@@ -114,7 +114,7 @@ describe('Integration: End-to-End Poke Agent Flows', () => {
     const skillResult = await tools.activateSkillTool.run({
       data: { name: 'automations' },
     } as any);
-    expect(skillResult).toContain('Automations Skill');
+    expect(skillResult).toContain('# Automations');
     expect(skillResult).toContain('Asia/Karachi');
 
     // 5. Test compaction resets conditional capabilities
