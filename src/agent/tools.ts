@@ -40,13 +40,10 @@ export function createPokeTools(ctx: ToolContexts) {
       ),
       reply_to: v.optional(v.string()),
     }),
-    run: async ({ data }) => {
-      const payloadHash = crypto
-        .createHash('sha256')
-        .update(JSON.stringify(data))
-        .digest('hex')
-        .slice(0, 16);
-      const idempotencyKey = `send-${payloadHash}`;
+    run: async ({ data, toolCallId }: any) => {
+      const idempotencyKey = toolCallId
+        ? `send-${toolCallId}`
+        : `send-${crypto.randomUUID()}`;
       const res = await ctx.sender.send(
         {
           mode: data.mode,

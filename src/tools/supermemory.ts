@@ -20,7 +20,7 @@ export interface MemoryItem {
 }
 
 export class SupermemoryToolHandler {
-  private baseUrl = 'https://api.supermemory.ai/v1';
+  private baseUrl = 'https://api.supermemory.ai/v3';
 
   constructor(private apiKey?: string, private containerId: string = 'owner') {}
 
@@ -61,7 +61,7 @@ export class SupermemoryToolHandler {
       }
 
       const data = (await res.json()) as any;
-      return { success: true, id: data.id || data.memoryId };
+      return { success: true, id: data.id || data.memoryId || data.uuid };
     });
   }
 
@@ -74,17 +74,18 @@ export class SupermemoryToolHandler {
     logger.info({ query: params.query, containerId: this.containerId }, 'Recalling memories from Supermemory');
 
     return await withProviderRetry(async () => {
-      const url = new URL(`${this.baseUrl}/memories/search`);
-      url.searchParams.set('q', params.query);
-      url.searchParams.set('containerId', this.containerId);
-      url.searchParams.set('limit', String(Math.min(params.limit || 5, 10)));
-
-      const res = await fetch(url.toString(), {
-        method: 'GET',
+      const res = await fetch(`${this.baseUrl}/search`, {
+        method: 'POST',
         headers: {
           Authorization: `Bearer ${this.apiKey}`,
+          'Content-Type': 'application/json',
           Accept: 'application/json',
         },
+        body: JSON.stringify({
+          query: params.query,
+          containerId: this.containerId,
+          limit: Math.min(params.limit || 5, 10),
+        }),
       });
 
       if (!res.ok) {
@@ -95,13 +96,15 @@ export class SupermemoryToolHandler {
       }
 
       const data = (await res.json()) as any;
-      const memories = Array.isArray(data) ? data : data.memories || data.results || [];
+      const memories = Array.isArray(data)
+        ? data
+        : data.results || data.memories || data.data || [];
 
       const results: MemoryItem[] = memories.map((m: any) => ({
-        id: m.id || m.memoryId,
-        content: m.content || m.text || '',
+        id: m.id || m.memoryId || m.uuid || '',
+        content: m.content || m.text || m.body || '',
         metadata: m.metadata,
-        score: m.score,
+        score: m.score ?? m.similarity,
         created_at: m.createdAt || m.created_at,
       }));
 

@@ -122,7 +122,7 @@ export class WhatsAppGateway {
     this.sock = makeWASocket({
       version,
       auth: state,
-      printQRInTerminal: false,
+      printQRInTerminal: true,
       logger: logger.child({ module: 'baileys' }) as any,
     });
 
@@ -177,19 +177,37 @@ export class WhatsAppGateway {
       return;
     }
 
-    // Owner check
-    const senderNumber = normalizePhoneNumber(remoteJid.replace(/@.*$/, ''));
+    // Owner check supporting LIDBaileys phone-JID alternative
     const ownerNumber = this.configManager.getOwnerPhoneNumber();
+    const rawCandidates = [
+      remoteJid,
+      (msg.key as any)?.remoteJidAlt,
+      msg.key?.participant,
+      (msg.key as any)?.participantAlt,
+    ].filter(Boolean) as string[];
 
-    if (!ownerNumber || senderNumber !== ownerNumber) {
+    const matchedJid = rawCandidates.find((jid) => {
+      const num = normalizePhoneNumber(jid.replace(/@.*$/, ''));
+      return num === ownerNumber;
+    });
+
+    if (!ownerNumber || !matchedJid) {
       logger.warn(
-        { senderNumber, ownerNumber, remoteJid },
+        { rawCandidates, ownerNumber, remoteJid },
         'Ignoring message from non-owner'
       );
       return;
     }
 
+    const senderNumber = normalizePhoneNumber(matchedJid.replace(/@.*$/, ''));
     const messageId = msg.key?.id || `msg-${Date.now()}`;
+    const idempotencyKey = `inbound_msg:${messageId}`;
+
+    if (this.db.isOpen() && this.db.checkIdempotency(idempotencyKey)) {
+      logger.info({ messageId }, 'Ignoring duplicate inbound message');
+      return;
+    }
+
     logger.info({ messageId, remoteJid }, 'Received WhatsApp message from owner');
 
     // Extract text and attachments
@@ -204,9 +222,19 @@ export class WhatsAppGateway {
 
     const trimmedText = text.trim();
 
-    // Check exact /stop command
-    if (trimmedText === '/stop') {
+    // Check exact /stop command - only triggers on pure text messages with no media
+    const isPureTextMessage =
+      (Boolean(msgContent.conversation) || Boolean(msgContent.extendedTextMessage)) &&
+      !msgContent.imageMessage &&
+      !msgContent.videoMessage &&
+      !msgContent.documentMessage &&
+      !msgContent.audioMessage;
+
+    if (isPureTextMessage && trimmedText === '/stop') {
       logger.info({ messageId }, 'Received exact /stop command. Triggering emergency brake.');
+      if (this.db.isOpen()) {
+        this.db.recordIdempotency(idempotencyKey, 'whatsapp_inbound', messageId);
+      }
       try {
         await this.onStop();
         await this.sender.sendDirectNotice('Stopped.');
@@ -248,17 +276,18 @@ export class WhatsAppGateway {
           caption: text || undefined,
         });
 
-        if (isPtt || mime.includes('audio/ogg')) {
-          isVoice = true;
+        // Transcribe voice note via Deepgram
+        if (this.deepgram) {
+          logger.info('Transcribing incoming voice note with Deepgram Nova-3');
           try {
             const transcript = await this.deepgram.transcribe(buffer as Buffer, mime);
-            text = `[voice]\n${transcript}`;
+            if (transcript) {
+              text = transcript;
+              isVoice = true;
+              logger.info({ transcriptPreview: transcript.slice(0, 80) }, 'Voice note transcribed');
+            }
           } catch (sttErr: any) {
-            logger.error({ err: sttErr.message }, 'Deepgram voice transcription failed');
-            await this.sender.sendDirectError(
-              `Voice transcription failed: ${sttErr.message}. You can reply in text or send the voice note again.`
-            );
-            return;
+            logger.error({ err: sttErr.message }, 'Voice note transcription failed');
           }
         }
       } catch (err: any) {
@@ -290,14 +319,20 @@ export class WhatsAppGateway {
       }
     }
 
-    // Document message
+    // Document message with path traversal protection
     if (msgContent.documentMessage) {
       try {
         if (!fs.existsSync(msgInboxDir)) {
           fs.mkdirSync(msgInboxDir, { recursive: true, mode: 0o700 });
         }
-        const filename = msgContent.documentMessage.fileName || 'document.bin';
-        const filePath = path.join(msgInboxDir, filename);
+        const rawFilename = msgContent.documentMessage.fileName || 'document.bin';
+        const filename = path.basename(rawFilename) || 'document.bin';
+        const filePath = path.resolve(msgInboxDir, filename);
+
+        if (!filePath.startsWith(path.resolve(msgInboxDir))) {
+          throw new Error(`Invalid document path: ${filePath}`);
+        }
+
         const buffer = await downloadMediaMessage(msg as WAMessage, 'buffer', {});
         fs.writeFileSync(filePath, buffer as Buffer);
 
@@ -347,6 +382,10 @@ export class WhatsAppGateway {
       attachments,
       rawMessage: msg,
     };
+
+    if (this.db.isOpen()) {
+      this.db.recordIdempotency(idempotencyKey, 'whatsapp_inbound', messageId);
+    }
 
     // Dispatch immediately into the main agent
     await this.onDispatch(normalized);

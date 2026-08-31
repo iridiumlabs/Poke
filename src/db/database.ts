@@ -170,6 +170,15 @@ export class PokeDatabase {
       .all() as WorkerJobRecord[];
   }
 
+  getUndeliveredFinishedWorkerJobs(): WorkerJobRecord[] {
+    if (!this.isOpen()) return [];
+    return this.db
+      .prepare(
+        "SELECT * FROM worker_jobs WHERE status IN ('completed', 'failed') AND completion_dispatched_at IS NULL ORDER BY finished_at ASC"
+      )
+      .all() as WorkerJobRecord[];
+  }
+
   updateWorkerJob(
     id: string,
     updates: Partial<{

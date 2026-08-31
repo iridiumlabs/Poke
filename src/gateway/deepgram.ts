@@ -72,11 +72,11 @@ export class DeepgramHandler {
     return await withProviderRetry(async () => {
       // Use Deepgram Flux through the current /v2/speak API per spec
       const url = new URL('https://api.deepgram.com/v2/speak');
-      url.searchParams.set('model', 'flux');
+      url.searchParams.set('model', 'aura-2-thalia-en');
       url.searchParams.set('encoding', 'opus');
       url.searchParams.set('container', 'ogg');
 
-      let res = await fetch(url.toString(), {
+      const res = await fetch(url.toString(), {
         method: 'POST',
         headers: {
           Authorization: `Token ${this.apiKey}`,
@@ -84,22 +84,6 @@ export class DeepgramHandler {
         },
         body: JSON.stringify({ text }),
       });
-
-      // Fallback to /v1/speak if /v2/speak is unavailable
-      if (!res.ok && (res.status === 404 || res.status === 400)) {
-        const v1Url = new URL('https://api.deepgram.com/v1/speak');
-        v1Url.searchParams.set('model', 'aura-asteria-en');
-        v1Url.searchParams.set('encoding', 'opus');
-        v1Url.searchParams.set('container', 'ogg');
-        res = await fetch(v1Url.toString(), {
-          method: 'POST',
-          headers: {
-            Authorization: `Token ${this.apiKey}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ text }),
-        });
-      }
 
       if (!res.ok) {
         const errText = await res.text().catch(() => '');

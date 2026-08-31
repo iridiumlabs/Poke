@@ -62,23 +62,17 @@ export class WorkerRunner {
           throw new Error('Worker aborted');
         }
 
-        try {
-          this.agentHandle = init(PokeWorkerAgent, { id: this.job.id });
-          await this.agentHandle.dispatch({
-            message: this.job.instruction,
-          });
+        this.agentHandle = init(PokeWorkerAgent, { id: this.job.id });
+        const receipt = await this.agentHandle.dispatch({
+          message: this.job.instruction,
+          initialData: { cwd: this.job.cwd || undefined },
+        });
 
-          return `Worker task "${this.job.name}" completed successfully.\n\nInstruction: ${this.job.instruction}`;
-        } catch (dispatchErr: any) {
-          if (
-            dispatchErr.message?.includes('aborted') ||
-            this.abortController?.signal.aborted
-          ) {
-            throw new Error('Worker aborted');
-          }
-          // If instance dispatch completed or reported result
-          return `Worker task "${this.job.name}" executed.\n\nInstruction: ${this.job.instruction}`;
-        }
+        const reply = await this.agentHandle.read(receipt, {
+          signal: this.abortController?.signal,
+        });
+
+        return reply.text || 'Worker task completed.';
       });
 
       if (this.abortController.signal.aborted) {

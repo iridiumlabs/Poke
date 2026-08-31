@@ -42,10 +42,20 @@ describe('AutomationScheduler & Timezone (Asia/Karachi)', () => {
     const nextCron = computeNextRun('cron', '0 9 * * *', baseTime);
     expect(nextCron).toBeGreaterThan(baseTime);
 
-    // Once
+    // Once with timezone offset
     const targetIso = '2026-09-05T15:00:00.000Z';
     const nextOnce = computeNextRun('once', targetIso, baseTime);
     expect(nextOnce).toBe(Date.parse(targetIso));
+
+    // Once without timezone offset: parsed in Asia/Karachi (+05:00)
+    const localStr = '2026-09-05 15:00:00';
+    const parsedKarachi = computeNextRun('once', localStr, baseTime);
+    expect(parsedKarachi).toBe(Date.parse('2026-09-05T15:00:00+05:00'));
+
+    // Past time throws
+    expect(() => computeNextRun('once', '2026-08-01 10:00:00', baseTime)).toThrow(
+      'One-off schedule must be set in the future (Asia/Karachi).'
+    );
   });
 
   it('creates, updates, disables, enables, lists, and deletes automations', () => {

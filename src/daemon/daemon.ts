@@ -150,6 +150,7 @@ export class PokeDaemon {
 
     try {
       await this.gateway.stop();
+      this.workerManager.stop();
       await this.runtime.stop();
       this.db.close();
 

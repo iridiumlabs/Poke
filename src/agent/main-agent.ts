@@ -9,7 +9,8 @@ import {
 import { local } from '@flue/runtime/node';
 import { MAIN_AGENT_SYSTEM_PROMPT } from './prompts.js';
 import { createPokeTools, ToolContexts } from './tools.js';
-import { CompactionManager } from '../context/compaction-manager.js';
+import { resolveFlueModelSpecifier } from '../providers/provider-registry.js';
+import { CompactionManager, RECENT_TOKENS_RETENTION } from '../context/compaction-manager.js';
 
 let sharedContexts: ToolContexts | null = null;
 let sharedCompactionManager: CompactionManager | null = null;
@@ -30,13 +31,15 @@ export function PokeMainAgent() {
   const config = sharedContexts.configManager.loadConfig();
   const mainModel = config.mainModel;
 
-  const modelName = mainModel?.model || 'gpt-4o';
+  const modelSpecifier = resolveFlueModelSpecifier(mainModel);
   const thinkingLevel = mainModel?.reasoningEffort as any;
 
   // 1. Declare model
-  useModel(modelName, {
+  useModel(modelSpecifier, {
     thinkingLevel,
-    compaction: false, // Managed by Poke's dual-tier compaction policy
+    compaction: {
+      keepRecentTokens: RECENT_TOKENS_RETENTION,
+    },
   });
 
   // 2. Attach local host sandbox forwarding daemon's full environment

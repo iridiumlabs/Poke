@@ -64,3 +64,14 @@ describe('CommandCodeCatalog', () => {
     expect(sonnetMeta?.reasoningEfforts).toContain('high');
   });
 });
+
+describe('resolveFlueModelSpecifier', () => {
+  it('correctly maps provider and model selections to provider/model format', async () => {
+    const { resolveFlueModelSpecifier } = await import('../../src/providers/provider-registry.js');
+
+    expect(resolveFlueModelSpecifier({ provider: 'codex', model: 'gpt-4o' })).toBe('openai-codex/gpt-4o');
+    expect(resolveFlueModelSpecifier({ provider: 'commandcode', model: 'claude-sonnet-4-6' })).toBe('commandcode/claude-sonnet-4-6');
+    expect(resolveFlueModelSpecifier({ provider: 'fireworks', model: 'accounts/fireworks/models/deepseek-r1' })).toBe('fireworks/accounts/fireworks/models/deepseek-r1');
+    expect(resolveFlueModelSpecifier({ provider: 'codex', model: 'openai-codex/o3-mini' })).toBe('openai-codex/o3-mini');
+  });
+});

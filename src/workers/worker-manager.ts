@@ -13,6 +13,7 @@ export type DispatchSignalFn = (signalBody: string) => Promise<void>;
 
 export class WorkerManager {
   private activeRunners = new Map<string, WorkerRunner>();
+  private abortedJobIds = new Set<string>();
   private isProcessing = false;
   private isStopped = false;
   private onDispatchCompletion: DispatchSignalFn | null = null;
@@ -70,21 +71,37 @@ export class WorkerManager {
   reconcileStartupJobs(): void {
     if (!this.db.isOpen()) return;
     const runningJobs = this.db.getRunningWorkerJobs();
-    if (runningJobs.length === 0) return;
-
     const logger = getLogger();
-    logger.warn({ count: runningJobs.length }, 'Reconciling interrupted running workers on startup');
 
-    for (const job of runningJobs) {
-      this.db.updateWorkerJob(job.id, {
-        status: 'failed',
-        error: 'Worker interrupted by daemon restart',
-        finished_at: Date.now(),
-      });
+    if (runningJobs.length > 0) {
+      logger.warn({ count: runningJobs.length }, 'Reconciling interrupted running workers on startup');
 
-      if (this.onDispatchCompletion) {
-        const signalXml = `<worker_completion id="${job.id}" status="failed" name="${job.name}">\nWorker interrupted by daemon restart\n</worker_completion>`;
-        this.onDispatchCompletion(signalXml).catch(() => {});
+      for (const job of runningJobs) {
+        this.db.updateWorkerJob(job.id, {
+          status: 'failed',
+          error: 'Worker interrupted by daemon restart',
+          finished_at: Date.now(),
+          completion_dispatched_at: Date.now(),
+        });
+
+        if (this.onDispatchCompletion) {
+          const signalXml = `<worker_completion id="${job.id}" status="failed" name="${job.name}">\nWorker interrupted by daemon restart\n</worker_completion>`;
+          this.onDispatchCompletion(signalXml).catch(() => {});
+        }
+      }
+    }
+
+    const undelivered = this.db.getUndeliveredFinishedWorkerJobs();
+    for (const job of undelivered) {
+      if (this.onDispatchCompletion && job.status !== 'aborted' && job.status !== 'cancelled') {
+        const signalXml = `<worker_completion id="${job.id}" status="${job.status}" name="${job.name}">\n${job.result || job.error || 'Job completed.'}\n</worker_completion>`;
+        this.onDispatchCompletion(signalXml)
+          .then(() => {
+            if (this.db.isOpen()) {
+              this.db.updateWorkerJob(job.id, { completion_dispatched_at: Date.now() });
+            }
+          })
+          .catch(() => {});
       }
     }
   }
@@ -137,7 +154,12 @@ export class WorkerManager {
     try {
       const outcome = await runner.run();
 
-      if (this.isStopped || !this.db.isOpen()) {
+      if (
+        this.isStopped ||
+        !this.db.isOpen() ||
+        this.abortedJobIds.has(job.id) ||
+        outcome.status === 'aborted'
+      ) {
         this.activeRunners.delete(job.id);
         return;
       }
@@ -151,31 +173,35 @@ export class WorkerManager {
       }
 
       const finishedAt = Date.now();
-      this.db.updateWorkerJob(job.id, {
-        status: outcome.status,
-        result: outcome.result || null,
-        error: outcome.error || null,
-        finished_at: finishedAt,
-      });
-
       this.activeRunners.delete(job.id);
 
       // Deliver completion signal to the main agent unless aborted
-      if (outcome.status !== 'aborted' && this.onDispatchCompletion && this.db.isOpen()) {
-        const check = this.db.getWorkerJob(job.id);
-        if (check && !check.completion_dispatched_at && check.status !== 'aborted') {
-          const signalXml = `<worker_completion id="${job.id}" status="${outcome.status}" name="${job.name}">\n${outcome.result || outcome.error || 'Job completed.'}\n</worker_completion>`;
+      if (this.onDispatchCompletion && this.db.isOpen()) {
+        const signalXml = `<worker_completion id="${job.id}" status="${outcome.status}" name="${job.name}">\n${outcome.result || outcome.error || 'Job completed.'}\n</worker_completion>`;
 
-          try {
+        try {
+          if (!this.abortedJobIds.has(job.id)) {
             await this.onDispatchCompletion(signalXml);
             if (this.db.isOpen()) {
               this.db.updateWorkerJob(job.id, {
+                status: outcome.status,
+                result: outcome.result || null,
+                error: outcome.error || null,
+                finished_at: finishedAt,
                 completion_dispatched_at: Date.now(),
               });
             }
             logger.info('Dispatched worker completion signal to main agent');
-          } catch (dispatchErr: any) {
-            logger.error({ err: dispatchErr.message }, 'Failed to dispatch worker completion signal');
+          }
+        } catch (dispatchErr: any) {
+          logger.error({ err: dispatchErr.message }, 'Failed to dispatch worker completion signal');
+          if (this.db.isOpen()) {
+            this.db.updateWorkerJob(job.id, {
+              status: outcome.status,
+              result: outcome.result || null,
+              error: outcome.error || null,
+              finished_at: finishedAt,
+            });
           }
         }
       }
@@ -237,13 +263,20 @@ export class WorkerManager {
   }
 
   abortAll(): { abortedCount: number; cancelledCount: number } {
-    for (const [, runner] of this.activeRunners.entries()) {
+    for (const [id, runner] of this.activeRunners.entries()) {
+      this.abortedJobIds.add(id);
       runner.abort();
     }
     this.activeRunners.clear();
 
     if (!this.db.isOpen()) return { abortedCount: 0, cancelledCount: 0 };
     const { abortedIds, cancelledIds } = this.db.abortAllActiveWorkerJobs();
+    for (const id of abortedIds) {
+      this.abortedJobIds.add(id);
+    }
+    for (const id of cancelledIds) {
+      this.abortedJobIds.add(id);
+    }
     getLogger().info(
       { abortedCount: abortedIds.length, cancelledCount: cancelledIds.length },
       'Aborted all running and cancelled all queued workers'

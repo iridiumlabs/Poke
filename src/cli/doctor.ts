@@ -1,7 +1,6 @@
 import fs from 'fs';
-import path from 'path';
+import Database from 'better-sqlite3';
 import { ConfigManager } from '../config/config.js';
-import { PokeDatabase } from '../db/database.js';
 import { resolvePokePaths } from '../config/paths.js';
 import { getPendingMigrations } from '../db/migrations.js';
 import { ProviderRegistry } from '../providers/provider-registry.js';
@@ -20,7 +19,7 @@ export async function runDoctor(customHome?: string): Promise<{ success: boolean
 
   console.log('\n--- Running Poke Diagnostics (`poke doctor`) ---\n');
 
-  // 1. Filesystem & Directory Permissions
+  // 1. Filesystem & Directory Permissions (Read-only verification)
   try {
     const testDirs = [
       paths.root,
@@ -32,35 +31,50 @@ export async function runDoctor(customHome?: string): Promise<{ success: boolean
       paths.skillsDir,
     ];
 
-    let allWritable = true;
+    let missingDirs: string[] = [];
     for (const d of testDirs) {
       if (!fs.existsSync(d)) {
-        fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+        missingDirs.push(d);
+      } else {
+        fs.accessSync(d, fs.constants.R_OK | fs.constants.W_OK);
       }
-      fs.accessSync(d, fs.constants.R_OK | fs.constants.W_OK);
     }
-    checks.push({ name: 'Directories & Permissions', passed: true, message: 'All directories exist and are writable' });
+
+    if (missingDirs.length === 0) {
+      checks.push({ name: 'Directories & Permissions', passed: true, message: 'All directories exist and are writable' });
+    } else {
+      checks.push({ name: 'Directories & Permissions', passed: false, warning: true, message: `${missingDirs.length} directories not initialized yet.` });
+    }
   } catch (err: any) {
     checks.push({ name: 'Directories & Permissions', passed: false, message: err.message });
   }
 
-  // 2. Database & Migrations
-  let db: PokeDatabase | null = null;
+  // 2. Database & Migrations (Read-only inspection)
+  let rawDb: Database.Database | null = null;
   try {
-    db = new PokeDatabase(customHome);
-    const pending = getPendingMigrations(db.getRawDb());
-    if (pending.length === 0) {
-      checks.push({ name: 'Database & Migrations', passed: true, message: 'SQLite database healthy, no pending migrations' });
+    if (!fs.existsSync(paths.sqliteFile)) {
+      checks.push({ name: 'Database & Migrations', passed: false, warning: true, message: 'SQLite database file not created yet.' });
     } else {
-      checks.push({ name: 'Database & Migrations', passed: false, message: `${pending.length} pending migrations` });
+      rawDb = new Database(paths.sqliteFile, { readonly: true, fileMustExist: true });
+      const pending = getPendingMigrations(rawDb);
+      if (pending.length === 0) {
+        checks.push({ name: 'Database & Migrations', passed: true, message: 'SQLite database healthy, no pending migrations' });
+      } else {
+        checks.push({ name: 'Database & Migrations', passed: false, message: `${pending.length} pending migrations` });
+      }
     }
   } catch (err: any) {
     checks.push({ name: 'Database & Migrations', passed: false, message: err.message });
+  } finally {
+    if (rawDb) {
+      try {
+        rawDb.close();
+      } catch {}
+    }
   }
 
   // 3. Configuration & Owner Binding
   const configManager = new ConfigManager(customHome);
-  const config = configManager.loadConfig();
   const ownerPhone = configManager.getOwnerPhoneNumber();
 
   if (ownerPhone) {
@@ -133,13 +147,18 @@ export async function runDoctor(customHome?: string): Promise<{ success: boolean
     checks.push({ name: 'Main Model Configuration', passed: false, message: 'No main model selected. Run `poke model`.' });
   }
 
-  // 7. Skills Registry
+  // 7. Skills Registry (Clean up watcher)
+  let skills: SkillRegistry | null = null;
   try {
-    const skills = new SkillRegistry(paths.skillsDir);
+    skills = new SkillRegistry(paths.skillsDir);
     const list = skills.listSkills();
     checks.push({ name: 'Skills Registry', passed: true, message: `${list.length} skills loaded from ${paths.skillsDir}` });
   } catch (err: any) {
     checks.push({ name: 'Skills Registry', passed: false, message: err.message });
+  } finally {
+    if (skills) {
+      skills.stopWatcher();
+    }
   }
 
   // Print results
@@ -154,8 +173,6 @@ export async function runDoctor(customHome?: string): Promise<{ success: boolean
       console.log(`✓ [PASS] ${check.name}: ${check.message}`);
     }
   }
-
-  if (db) db.close();
 
   console.log(`\nOverall Doctor Status: ${overallSuccess ? 'HEALTHY' : 'ISSUES DETECTED'}\n`);
   return { success: overallSuccess, checks };

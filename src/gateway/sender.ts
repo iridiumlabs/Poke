@@ -118,7 +118,14 @@ export class WhatsAppSender {
           mimetype: mimeType,
           ptt: true, // Send as WhatsApp voice note
         },
-        params.reply_to ? { quoted: { key: { id: params.reply_to } } } : undefined
+        params.reply_to
+          ? {
+              quoted: {
+                key: { remoteJid: targetJid, id: params.reply_to },
+                message: { conversation: '' },
+              },
+            }
+          : undefined
       );
 
       if (msg?.key?.id) {
@@ -134,7 +141,14 @@ export class WhatsAppSender {
         const msg = await sock.sendMessage(
           targetJid,
           { text: chunk },
-          isFirst && params.reply_to ? { quoted: { key: { id: params.reply_to } } } : undefined
+          isFirst && params.reply_to
+            ? {
+                quoted: {
+                  key: { remoteJid: targetJid, id: params.reply_to },
+                  message: { conversation: '' },
+                },
+              }
+            : undefined
         );
         if (msg?.key?.id) {
           messageId = msg.key.id;
@@ -144,33 +158,35 @@ export class WhatsAppSender {
       // Send attachments if present
       if (params.attachments && params.attachments.length > 0) {
         for (const att of params.attachments) {
-          if (fs.existsSync(att.path)) {
-            const buffer = fs.readFileSync(att.path);
-            const mime = att.mimeType || 'application/octet-stream';
-            const filename = att.filename || path.basename(att.path);
+          if (!fs.existsSync(att.path)) {
+            throw new Error(`Attachment file not found: ${att.path}`);
+          }
 
-            if (mime.startsWith('image/')) {
-              await sock.sendMessage(targetJid, {
-                image: buffer,
-                caption: filename !== path.basename(att.path) ? filename : undefined,
-              });
-            } else if (mime.startsWith('video/')) {
-              await sock.sendMessage(targetJid, {
-                video: buffer,
-                caption: filename,
-              });
-            } else if (mime.startsWith('audio/')) {
-              await sock.sendMessage(targetJid, {
-                audio: buffer,
-                mimetype: mime,
-              });
-            } else {
-              await sock.sendMessage(targetJid, {
-                document: buffer,
-                mimetype: mime,
-                fileName: filename,
-              });
-            }
+          const buffer = fs.readFileSync(att.path);
+          const mime = att.mimeType || 'application/octet-stream';
+          const filename = att.filename || path.basename(att.path);
+
+          if (mime.startsWith('image/')) {
+            await sock.sendMessage(targetJid, {
+              image: buffer,
+              caption: filename !== path.basename(att.path) ? filename : undefined,
+            });
+          } else if (mime.startsWith('video/')) {
+            await sock.sendMessage(targetJid, {
+              video: buffer,
+              caption: filename,
+            });
+          } else if (mime.startsWith('audio/')) {
+            await sock.sendMessage(targetJid, {
+              audio: buffer,
+              mimetype: mime,
+            });
+          } else {
+            await sock.sendMessage(targetJid, {
+              document: buffer,
+              mimetype: mime,
+              fileName: filename,
+            });
           }
         }
       }

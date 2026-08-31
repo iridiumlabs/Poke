@@ -188,12 +188,62 @@ describe('WhatsApp Gateway & Sender', () => {
     try {
       const res = await dg.synthesizeToAudioFile('Hello from Deepgram Flux');
       expect(requestedUrl).toContain('https://api.deepgram.com/v2/speak');
-      expect(requestedUrl).toContain('model=flux');
+      expect(requestedUrl).toContain('model=aura-2-thalia-en');
       expect(requestedUrl).toContain('encoding=opus');
       expect(res.mimeType).toContain('audio/ogg');
       expect(fs.existsSync(res.audioPath)).toBe(true);
     } finally {
       global.fetch = originalFetch;
     }
+  });
+
+  it('matches owner messages when sent with Baileys LID and remoteJidAlt', async () => {
+    let dispatched = false;
+    const gateway = new WhatsAppGateway(
+      config,
+      db,
+      async () => {
+        dispatched = true;
+      },
+      async () => {},
+      tempDir
+    );
+
+    // LID message with remoteJidAlt matching owner
+    await gateway.handleIncomingMessage({
+      key: {
+        remoteJid: '25482348912345@lid',
+        remoteJidAlt: '923001234567@s.whatsapp.net',
+        id: 'm-lid-1',
+      } as any,
+      message: { conversation: 'Hello from LID' },
+    });
+
+    expect(dispatched).toBe(true);
+  });
+
+  it('deduplicates redelivered inbound messages using idempotency', async () => {
+    let dispatchCount = 0;
+    const gateway = new WhatsAppGateway(
+      config,
+      db,
+      async () => {
+        dispatchCount++;
+      },
+      async () => {},
+      tempDir
+    );
+
+    const msg = {
+      key: { remoteJid: '923001234567@s.whatsapp.net', id: 'm-duplicate-test' },
+      message: { conversation: 'Testing idempotency' },
+    };
+
+    await gateway.handleIncomingMessage(msg);
+    expect(dispatchCount).toBe(1);
+
+    // Redelivery
+    await gateway.handleIncomingMessage(msg);
+    expect(dispatchCount).toBe(1);
   });
 });

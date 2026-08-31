@@ -88,6 +88,19 @@ export function uninstallSystemdService(): boolean {
   }
 }
 
+function isPokeProcess(pid: number): boolean {
+  try {
+    const cmdlinePath = `/proc/${pid}/cmdline`;
+    if (fs.existsSync(cmdlinePath)) {
+      const cmdline = fs.readFileSync(cmdlinePath, 'utf8');
+      return cmdline.includes('poke') || cmdline.includes('node');
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function runStart(options: { foreground?: boolean }, customHome?: string): Promise<void> {
   const paths = resolvePokePaths(customHome);
   const pidFile = path.join(paths.root, 'daemon.pid');
@@ -100,8 +113,11 @@ export async function runStart(options: { foreground?: boolean }, customHome?: s
     return;
   }
 
-  // Check if systemd user service is installed and we can use it
-  if (isSystemdServiceInstalled() && isSystemdAvailable()) {
+  // Ensure systemd user service is installed and started if systemd is available
+  if (isSystemdAvailable()) {
+    if (!isSystemdServiceInstalled()) {
+      installSystemdService();
+    }
     try {
       execSync('systemctl --user start poke.service');
       console.log('✓ Started Poke daemon via systemd user service (poke.service).');
@@ -117,8 +133,12 @@ export async function runStart(options: { foreground?: boolean }, customHome?: s
     if (!isNaN(pid)) {
       try {
         process.kill(pid, 0);
-        console.log(`Poke daemon is already running (PID: ${pid}).`);
-        return;
+        if (isPokeProcess(pid)) {
+          console.log(`Poke daemon is already running (PID: ${pid}).`);
+          return;
+        } else {
+          fs.unlinkSync(pidFile);
+        }
       } catch {
         fs.unlinkSync(pidFile);
       }
@@ -161,6 +181,12 @@ export async function runStop(customHome?: string): Promise<void> {
   const pid = parseInt(rawPid, 10);
   if (isNaN(pid)) {
     console.log('Invalid PID file found, removing.');
+    fs.unlinkSync(pidFile);
+    return;
+  }
+
+  if (!isPokeProcess(pid)) {
+    console.log(`Stale PID file detected (PID ${pid} is not Poke daemon). Removing.`);
     fs.unlinkSync(pidFile);
     return;
   }

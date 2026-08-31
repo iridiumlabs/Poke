@@ -91,32 +91,36 @@ export class AutomationScheduler {
     const scheduledDateIso = new Date(auto.next_run_at || triggerTimeMs).toISOString();
     const signalXml = `<automation_trigger id="${auto.id}" name="${auto.name}" scheduled_at="${scheduledDateIso}">\n${auto.instruction}\n</automation_trigger>`;
 
-    // Update next run time BEFORE or WITH dispatch to guarantee idempotency
-    let nextRun: number | null = null;
-    let newEnabled = auto.enabled;
-
-    if (auto.schedule_type === 'once') {
-      nextRun = null;
-      newEnabled = 0; // Disabled once finished
-    } else {
-      try {
-        nextRun = computeNextRun(auto.schedule_type, auto.schedule_value, Date.now());
-      } catch (err: any) {
-        logger.error({ err: err.message }, 'Failed to compute next run for recurring automation');
-      }
-    }
-
+    // Persist claim before delivery
     this.db.updateAutomation(auto.id, {
-      next_run_at: nextRun,
       last_run_at: triggerTimeMs,
-      enabled: newEnabled,
-      last_outcome: 'triggered',
+      last_outcome: 'claimed',
     });
 
     if (this.onDispatchSignal) {
       try {
         await this.onDispatchSignal(signalXml);
-        this.db.updateAutomation(auto.id, { last_outcome: 'dispatched' });
+
+        // Compute next run time and advance schedule only after successful delivery
+        let nextRun: number | null = null;
+        let newEnabled = auto.enabled;
+
+        if (auto.schedule_type === 'once') {
+          nextRun = null;
+          newEnabled = 0; // Disabled once finished
+        } else {
+          try {
+            nextRun = computeNextRun(auto.schedule_type, auto.schedule_value, Date.now());
+          } catch (err: any) {
+            logger.error({ err: err.message }, 'Failed to compute next run for recurring automation');
+          }
+        }
+
+        this.db.updateAutomation(auto.id, {
+          next_run_at: nextRun,
+          enabled: newEnabled,
+          last_outcome: 'dispatched',
+        });
         logger.info('Automation trigger dispatched to main agent');
       } catch (err: any) {
         logger.error({ err: err.message }, 'Failed to dispatch automation signal');

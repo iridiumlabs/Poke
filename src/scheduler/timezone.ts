@@ -32,9 +32,27 @@ export function computeNextRun(
   fromTimeMs = Date.now()
 ): number | null {
   if (scheduleType === 'once') {
-    const parsed = Date.parse(scheduleValue);
+    let toParse = scheduleValue.trim();
+    if (/^\d+$/.test(toParse)) {
+      const parsedNum = parseInt(toParse, 10);
+      if (parsedNum <= fromTimeMs) {
+        throw new Error(`One-off schedule must be set in the future (${POKE_TIMEZONE}).`);
+      }
+      return parsedNum;
+    }
+
+    const hasTzOffset = /([zZ]|[+-]\d{2}(:?\d{2})?)$/.test(toParse);
+    if (!hasTzOffset) {
+      toParse = toParse.replace(' ', 'T');
+      toParse = `${toParse}+05:00`;
+    }
+
+    const parsed = Date.parse(toParse);
     if (isNaN(parsed)) {
       throw new Error(`Invalid date/time for "once" schedule: "${scheduleValue}"`);
+    }
+    if (parsed <= fromTimeMs) {
+      throw new Error(`One-off schedule must be set in the future (${POKE_TIMEZONE}).`);
     }
     return parsed;
   }
