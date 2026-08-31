@@ -44,11 +44,10 @@ export function PokeWorkerAgent() {
 
   const initialData = useInitialData<{ cwd?: string }>();
 
-  // 2. Attach local host sandbox forwarding daemon full environment and job cwd
+  // 2. Attach local host sandbox with Flue's shell-essential environment allowlist and job cwd
   useSandbox(
     local({
       cwd: initialData?.cwd,
-      env: { ...process.env },
     })
   );
 

@@ -6,6 +6,7 @@ import { ComposioToolHandler } from '../tools/composio.js';
 import { SkillRegistry } from '../skills/registry.js';
 import { WorkerRunner } from './worker-runner.js';
 import { getLogger } from '../logger/logger.js';
+import { createWorkerCompletionSignal } from '../agent/signals.js';
 
 export const MAX_CONCURRENT_WORKERS = 4;
 
@@ -17,6 +18,7 @@ export class WorkerManager {
   private isProcessing = false;
   private isStopped = false;
   private onDispatchCompletion: DispatchSignalFn | null = null;
+  private completionDispatches = new Set<string>();
 
   constructor(
     private db: PokeDatabase,
@@ -81,28 +83,13 @@ export class WorkerManager {
           status: 'failed',
           error: 'Worker interrupted by daemon restart',
           finished_at: Date.now(),
-          completion_dispatched_at: Date.now(),
         });
-
-        if (this.onDispatchCompletion) {
-          const signalXml = `<worker_completion id="${job.id}" status="failed" name="${job.name}">\nWorker interrupted by daemon restart\n</worker_completion>`;
-          this.onDispatchCompletion(signalXml).catch(() => {});
-        }
       }
     }
 
     const undelivered = this.db.getUndeliveredFinishedWorkerJobs();
     for (const job of undelivered) {
-      if (this.onDispatchCompletion && job.status !== 'aborted' && job.status !== 'cancelled') {
-        const signalXml = `<worker_completion id="${job.id}" status="${job.status}" name="${job.name}">\n${job.result || job.error || 'Job completed.'}\n</worker_completion>`;
-        this.onDispatchCompletion(signalXml)
-          .then(() => {
-            if (this.db.isOpen()) {
-              this.db.updateWorkerJob(job.id, { completion_dispatched_at: Date.now() });
-            }
-          })
-          .catch(() => {});
-      }
+      void this.dispatchCompletion(job);
     }
   }
 
@@ -154,13 +141,19 @@ export class WorkerManager {
     try {
       const outcome = await runner.run();
 
-      if (
-        this.isStopped ||
-        !this.db.isOpen() ||
-        this.abortedJobIds.has(job.id) ||
-        outcome.status === 'aborted'
-      ) {
+      if (this.isStopped || !this.db.isOpen()) {
         this.activeRunners.delete(job.id);
+        return;
+      }
+
+      if (this.abortedJobIds.has(job.id) || outcome.status === 'aborted') {
+        this.activeRunners.delete(job.id);
+        this.db.completeWorkerJob(job.id, {
+          status: 'aborted',
+          result: null,
+          error: outcome.error ?? null,
+          finished_at: Date.now(),
+        });
         return;
       }
 
@@ -175,34 +168,17 @@ export class WorkerManager {
       const finishedAt = Date.now();
       this.activeRunners.delete(job.id);
 
-      // Deliver completion signal to the main agent unless aborted
-      if (this.onDispatchCompletion && this.db.isOpen()) {
-        const signalXml = `<worker_completion id="${job.id}" status="${outcome.status}" name="${job.name}">\n${outcome.result || outcome.error || 'Job completed.'}\n</worker_completion>`;
+      const completed = this.db.completeWorkerJob(job.id, {
+        status: outcome.status,
+        result: outcome.result ?? null,
+        error: outcome.error ?? null,
+        finished_at: finishedAt,
+      });
 
-        try {
-          if (!this.abortedJobIds.has(job.id)) {
-            await this.onDispatchCompletion(signalXml);
-            if (this.db.isOpen()) {
-              this.db.updateWorkerJob(job.id, {
-                status: outcome.status,
-                result: outcome.result || null,
-                error: outcome.error || null,
-                finished_at: finishedAt,
-                completion_dispatched_at: Date.now(),
-              });
-            }
-            logger.info('Dispatched worker completion signal to main agent');
-          }
-        } catch (dispatchErr: any) {
-          logger.error({ err: dispatchErr.message }, 'Failed to dispatch worker completion signal');
-          if (this.db.isOpen()) {
-            this.db.updateWorkerJob(job.id, {
-              status: outcome.status,
-              result: outcome.result || null,
-              error: outcome.error || null,
-              finished_at: finishedAt,
-            });
-          }
+      if (completed) {
+        const completedJob = this.db.getWorkerJob(job.id);
+        if (completedJob) {
+          await this.dispatchCompletion(completedJob);
         }
       }
     } catch (err: any) {
@@ -210,8 +186,9 @@ export class WorkerManager {
       if (this.db.isOpen()) {
         const check = this.db.getWorkerJob(job.id);
         if (check && check.status !== 'aborted' && check.status !== 'cancelled') {
-          this.db.updateWorkerJob(job.id, {
+          this.db.completeWorkerJob(job.id, {
             status: 'failed',
+            result: null,
             error: err.message,
             finished_at: Date.now(),
           });
@@ -227,6 +204,41 @@ export class WorkerManager {
           }
         }, 0);
       }
+    }
+  }
+
+  private async dispatchCompletion(job: WorkerJobRecord): Promise<void> {
+    if (
+      !this.onDispatchCompletion ||
+      !this.db.isOpen() ||
+      job.completion_dispatched_at ||
+      job.status === 'aborted' ||
+      job.status === 'cancelled' ||
+      this.completionDispatches.has(job.id)
+    ) {
+      return;
+    }
+
+    this.completionDispatches.add(job.id);
+    const logger = getLogger().child({ jobId: job.id, jobName: job.name });
+
+    try {
+      await this.onDispatchCompletion(
+        createWorkerCompletionSignal({
+          id: job.id,
+          status: job.status,
+          name: job.name,
+          body: job.result || job.error || 'Job completed.',
+        })
+      );
+      if (this.db.isOpen()) {
+        this.db.markWorkerCompletionDispatched(job.id);
+      }
+      logger.info('Dispatched worker completion signal to main agent');
+    } catch (err: any) {
+      logger.error({ err: err.message }, 'Failed to dispatch worker completion signal');
+    } finally {
+      this.completionDispatches.delete(job.id);
     }
   }
 

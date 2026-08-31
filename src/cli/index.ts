@@ -41,8 +41,10 @@ export function createCli(): Command {
     .description('Configure the AI model and reasoning effort for the main agent or workers')
     .argument('[target]', 'Target agent ("main" or "worker")', 'main')
     .action(async (target) => {
-      const mode = target === 'worker' ? 'worker' : 'main';
-      await runModelSelection(mode);
+      if (target !== 'main' && target !== 'worker') {
+        throw new Error('Model target must be "main" or "worker".');
+      }
+      await runModelSelection(target);
     });
 
   program

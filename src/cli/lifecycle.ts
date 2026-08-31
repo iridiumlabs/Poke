@@ -3,7 +3,13 @@ import os from 'os';
 import path from 'path';
 import { spawn, execSync } from 'child_process';
 import { resolvePokePaths } from '../config/paths.js';
+import { resolvePokeInstallationPaths } from '../config/installation.js';
 import { PokeDaemon } from '../daemon/daemon.js';
+import {
+  isLivePokeDaemon,
+  readDaemonPidFile,
+  removeDaemonPidFileIfMatches,
+} from '../daemon/pid-file.js';
 
 export function isSystemdAvailable(): boolean {
   try {
@@ -37,8 +43,8 @@ export function installSystemdService(): boolean {
     }
 
     const nodePath = process.execPath;
-    const pokeBinPath = path.resolve('dist/bin/poke.js');
-    const workingDir = path.resolve('.');
+    const { pokeBinPath, workingDir } = resolvePokeInstallationPaths();
+    const quoteSystemdArgument = (value: string) => `"${value.replace(/[\\"]/g, '\\$&')}"`;
 
     const unitContent = `[Unit]
 Description=Poke WhatsApp Personal Agent Daemon
@@ -46,8 +52,8 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=${workingDir}
-ExecStart=${nodePath} ${pokeBinPath} start --foreground
+WorkingDirectory=${quoteSystemdArgument(workingDir)}
+ExecStart=${quoteSystemdArgument(nodePath)} ${quoteSystemdArgument(pokeBinPath)} start --foreground
 Restart=on-failure
 RestartSec=5
 KillMode=process
@@ -88,19 +94,6 @@ export function uninstallSystemdService(): boolean {
   }
 }
 
-function isPokeProcess(pid: number): boolean {
-  try {
-    const cmdlinePath = `/proc/${pid}/cmdline`;
-    if (fs.existsSync(cmdlinePath)) {
-      const cmdline = fs.readFileSync(cmdlinePath, 'utf8');
-      return cmdline.includes('poke') || cmdline.includes('node');
-    }
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 export async function runStart(options: { foreground?: boolean }, customHome?: string): Promise<void> {
   const paths = resolvePokePaths(customHome);
   const pidFile = path.join(paths.root, 'daemon.pid');
@@ -128,25 +121,18 @@ export async function runStart(options: { foreground?: boolean }, customHome?: s
   }
 
   if (fs.existsSync(pidFile)) {
-    const rawPid = fs.readFileSync(pidFile, 'utf8').trim();
-    const pid = parseInt(rawPid, 10);
-    if (!isNaN(pid)) {
-      try {
-        process.kill(pid, 0);
-        if (isPokeProcess(pid)) {
-          console.log(`Poke daemon is already running (PID: ${pid}).`);
-          return;
-        } else {
-          fs.unlinkSync(pidFile);
-        }
-      } catch {
-        fs.unlinkSync(pidFile);
-      }
+    const record = readDaemonPidFile(pidFile);
+    const { pokeBinPath } = resolvePokeInstallationPaths();
+    if (record && isLivePokeDaemon(record, pokeBinPath)) {
+      console.log(`Poke daemon is already running (PID: ${record.pid}).`);
+      return;
     }
+    // Let the daemon claim remove a stale PID atomically, avoiding a race with a
+    // daemon which is just starting.
   }
 
   console.log('Starting Poke daemon in background...');
-  const scriptPath = path.resolve('dist/bin/poke.js');
+  const { pokeBinPath: scriptPath } = resolvePokeInstallationPaths();
   const child = spawn(process.execPath, [scriptPath, 'start', '--foreground'], {
     detached: true,
     stdio: 'ignore',
@@ -177,19 +163,19 @@ export async function runStop(customHome?: string): Promise<void> {
     return;
   }
 
-  const rawPid = fs.readFileSync(pidFile, 'utf8').trim();
-  const pid = parseInt(rawPid, 10);
-  if (isNaN(pid)) {
-    console.log('Invalid PID file found, removing.');
-    fs.unlinkSync(pidFile);
+  const record = readDaemonPidFile(pidFile);
+  const { pokeBinPath } = resolvePokeInstallationPaths();
+  if (!record || !isLivePokeDaemon(record, pokeBinPath)) {
+    console.log('Stale PID file detected, removing.');
+    if (record) {
+      removeDaemonPidFileIfMatches(pidFile, record);
+    } else {
+      fs.unlinkSync(pidFile);
+    }
     return;
   }
 
-  if (!isPokeProcess(pid)) {
-    console.log(`Stale PID file detected (PID ${pid} is not Poke daemon). Removing.`);
-    fs.unlinkSync(pidFile);
-    return;
-  }
+  const { pid } = record;
 
   try {
     process.kill(pid, 'SIGTERM');
@@ -206,19 +192,21 @@ export async function runStop(customHome?: string): Promise<void> {
       }
     }
 
+    if (!isLivePokeDaemon(record, pokeBinPath)) {
+      console.log('Daemon exited or PID was reused; not sending SIGKILL.');
+      removeDaemonPidFileIfMatches(pidFile, record);
+      return;
+    }
+
     console.log('Daemon did not stop in time, sending SIGKILL...');
     try {
       process.kill(pid, 'SIGKILL');
     } catch {}
-    if (fs.existsSync(pidFile)) {
-      fs.unlinkSync(pidFile);
-    }
+    removeDaemonPidFileIfMatches(pidFile, record);
     console.log('✓ Poke daemon terminated.');
   } catch (err: any) {
     console.log(`Daemon was not running: ${err.message}`);
-    if (fs.existsSync(pidFile)) {
-      fs.unlinkSync(pidFile);
-    }
+    removeDaemonPidFileIfMatches(pidFile, record);
   }
 }
 

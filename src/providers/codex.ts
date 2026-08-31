@@ -1,6 +1,7 @@
 import { ModelCapabilities, ModelInfo } from '../config/types.js';
 import { getLogger } from '../logger/logger.js';
 import { withProviderRetry } from './retry.js';
+import { providerRequestSignal } from './fetch.js';
 
 export const CODEX_KNOWN_MODELS: Record<string, Partial<ModelCapabilities>> = {
   'o1': {
@@ -41,14 +42,18 @@ export class CodexCatalog {
               Authorization: `Bearer ${accessToken}`,
               Accept: 'application/json',
             },
+            signal: providerRequestSignal(),
           });
           if (!res.ok) {
-            throw new Error(`OpenAI API returned ${res.status}`);
+            const error = new Error(`OpenAI API returned ${res.status}`);
+            (error as any).status = res.status;
+            (error as any).headers = res.headers;
+            throw error;
           }
           return await res.json();
         });
 
-        const list: any[] = Array.isArray(rawData.data) ? rawData.data : [];
+        const list: any[] = Array.isArray(rawData?.data) ? rawData.data : [];
         const result: ModelInfo[] = [];
 
         for (const item of list) {

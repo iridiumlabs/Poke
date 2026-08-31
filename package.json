@@ -26,6 +26,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@earendil-works/pi-ai": "0.83.0",
     "@flue/runtime": "^2.0.3",
     "@whiskeysockets/baileys": "^7.0.0-rc14",
     "better-sqlite3": "^13.0.3",

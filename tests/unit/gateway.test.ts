@@ -36,6 +36,14 @@ describe('WhatsApp Gateway & Sender', () => {
     expect(chunks[1]).toContain('Paragraph 2:');
   });
 
+  it('never produces an empty or oversized chunk near an incomplete code-block boundary', () => {
+    const text = `\`\`\`\n${'x'.repeat(95)}\n\`\`\`\n${'y'.repeat(100)}`;
+    const chunks = splitLongTextMessage(text, 100);
+
+    expect(chunks).toHaveLength(3);
+    expect(chunks.every((chunk) => chunk.length > 0 && chunk.length <= 100)).toBe(true);
+  });
+
   it('enforces owner-only message intake: rejects unknown senders and groups', async () => {
     let dispatchedCount = 0;
     let stoppedCount = 0;
@@ -171,7 +179,7 @@ describe('WhatsApp Gateway & Sender', () => {
     expect(result).toContain('message_id: ABC123');
   });
 
-  it('targets Deepgram Flux /v2/speak API for TTS synthesis', async () => {
+  it('targets Deepgram Aura-2 /v1/speak API for TTS synthesis', async () => {
     const dg = new DeepgramHandler('test-api-key', tempDir);
 
     let requestedUrl = '';
@@ -186,8 +194,8 @@ describe('WhatsApp Gateway & Sender', () => {
     });
 
     try {
-      const res = await dg.synthesizeToAudioFile('Hello from Deepgram Flux');
-      expect(requestedUrl).toContain('https://api.deepgram.com/v2/speak');
+      const res = await dg.synthesizeToAudioFile('Hello from Deepgram Aura-2');
+      expect(requestedUrl).toContain('https://api.deepgram.com/v1/speak');
       expect(requestedUrl).toContain('model=aura-2-thalia-en');
       expect(requestedUrl).toContain('encoding=opus');
       expect(res.mimeType).toContain('audio/ogg');
@@ -245,5 +253,57 @@ describe('WhatsApp Gateway & Sender', () => {
     // Redelivery
     await gateway.handleIncomingMessage(msg);
     expect(dispatchCount).toBe(1);
+  });
+
+  it('does not acknowledge an inbound message when dispatch admission fails', async () => {
+    let shouldFail = true;
+    let dispatchCount = 0;
+    const gateway = new WhatsAppGateway(
+      config,
+      db,
+      async () => {
+        dispatchCount++;
+        if (shouldFail) throw new Error('runtime is starting');
+      },
+      async () => {},
+      tempDir
+    );
+    const msg = {
+      key: { remoteJid: '923001234567@s.whatsapp.net', id: 'm-retry-dispatch' },
+      message: { conversation: 'Retry me' },
+    };
+
+    await expect(gateway.handleIncomingMessage(msg)).rejects.toThrow('runtime is starting');
+    expect(db.checkIdempotency('inbound_msg:m-retry-dispatch')).toBeNull();
+
+    shouldFail = false;
+    await gateway.handleIncomingMessage(msg);
+    expect(dispatchCount).toBe(2);
+    expect(db.checkIdempotency('inbound_msg:m-retry-dispatch')).not.toBeNull();
+  });
+
+  it('does not acknowledge /stop until the emergency action succeeds', async () => {
+    let stopAttempts = 0;
+    const gateway = new WhatsAppGateway(
+      config,
+      db,
+      async () => {},
+      async () => {
+        stopAttempts++;
+        if (stopAttempts === 1) throw new Error('abort failed');
+      },
+      tempDir
+    );
+    const msg = {
+      key: { remoteJid: '923001234567@s.whatsapp.net', id: 'm-retry-stop' },
+      message: { conversation: '/stop' },
+    };
+
+    await gateway.handleIncomingMessage(msg);
+    expect(db.checkIdempotency('inbound_msg:m-retry-stop')).toBeNull();
+
+    await gateway.handleIncomingMessage(msg);
+    expect(stopAttempts).toBe(2);
+    expect(db.checkIdempotency('inbound_msg:m-retry-stop')).not.toBeNull();
   });
 });

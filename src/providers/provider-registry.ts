@@ -32,6 +32,24 @@ export function resolveFlueModelSpecifier(selection?: ModelSelection): string {
   return `${providerPrefix}/${selection.model}`;
 }
 
+export function normalizeCatalogModelId(model: string, provider?: ProviderType): string {
+  const prefixes =
+    provider === 'codex'
+      ? ['openai-codex/', 'codex/']
+      : provider === 'commandcode'
+        ? ['commandcode/']
+        : provider === 'fireworks'
+          ? ['fireworks/']
+          : ['openai-codex/', 'codex/', 'commandcode/', 'fireworks/'];
+
+  for (const prefix of prefixes) {
+    if (model.startsWith(prefix)) {
+      return model.slice(prefix.length);
+    }
+  }
+  return model;
+}
+
 export function createCommandCodeProvider() {
   const DYNAMIC_MODEL_TEMPLATE = Symbol.for('flue.dynamicModelTemplate');
   const provider = createProvider({
@@ -83,19 +101,23 @@ export class ProviderRegistry {
   ): Promise<ModelInfo[]> {
     switch (provider) {
       case 'commandcode': {
-        if (!credentials.commandCodeApiKey) {
+        const apiKey = credentials.commandCodeApiKey || process.env.COMMANDCODE_API_KEY;
+        if (!apiKey) {
           throw new Error('Command Code API key is missing. Run `poke login` to authenticate.');
         }
-        return await CommandCodeCatalog.fetchLiveModels(credentials.commandCodeApiKey);
+        return await CommandCodeCatalog.fetchLiveModels(apiKey);
       }
       case 'fireworks': {
-        if (!credentials.fireworksApiKey) {
+        const apiKey = credentials.fireworksApiKey || process.env.FIREWORKS_API_KEY;
+        if (!apiKey) {
           throw new Error('Fireworks API key is missing. Run `poke login` to authenticate.');
         }
-        return await FireworksCatalog.fetchLiveModels(credentials.fireworksApiKey);
+        return await FireworksCatalog.fetchLiveModels(apiKey);
       }
       case 'codex': {
-        return await CodexCatalog.fetchLiveModels(credentials.codexAuth?.accessToken);
+        return await CodexCatalog.fetchLiveModels(
+          credentials.codexAuth?.accessToken || process.env.OPENAI_CODEX_ACCESS_TOKEN || process.env.OPENAI_API_KEY
+        );
       }
       default:
         throw new Error(`Unsupported provider: ${provider}`);
@@ -108,7 +130,8 @@ export class ProviderRegistry {
   ): Promise<{ valid: boolean; error?: string; modelInfo?: ModelInfo }> {
     try {
       const models = await this.fetchModels(selection.provider, credentials);
-      const found = models.find((m) => m.id === selection.model);
+      const modelId = normalizeCatalogModelId(selection.model, selection.provider);
+      const found = models.find((m) => m.id === modelId);
 
       if (!found) {
         return {

@@ -1,5 +1,7 @@
+import { randomUUID } from 'node:crypto';
 import { getLogger } from '../logger/logger.js';
 import { withProviderRetry } from '../providers/retry.js';
+import { providerRequestSignal } from '../providers/fetch.js';
 
 export interface MemorySaveParams {
   content: string;
@@ -35,6 +37,8 @@ export class SupermemoryToolHandler {
 
     const logger = getLogger();
     logger.info({ containerId: this.containerId }, 'Saving memory to Supermemory');
+    const customId = `poke-${randomUUID()}`;
+    const savedAt = new Date().toISOString();
 
     return await withProviderRetry(async () => {
       const res = await fetch(`${this.baseUrl}/memories`, {
@@ -43,12 +47,14 @@ export class SupermemoryToolHandler {
           Authorization: `Bearer ${this.apiKey}`,
           'Content-Type': 'application/json',
         },
+        signal: providerRequestSignal(),
         body: JSON.stringify({
           content: params.content,
           containerId: this.containerId,
+          customId,
           metadata: {
             ...params.metadata,
-            savedAt: new Date().toISOString(),
+            savedAt,
           },
         }),
       });
@@ -57,6 +63,7 @@ export class SupermemoryToolHandler {
         const text = await res.text().catch(() => '');
         const err = new Error(`Supermemory save returned ${res.status}: ${text}`);
         (err as any).status = res.status;
+        (err as any).headers = res.headers;
         throw err;
       }
 
@@ -81,6 +88,7 @@ export class SupermemoryToolHandler {
           'Content-Type': 'application/json',
           Accept: 'application/json',
         },
+        signal: providerRequestSignal(),
         body: JSON.stringify({
           query: params.query,
           containerId: this.containerId,
@@ -92,6 +100,7 @@ export class SupermemoryToolHandler {
         const text = await res.text().catch(() => '');
         const err = new Error(`Supermemory recall returned ${res.status}: ${text}`);
         (err as any).status = res.status;
+        (err as any).headers = res.headers;
         throw err;
       }
 

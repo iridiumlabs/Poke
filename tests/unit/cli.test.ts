@@ -2,10 +2,15 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import readline from 'node:readline';
+import { PassThrough, Writable } from 'node:stream';
 import { runDoctor } from '../../src/cli/doctor.js';
 import { redactSecrets } from '../../src/logger/logger.js';
 import { ConfigManager } from '../../src/config/config.js';
 import { PokeDatabase } from '../../src/db/database.js';
+import { readLogTail } from '../../src/cli/logs.js';
+import { promptSecret } from '../../src/cli/prompt.js';
+import { createCli } from '../../src/cli/index.js';
 
 describe('CLI & Diagnostics', () => {
   let tempDir: string;
@@ -65,5 +70,41 @@ describe('CLI & Diagnostics', () => {
 
     const exaCheck = checks.find((c) => c.name === 'Exa API Key');
     expect(exaCheck?.passed).toBe(true);
+  });
+
+  it('reads only the requested tail of a large log file', () => {
+    const logFile = path.join(tempDir, 'poke.log');
+    const lines = Array.from({ length: 2_000 }, (_, index) => `line-${index}`);
+    fs.writeFileSync(logFile, `${lines.join('\n')}\n`);
+
+    expect(readLogTail(logFile, 3)).toEqual(['line-1997', 'line-1998', 'line-1999']);
+  });
+
+  it('masks credential input in a terminal readline prompt', async () => {
+    const input = new PassThrough();
+    let output = '';
+    const outputStream = new Writable({
+      write(chunk, _encoding, callback) {
+        output += chunk.toString();
+        callback();
+      },
+    });
+    const rl = readline.createInterface({ input, output: outputStream, terminal: true });
+
+    const answer = promptSecret(rl, 'API key: ', true);
+    input.write('secret-value\n');
+
+    await expect(answer).resolves.toBe('secret-value');
+    expect(output).not.toContain('secret-value');
+    expect(output).toContain('************');
+    rl.close();
+  });
+
+  it('rejects an invalid model target before selecting a configuration', async () => {
+    const program = createCli();
+
+    await expect(
+      program.parseAsync(['node', 'poke', 'model', 'wroker'], { from: 'node' })
+    ).rejects.toThrow('Model target must be "main" or "worker".');
   });
 });

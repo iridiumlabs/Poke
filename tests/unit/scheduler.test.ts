@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -119,5 +119,54 @@ describe('AutomationScheduler & Timezone (Asia/Karachi)', () => {
     // Overdue cron was recomputed to a future occurrence (missed intervals skipped)
     const updatedCron = db.getAutomation('auto-cron');
     expect(updatedCron?.next_run_at).toBeGreaterThan(now);
+  });
+
+  it('atomically claims an overdue automation and escapes its untrusted signal fields', async () => {
+    const scheduledAt = Date.now() - 1_000;
+    db.createAutomation({
+      id: 'auto-"<&',
+      name: 'Daily "summary" & review',
+      instruction: 'Read <untrusted> & report it.',
+      schedule_type: 'once',
+      schedule_value: new Date(scheduledAt).toISOString(),
+      next_run_at: scheduledAt,
+    });
+
+    const dispatched: string[] = [];
+    scheduler.setDispatcher(async (signal) => {
+      dispatched.push(signal);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+    scheduler.start(60_000);
+
+    await Promise.all([scheduler.tick(), scheduler.tick()]);
+
+    expect(dispatched).toHaveLength(1);
+    expect(dispatched[0]).toContain('id="auto-&quot;&lt;&amp;"');
+    expect(dispatched[0]).toContain('name="Daily &quot;summary&quot; &amp; review"');
+    expect(dispatched[0]).toContain('Read &lt;untrusted&gt; &amp; report it.');
+    expect(db.getAutomation('auto-"<&')?.last_outcome).toBe('dispatched');
+    expect(db.getAutomation('auto-"<&')?.enabled).toBe(0);
+  });
+
+  it('keeps a failed dispatch eligible for a bounded retry instead of leaving it claimed', async () => {
+    const scheduledAt = Date.now() - 1_000;
+    db.createAutomation({
+      id: 'auto-retry',
+      name: 'Retry alert',
+      instruction: 'Send the alert.',
+      schedule_type: 'once',
+      schedule_value: new Date(scheduledAt).toISOString(),
+      next_run_at: scheduledAt,
+    });
+    scheduler.setDispatcher(vi.fn().mockRejectedValue(new Error('main agent unavailable')));
+    scheduler.start(60_000);
+
+    await scheduler.tick();
+
+    const updated = db.getAutomation('auto-retry');
+    expect(updated?.last_outcome).toContain('dispatch_error: main agent unavailable');
+    expect(updated?.next_run_at).toBeGreaterThan(Date.now());
+    expect(updated?.enabled).toBe(1);
   });
 });

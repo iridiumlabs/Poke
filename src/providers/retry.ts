@@ -4,9 +4,12 @@ export interface RetryOptions {
   maxAttempts?: number;
   delaysMs?: number[];
   jitter?: boolean;
+  maxDelayMs?: number;
+  signal?: AbortSignal;
 }
 
 export const DEFAULT_PROVIDER_RETRY_DELAYS_MS = [2000, 5000, 10000, 20000];
+export const MAX_PROVIDER_RETRY_DELAY_MS = 60_000;
 
 export class NonRetryableError extends Error {
   constructor(message: string, public readonly statusCode?: number, public readonly cause?: unknown) {
@@ -87,6 +90,33 @@ export function extractRetryAfterMs(error: any): number | null {
   return null;
 }
 
+function abortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error('Provider retry aborted.');
+}
+
+function waitForRetryDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) {
+    return new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+
+  if (signal.aborted) {
+    return Promise.reject(abortError(signal));
+  }
+
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(abortError(signal));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, delayMs);
+
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 export async function withProviderRetry<T>(
   operation: (attempt: number) => Promise<T>,
   options?: RetryOptions
@@ -98,10 +128,18 @@ export async function withProviderRetry<T>(
   let lastError: any = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (options?.signal?.aborted) {
+      throw abortError(options.signal);
+    }
+
     try {
       return await operation(attempt);
     } catch (err: any) {
       lastError = err;
+
+      if (options?.signal?.aborted) {
+        throw abortError(options.signal);
+      }
 
       if (!isTransientError(err)) {
         logger.warn(
@@ -120,12 +158,13 @@ export async function withProviderRetry<T>(
       }
 
       const retryAfterMs = extractRetryAfterMs(err);
-      let delayMs = retryAfterMs !== null ? retryAfterMs : delays[attempt - 1] || 20000;
+      const maxDelayMs = options?.maxDelayMs ?? MAX_PROVIDER_RETRY_DELAY_MS;
+      let delayMs = Math.min(retryAfterMs !== null ? retryAfterMs : delays[attempt - 1] || 20000, maxDelayMs);
 
       if (options?.jitter !== false) {
         // Add up to ±10% jitter
         const jitter = (Math.random() * 0.2 - 0.1) * delayMs;
-        delayMs = Math.max(100, Math.round(delayMs + jitter));
+        delayMs = Math.min(maxDelayMs, Math.max(100, Math.round(delayMs + jitter)));
       }
 
       logger.info(
@@ -133,7 +172,7 @@ export async function withProviderRetry<T>(
         'Transient provider error, scheduling retry'
       );
 
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      await waitForRetryDelay(delayMs, options?.signal);
     }
   }
 

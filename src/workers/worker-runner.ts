@@ -56,24 +56,21 @@ export class WorkerRunner {
         throw new Error('No worker or main model configured. Run `poke model worker` or `poke model`.');
       }
 
-      // Execute worker task through Flue PokeWorkerAgent instance
-      const resultText = await withProviderRetry(async () => {
-        if (this.abortController?.signal.aborted) {
-          throw new Error('Worker aborted');
-        }
-
-        this.agentHandle = init(PokeWorkerAgent, { id: this.job.id });
-        const receipt = await this.agentHandle.dispatch({
-          message: this.job.instruction,
-          initialData: { cwd: this.job.cwd || undefined },
-        });
-
-        const reply = await this.agentHandle.read(receipt, {
-          signal: this.abortController?.signal,
-        });
-
-        return reply.text || 'Worker task completed.';
+      // A durable receipt may be read again safely, but dispatching it again can repeat tool calls.
+      this.agentHandle = init(PokeWorkerAgent, { id: this.job.id });
+      const receipt = await this.agentHandle.dispatch({
+        message: this.job.instruction,
+        initialData: { cwd: this.job.cwd || undefined },
       });
+      const resultText = await withProviderRetry(
+        async () => {
+          const reply = await this.agentHandle!.read(receipt, {
+            signal: this.abortController?.signal,
+          });
+          return reply.text || 'Worker task completed.';
+        },
+        { signal: this.abortController.signal }
+      );
 
       if (this.abortController.signal.aborted) {
         return { status: 'aborted' };

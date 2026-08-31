@@ -4,14 +4,7 @@ import { ProviderType } from '../config/types.js';
 import { CommandCodeCatalog } from '../providers/commandcode.js';
 import { FireworksCatalog } from '../providers/fireworks.js';
 import { CodexCatalog } from '../providers/codex.js';
-
-function promptQuestion(rl: readline.Interface, query: string): Promise<string> {
-  return new Promise((resolve) => {
-    rl.question(query, (answer) => {
-      resolve(answer.trim());
-    });
-  });
-}
+import { promptQuestion, promptSecret } from './prompt.js';
 
 export async function runLogin(customHome?: string, inputRl?: readline.Interface): Promise<void> {
   const rl =
@@ -32,7 +25,7 @@ export async function runLogin(customHome?: string, inputRl?: readline.Interface
     const choice = await promptQuestion(rl, '\nSelect provider [1-3]: ');
 
     if (choice === '1' || choice.toLowerCase().includes('command')) {
-      const key = await promptQuestion(rl, 'Enter Command Code Provider API key: ');
+      const key = await promptSecret(rl, 'Enter Command Code Provider API key: ', !inputRl);
       if (key) {
         console.log('Validating Command Code credentials...');
         try {
@@ -46,7 +39,7 @@ export async function runLogin(customHome?: string, inputRl?: readline.Interface
         }
       }
     } else if (choice === '2' || choice.toLowerCase().includes('fireworks')) {
-      const key = await promptQuestion(rl, 'Enter Fireworks AI API key: ');
+      const key = await promptSecret(rl, 'Enter Fireworks AI API key: ', !inputRl);
       if (key) {
         console.log('Validating Fireworks credentials...');
         try {
@@ -60,7 +53,7 @@ export async function runLogin(customHome?: string, inputRl?: readline.Interface
         }
       }
     } else if (choice === '3' || choice.toLowerCase().includes('codex')) {
-      const token = await promptQuestion(rl, 'Enter Codex Access Token: ');
+      const token = await promptSecret(rl, 'Enter Codex Access Token: ', !inputRl);
       if (token) {
         configManager.updateCredentials({
           codexAuth: {

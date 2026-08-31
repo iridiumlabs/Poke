@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -9,6 +9,7 @@ import { ExaToolHandler } from '../../src/tools/exa.js';
 import { SupermemoryToolHandler } from '../../src/tools/supermemory.js';
 import { ComposioToolHandler } from '../../src/tools/composio.js';
 import { SkillRegistry } from '../../src/skills/registry.js';
+import { WorkerRunner } from '../../src/workers/worker-runner.js';
 
 describe('WorkerManager', () => {
   let tempDir: string;
@@ -36,6 +37,7 @@ describe('WorkerManager', () => {
     workerManager.stop();
     db.close();
     fs.rmSync(tempDir, { recursive: true, force: true });
+    vi.restoreAllMocks();
   });
 
   it('runs up to 4 concurrent workers and queues the 5th', async () => {
@@ -135,5 +137,59 @@ describe('WorkerManager', () => {
     expect(updated?.status).toBe('failed');
     expect(updated?.error).toContain('Worker interrupted by daemon restart');
     expect(db.getRunningWorkerJobs().length).toBe(0);
+  });
+
+  it('persists a terminal worker outcome even when no completion dispatcher is attached', async () => {
+    vi.spyOn(WorkerRunner.prototype, 'run').mockResolvedValue({
+      status: 'completed',
+      result: 'Finished without an agent dispatcher.',
+    });
+
+    const job = await workerManager.startJob({
+      name: 'durable-result',
+      instruction: 'Complete this task.',
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const updated = db.getWorkerJob(job.id);
+    expect(updated?.status).toBe('completed');
+    expect(updated?.result).toBe('Finished without an agent dispatcher.');
+    expect(updated?.completion_dispatched_at).toBeNull();
+  });
+
+  it('releases a worker slot when the runner reports an abort', async () => {
+    vi.spyOn(WorkerRunner.prototype, 'run').mockResolvedValue({ status: 'aborted' });
+
+    const job = await workerManager.startJob({
+      name: 'self-aborted',
+      instruction: 'Abort this task.',
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(db.getWorkerJob(job.id)?.status).toBe('aborted');
+    expect(db.getRunningWorkerJobs()).toHaveLength(0);
+  });
+
+  it('retries an undelivered startup completion and escapes worker-controlled XML', async () => {
+    const dispatched: string[] = [];
+    workerManager.setCompletionDispatcher(async (signal) => {
+      dispatched.push(signal);
+    });
+    const crashedJob = db.createWorkerJob({
+      id: 'job-"<&',
+      name: 'crashed "worker" & task',
+      instruction: 'Do heavy work',
+      status: 'running',
+    });
+
+    workerManager.reconcileStartupJobs();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const updated = db.getWorkerJob(crashedJob.id);
+    expect(updated?.status).toBe('failed');
+    expect(updated?.completion_dispatched_at).not.toBeNull();
+    expect(dispatched).toHaveLength(1);
+    expect(dispatched[0]).toContain('id="job-&quot;&lt;&amp;"');
+    expect(dispatched[0]).toContain('name="crashed &quot;worker&quot; &amp; task"');
   });
 });

@@ -1,4 +1,3 @@
-import fs from 'fs';
 import path from 'path';
 import { ConfigManager } from '../config/config.js';
 import { PokeDatabase } from '../db/database.js';
@@ -13,6 +12,8 @@ import { WhatsAppGateway } from '../gateway/whatsapp.js';
 import { PokeRuntime } from '../agent/runtime.js';
 import { getLogger } from '../logger/logger.js';
 import { resolvePokePaths, ensurePokeDirectories } from '../config/paths.js';
+import { resolvePokeInstallationPaths } from '../config/installation.js';
+import { claimDaemonPidFile, removeOwnedDaemonPidFile } from './pid-file.js';
 
 export class PokeDaemon {
   private configManager: ConfigManager;
@@ -28,6 +29,8 @@ export class PokeDaemon {
   private runtime: PokeRuntime;
   private pidFile: string;
   private isRunning = false;
+  private ownsPidFile = false;
+  private signalHandlers: Array<[NodeJS.Signals, () => void]> = [];
 
   constructor(customHome?: string) {
     const paths = resolvePokePaths(customHome);
@@ -114,51 +117,72 @@ export class PokeDaemon {
 
   async start(): Promise<void> {
     if (this.isRunning) return;
-    this.isRunning = true;
 
     const logger = getLogger();
     logger.info({ pid: process.pid }, 'Starting Poke daemon');
 
-    // Write PID file
-    fs.writeFileSync(this.pidFile, String(process.pid), 'utf8');
-
-    // Start Flue agent runtime
-    await this.runtime.start();
-
-    // Start WhatsApp gateway
-    await this.gateway.start();
-
-    // Graceful shutdown listeners
-    const onSignal = async (signal: string) => {
-      logger.info({ signal }, 'Received shutdown signal');
+    try {
+      claimDaemonPidFile(this.pidFile, resolvePokeInstallationPaths().pokeBinPath);
+    } catch (err) {
       await this.stop();
-      process.exit(0);
-    };
+      throw err;
+    }
+    this.ownsPidFile = true;
+    this.isRunning = true;
 
-    process.on('SIGINT', () => onSignal('SIGINT'));
-    process.on('SIGTERM', () => onSignal('SIGTERM'));
+    try {
+      await this.runtime.start();
+      await this.gateway.start();
 
-    logger.info('Poke daemon is running');
+      const onSignal = (signal: NodeJS.Signals) => {
+        logger.info({ signal }, 'Received shutdown signal');
+        void this.stop().finally(() => process.exit(0));
+      };
+      this.signalHandlers = [
+        ['SIGINT', () => onSignal('SIGINT')],
+        ['SIGTERM', () => onSignal('SIGTERM')],
+      ];
+      for (const [signal, handler] of this.signalHandlers) {
+        process.once(signal, handler);
+      }
+
+      logger.info('Poke daemon is running');
+    } catch (err) {
+      logger.error({ err: err instanceof Error ? err.message : String(err) }, 'Poke daemon startup failed');
+      await this.stop();
+      throw err;
+    }
   }
 
   async stop(): Promise<void> {
-    if (!this.isRunning) return;
+    if (!this.isRunning && !this.db.isOpen()) return;
     this.isRunning = false;
 
     const logger = getLogger();
     logger.info('Stopping Poke daemon gracefully');
 
-    try {
-      await this.gateway.stop();
-      this.workerManager.stop();
-      await this.runtime.stop();
-      this.db.close();
+    for (const [signal, handler] of this.signalHandlers) {
+      process.off(signal, handler);
+    }
+    this.signalHandlers = [];
 
-      if (fs.existsSync(this.pidFile)) {
-        fs.unlinkSync(this.pidFile);
+    const cleanup = async (name: string, action: () => void | Promise<void>) => {
+      try {
+        await action();
+      } catch (err: any) {
+        logger.error({ err: err.message }, `Failed to stop ${name}`);
       }
-    } catch (err: any) {
-      logger.error({ err: err.message }, 'Error during daemon shutdown');
+    };
+
+    await cleanup('WhatsApp gateway', () => this.gateway.stop());
+    await cleanup('worker manager', () => this.workerManager.stop());
+    await cleanup('Flue runtime', () => this.runtime.stop());
+    await cleanup('skill registry', () => this.skills.stopWatcher());
+    await cleanup('database', () => this.db.close());
+
+    if (this.ownsPidFile) {
+      await cleanup('PID file', () => removeOwnedDaemonPidFile(this.pidFile));
+      this.ownsPidFile = false;
     }
   }
 }

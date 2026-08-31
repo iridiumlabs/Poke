@@ -12,6 +12,7 @@ import { ComposioToolHandler } from '../../src/tools/composio.js';
 describe('Integration: End-to-End Poke Agent Flows', () => {
   let tempDir: string;
   let daemon: PokeDaemon;
+  let skills: SkillRegistry | null = null;
 
   beforeEach(() => {
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'poke-e2e-test-'));
@@ -28,6 +29,7 @@ describe('Integration: End-to-End Poke Agent Flows', () => {
   });
 
   afterEach(async () => {
+    skills?.stopWatcher();
     await daemon.stop();
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
@@ -38,13 +40,26 @@ describe('Integration: End-to-End Poke Agent Flows', () => {
     const sender = gateway.getSender();
     const workerManager = daemon.getWorkerManager();
     const scheduler = daemon.getScheduler();
-    const skills = new SkillRegistry(path.join(tempDir, 'skills'));
+    skills = new SkillRegistry(path.join(tempDir, 'skills'));
     skills.seedDefaultSkills();
 
     let sentMessage = '';
     vi.spyOn(sender, 'send').mockImplementation(async (params) => {
       sentMessage = params.text;
       return { messageId: 'msg-mock-1', mode: params.mode, timestamp: Date.now() };
+    });
+    vi.spyOn(workerManager, 'startJob').mockResolvedValue({
+      id: 'job-mock-1',
+      name: 'data-processing',
+      instruction: 'Process records in /tmp/data',
+      cwd: null,
+      status: 'queued',
+      result: null,
+      error: null,
+      created_at: Date.now(),
+      started_at: null,
+      finished_at: null,
+      completion_dispatched_at: null,
     });
 
     const tools = createPokeTools({

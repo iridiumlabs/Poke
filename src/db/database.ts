@@ -205,6 +205,43 @@ export class PokeDatabase {
     this.db.prepare(`UPDATE worker_jobs SET ${fields.join(', ')} WHERE id = ?`).run(...values);
   }
 
+  completeWorkerJob(
+    id: string,
+    outcome: Pick<WorkerJobRecord, 'status' | 'result' | 'error' | 'finished_at'>
+  ): boolean {
+    if (!this.isOpen()) return false;
+
+    const result = this.db
+      .prepare(
+        `UPDATE worker_jobs
+         SET status = @status, result = @result, error = @error, finished_at = @finished_at
+         WHERE id = @id AND status = 'running'`
+      )
+      .run({
+        id,
+        status: outcome.status,
+        result: outcome.result ?? null,
+        error: outcome.error ?? null,
+        finished_at: outcome.finished_at ?? Date.now(),
+      });
+
+    return result.changes > 0;
+  }
+
+  markWorkerCompletionDispatched(id: string): boolean {
+    if (!this.isOpen()) return false;
+    const result = this.db
+      .prepare(
+        `UPDATE worker_jobs
+         SET completion_dispatched_at = ?
+         WHERE id = ?
+           AND status IN ('completed', 'failed')
+           AND completion_dispatched_at IS NULL`
+      )
+      .run(Date.now(), id);
+    return result.changes > 0;
+  }
+
   abortAllActiveWorkerJobs(): { abortedIds: string[]; cancelledIds: string[] } {
     if (!this.isOpen()) return { abortedIds: [], cancelledIds: [] };
     const running = this.getRunningWorkerJobs();
@@ -327,7 +364,12 @@ export class PokeDatabase {
     if (!this.isOpen()) return [];
     return this.db
       .prepare(
-        'SELECT * FROM automations WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ? ORDER BY next_run_at ASC'
+        `SELECT * FROM automations
+         WHERE enabled = 1
+           AND next_run_at IS NOT NULL
+           AND next_run_at <= ?
+           AND (last_outcome IS NULL OR last_outcome != 'claimed')
+         ORDER BY next_run_at ASC`
       )
       .all(nowMs) as AutomationRecord[];
   }
@@ -336,10 +378,30 @@ export class PokeDatabase {
     if (!this.isOpen()) return null;
     const row = this.db
       .prepare(
-        'SELECT * FROM automations WHERE enabled = 1 AND next_run_at IS NOT NULL ORDER BY next_run_at ASC LIMIT 1'
+        `SELECT * FROM automations
+         WHERE enabled = 1
+           AND next_run_at IS NOT NULL
+           AND (last_outcome IS NULL OR last_outcome != 'claimed')
+         ORDER BY next_run_at ASC
+         LIMIT 1`
       )
       .get() as AutomationRecord | undefined;
     return row || null;
+  }
+
+  claimDueAutomation(id: string, scheduledAt: number, claimedAt: number): boolean {
+    if (!this.isOpen()) return false;
+    const result = this.db
+      .prepare(
+        `UPDATE automations
+         SET last_run_at = ?, last_outcome = 'claimed', updated_at = ?
+         WHERE id = ?
+           AND enabled = 1
+           AND next_run_at = ?
+           AND (last_outcome IS NULL OR last_outcome != 'claimed')`
+      )
+      .run(claimedAt, claimedAt, id, scheduledAt);
+    return result.changes > 0;
   }
 
   // --- Idempotency ---

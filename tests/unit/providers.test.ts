@@ -1,6 +1,8 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { withProviderRetry, isTransientError, NonRetryableError } from '../../src/providers/retry.js';
 import { CommandCodeCatalog } from '../../src/providers/commandcode.js';
+import { ProviderRegistry, normalizeCatalogModelId } from '../../src/providers/provider-registry.js';
+import { ComposioToolHandler } from '../../src/tools/composio.js';
 
 describe('Provider Retry & Error Classification', () => {
   it('identifies transient errors correctly', () => {
@@ -51,6 +53,32 @@ describe('Provider Retry & Error Classification', () => {
 
     expect(attempts).toBe(1);
   });
+
+  it('cancels a Retry-After wait when the caller aborts', async () => {
+    const controller = new AbortController();
+    let attempts = 0;
+    let operationStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      operationStarted = resolve;
+    });
+
+    const retry = withProviderRetry(
+      async () => {
+        attempts++;
+        operationStarted();
+        const error = new Error('Too many requests');
+        (error as any).status = 429;
+        (error as any).headers = new Headers({ 'retry-after': '86400' });
+        throw error;
+      },
+      { signal: controller.signal, jitter: false }
+    );
+
+    await started;
+    controller.abort(new Error('runtime stopped'));
+    await expect(retry).rejects.toThrow('runtime stopped');
+    expect(attempts).toBe(1);
+  });
 });
 
 describe('CommandCodeCatalog', () => {
@@ -63,6 +91,25 @@ describe('CommandCodeCatalog', () => {
     expect(sonnetMeta?.reasoningEfforts).toContain('low');
     expect(sonnetMeta?.reasoningEfforts).toContain('high');
   });
+
+  it('normalizes live reasoning effort metadata without accepting malformed values', async () => {
+    const originalFetch = global.fetch;
+    global.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          data: [{ id: 'model-a', reasoningEfforts: ['HIGH', 'not-an-effort', 5, null] }],
+        }),
+        { status: 200 }
+      )) as typeof fetch;
+
+    try {
+      const models = await CommandCodeCatalog.fetchLiveModels('test-key');
+      expect(models).toHaveLength(1);
+      expect(models[0].capabilities.reasoningEfforts).toEqual(['high']);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
 });
 
 describe('resolveFlueModelSpecifier', () => {
@@ -73,5 +120,81 @@ describe('resolveFlueModelSpecifier', () => {
     expect(resolveFlueModelSpecifier({ provider: 'commandcode', model: 'claude-sonnet-4-6' })).toBe('commandcode/claude-sonnet-4-6');
     expect(resolveFlueModelSpecifier({ provider: 'fireworks', model: 'accounts/fireworks/models/deepseek-r1' })).toBe('fireworks/accounts/fireworks/models/deepseek-r1');
     expect(resolveFlueModelSpecifier({ provider: 'codex', model: 'openai-codex/o3-mini' })).toBe('openai-codex/o3-mini');
+  });
+
+  it('matches provider-qualified configuration IDs with bare live catalog IDs', async () => {
+    expect(normalizeCatalogModelId('openai-codex/gpt-4o', 'codex')).toBe('gpt-4o');
+    expect(normalizeCatalogModelId('commandcode/claude-sonnet-4-6', 'commandcode')).toBe('claude-sonnet-4-6');
+    expect(normalizeCatalogModelId('fireworks/accounts/fireworks/models/deepseek-r1', 'fireworks')).toBe(
+      'accounts/fireworks/models/deepseek-r1'
+    );
+
+    const fetchModels = vi.spyOn(ProviderRegistry, 'fetchModels').mockResolvedValue([
+      {
+        id: 'gpt-4o',
+        name: 'gpt-4o',
+        capabilities: { reasoningEfforts: [] },
+      },
+    ]);
+    try {
+      await expect(
+        ProviderRegistry.validateSelection(
+          { provider: 'codex', model: 'openai-codex/gpt-4o' },
+          {}
+        )
+      ).resolves.toMatchObject({ valid: true, modelInfo: { id: 'gpt-4o' } });
+    } finally {
+      fetchModels.mockRestore();
+    }
+  });
+
+  it('uses environment credentials while validating a provider selection', async () => {
+    const previousKey = process.env.COMMANDCODE_API_KEY;
+    process.env.COMMANDCODE_API_KEY = 'env-command-code-key';
+    const fetchLiveModels = vi.spyOn(CommandCodeCatalog, 'fetchLiveModels').mockResolvedValue([]);
+
+    try {
+      await ProviderRegistry.fetchModels('commandcode', {});
+      expect(fetchLiveModels).toHaveBeenCalledWith('env-command-code-key');
+    } finally {
+      fetchLiveModels.mockRestore();
+      if (previousKey === undefined) {
+        delete process.env.COMMANDCODE_API_KEY;
+      } else {
+        process.env.COMMANDCODE_API_KEY = previousKey;
+      }
+    }
+  });
+});
+
+describe('ComposioToolHandler', () => {
+  it('caches the locally filtered catalog and does not retry externally mutating actions', async () => {
+    const handler = new ComposioToolHandler('test-key');
+    const toolset = {
+      getTools: vi.fn().mockResolvedValue([
+        {
+          function: {
+            name: 'GMAIL_SEND_EMAIL',
+            description: 'Send an email through Gmail.',
+            parameters: { type: 'object' },
+          },
+        },
+      ]),
+      executeAction: vi.fn().mockRejectedValue(new Error('connection reset after action')),
+    };
+    (handler as any).toolset = toolset;
+
+    await expect(handler.search({ query: 'email' })).resolves.toMatchObject({
+      actions: [{ name: 'GMAIL_SEND_EMAIL' }],
+    });
+    await expect(handler.search({ query: 'gmail' })).resolves.toMatchObject({
+      actions: [{ name: 'GMAIL_SEND_EMAIL' }],
+    });
+    expect(toolset.getTools).toHaveBeenCalledTimes(1);
+
+    await expect(handler.execute({ action: 'GMAIL_SEND_EMAIL' })).rejects.toThrow(
+      'connection reset after action'
+    );
+    expect(toolset.executeAction).toHaveBeenCalledTimes(1);
   });
 });

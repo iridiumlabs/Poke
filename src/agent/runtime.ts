@@ -44,97 +44,109 @@ export class PokeRuntime {
     if (this.isRunning) return;
     this.isRunning = true;
 
-    const logger = getLogger();
-    logger.info('Starting Poke Flue runtime');
-
-    const paths = resolvePokePaths(this.customHome);
-    ensurePokeDirectories(paths);
-
-    // Register all AI model providers (Command Code, Fireworks, Codex)
-    registerAllProviders();
-
-    const creds = this.configManager.getCredentials();
-    const mainModel = this.configManager.getMainModel();
-    if (mainModel) {
-      const validation = await ProviderRegistry.validateSelection(mainModel, creds);
-      if (!validation.valid) {
-        throw new Error(`Invalid main model configuration: ${validation.error}`);
-      }
-    }
-
-    const toolContexts = {
-      sender: this.sender,
-      exa: this.exa,
-      supermemory: this.supermemory,
-      composio: this.composio,
-      workerManager: this.workerManager,
-      scheduler: this.scheduler,
-      skills: this.skills,
-      configManager: this.configManager,
-    };
-
-    // Set shared contexts for main agent and worker agent
-    setMainAgentContexts(toolContexts, this.compactionManager);
-    setWorkerAgentContexts(toolContexts);
-
-    // Seed default skills
-    this.skills.seedDefaultSkills();
-
-    // Prepare runtime environment forwarding system env + configured credentials
-    const runtimeEnv: Record<string, string | undefined> = {
-      ...process.env,
-      COMMANDCODE_API_KEY: creds.commandCodeApiKey || process.env.COMMANDCODE_API_KEY,
-      FIREWORKS_API_KEY: creds.fireworksApiKey || process.env.FIREWORKS_API_KEY,
-      OPENAI_API_KEY: creds.codexAuth?.accessToken || process.env.OPENAI_API_KEY,
-      OPENAI_CODEX_ACCESS_TOKEN: creds.codexAuth?.accessToken || process.env.OPENAI_CODEX_ACCESS_TOKEN,
-      EXA_API_KEY: creds.exaApiKey || process.env.EXA_API_KEY,
-      DEEPGRAM_API_KEY: creds.deepgramApiKey || process.env.DEEPGRAM_API_KEY,
-      SUPERMEMORY_API_KEY: creds.supermemoryApiKey || process.env.SUPERMEMORY_API_KEY,
-      COMPOSIO_API_KEY: creds.composioApiKey || process.env.COMPOSIO_API_KEY,
-    };
-
-    // Start Flue runtime with SQLite persistence
-    this.flue = await start({
-      agents: [PokeMainAgent, PokeWorkerAgent],
-      db: sqlite(paths.sqliteFile),
-      env: runtimeEnv as any,
-    });
-
-    // Subscribe to Flue events for compaction observation
     try {
-      this.unsubscribeObserver = observe((event: any) => {
-        if (event.type === 'compaction') {
-          this.compactionManager.onCompactionSuccess();
+      const logger = getLogger();
+      logger.info('Starting Poke Flue runtime');
+
+      const paths = resolvePokePaths(this.customHome);
+      ensurePokeDirectories(paths);
+
+      // Register all AI model providers (Command Code, Fireworks, Codex)
+      registerAllProviders();
+
+      const creds = this.configManager.getCredentials();
+      const mainModel = this.configManager.getMainModel();
+      if (mainModel) {
+        const validation = await ProviderRegistry.validateSelection(mainModel, creds);
+        if (!validation.valid) {
+          throw new Error(`Invalid main model configuration: ${validation.error}`);
         }
-      }) as any;
-    } catch {}
+      }
 
-    // Obtain stable handle for owner
-    this.agentHandle = init(PokeMainAgent, { id: MAIN_AGENT_INSTANCE_ID });
+      const toolContexts = {
+        sender: this.sender,
+        exa: this.exa,
+        supermemory: this.supermemory,
+        composio: this.composio,
+        workerManager: this.workerManager,
+        scheduler: this.scheduler,
+        skills: this.skills,
+        configManager: this.configManager,
+      };
 
-    // Connect worker completion dispatcher to main agent
-    this.workerManager.setCompletionDispatcher(async (signalXml) => {
-      await this.dispatchSignal('worker.completion', signalXml);
-    });
+      // Set shared contexts for main agent and worker agent
+      setMainAgentContexts(toolContexts, this.compactionManager);
+      setWorkerAgentContexts(toolContexts);
 
-    // Connect automation dispatcher to main agent
-    this.scheduler.setDispatcher(async (signalXml) => {
-      await this.dispatchSignal('automation.trigger', signalXml);
-    });
+      // Seed default skills
+      this.skills.seedDefaultSkills();
 
-    // Start scheduler
-    this.scheduler.start();
+      // Prepare runtime environment forwarding system env + configured credentials
+      const runtimeEnv: Record<string, string | undefined> = {
+        ...process.env,
+        COMMANDCODE_API_KEY: creds.commandCodeApiKey || process.env.COMMANDCODE_API_KEY,
+        FIREWORKS_API_KEY: creds.fireworksApiKey || process.env.FIREWORKS_API_KEY,
+        OPENAI_API_KEY: creds.codexAuth?.accessToken || process.env.OPENAI_API_KEY,
+        OPENAI_CODEX_ACCESS_TOKEN: creds.codexAuth?.accessToken || process.env.OPENAI_CODEX_ACCESS_TOKEN,
+        EXA_API_KEY: creds.exaApiKey || process.env.EXA_API_KEY,
+        DEEPGRAM_API_KEY: creds.deepgramApiKey || process.env.DEEPGRAM_API_KEY,
+        SUPERMEMORY_API_KEY: creds.supermemoryApiKey || process.env.SUPERMEMORY_API_KEY,
+        COMPOSIO_API_KEY: creds.composioApiKey || process.env.COMPOSIO_API_KEY,
+      };
 
-    // Reconcile startup worker queue
-    this.workerManager.reconcileStartupJobs();
-    this.workerManager.processQueue();
+      // Start Flue runtime with SQLite persistence
+      this.flue = await start({
+        agents: [PokeMainAgent, PokeWorkerAgent],
+        db: sqlite(paths.sqliteFile),
+        env: runtimeEnv as any,
+      });
 
-    // Start idle compaction check loop (every 60s)
-    this.idleCheckInterval = setInterval(() => {
-      this.checkIdleCompaction();
-    }, 60000);
+      // Subscribe to Flue events for compaction observation
+      try {
+        this.unsubscribeObserver = observe((event: any) => {
+          if (event.type !== 'compaction') return;
+          if (event.isError) {
+            this.compactionManager.onCompactionFailure(event.error || new Error('Flue compaction failed.'));
+          } else {
+            this.compactionManager.onCompactionSuccess();
+          }
+        }) as any;
+      } catch {}
 
-    logger.info('Poke Flue runtime started with instance "owner"');
+      // Obtain stable handle for owner
+      this.agentHandle = init(PokeMainAgent, { id: MAIN_AGENT_INSTANCE_ID });
+
+      // Connect worker completion dispatcher to main agent
+      this.workerManager.setCompletionDispatcher(async (signalXml) => {
+        await this.dispatchSignal('worker.completion', signalXml);
+      });
+
+      // Connect automation dispatcher to main agent
+      this.scheduler.setDispatcher(async (signalXml) => {
+        await this.dispatchSignal('automation.trigger', signalXml);
+      });
+
+      // Start scheduler
+      this.scheduler.start();
+
+      // Reconcile startup worker queue
+      this.workerManager.reconcileStartupJobs();
+      this.workerManager.processQueue();
+
+      // Start idle compaction check loop (every 60s)
+      this.idleCheckInterval = setInterval(() => {
+        this.checkIdleCompaction();
+      }, 60000);
+
+      logger.info('Poke Flue runtime started with instance "owner"');
+    } catch (err) {
+      try {
+        await this.stop();
+      } catch (cleanupErr: any) {
+        getLogger().error({ err: cleanupErr.message }, 'Failed to clean up Poke runtime after startup failure');
+      }
+      throw err;
+    }
   }
 
   async checkIdleCompaction(): Promise<void> {
@@ -252,9 +264,12 @@ export class PokeRuntime {
       this.unsubscribeObserver = null;
     }
 
-    if (this.flue) {
-      await this.flue.stop();
-      this.flue = null;
+    const flue = this.flue;
+    this.flue = null;
+    this.agentHandle = null;
+
+    if (flue) {
+      await flue.stop();
     }
   }
 }

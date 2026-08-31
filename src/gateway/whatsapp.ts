@@ -232,15 +232,15 @@ export class WhatsAppGateway {
 
     if (isPureTextMessage && trimmedText === '/stop') {
       logger.info({ messageId }, 'Received exact /stop command. Triggering emergency brake.');
-      if (this.db.isOpen()) {
-        this.db.recordIdempotency(idempotencyKey, 'whatsapp_inbound', messageId);
-      }
       try {
         await this.onStop();
+        if (this.db.isOpen()) {
+          this.db.recordIdempotency(idempotencyKey, 'whatsapp_inbound', messageId);
+        }
         await this.sender.sendDirectNotice('Stopped.');
       } catch (err: any) {
         logger.error({ err: err.message }, 'Failed during /stop handling');
-        await this.sender.sendDirectNotice('Stopped.');
+        await this.sender.sendDirectError('Unable to stop active work. Please try /stop again.');
       }
       return;
     }
@@ -383,12 +383,14 @@ export class WhatsAppGateway {
       rawMessage: msg,
     };
 
+    // Dispatch immediately into the main agent
+    await this.onDispatch(normalized);
+
+    // Only acknowledge the inbound message after dispatch admission succeeds, so a
+    // transient runtime failure can be retried by a redelivery.
     if (this.db.isOpen()) {
       this.db.recordIdempotency(idempotencyKey, 'whatsapp_inbound', messageId);
     }
-
-    // Dispatch immediately into the main agent
-    await this.onDispatch(normalized);
   }
 
   async stop(): Promise<void> {

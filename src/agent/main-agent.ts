@@ -42,12 +42,8 @@ export function PokeMainAgent() {
     },
   });
 
-  // 2. Attach local host sandbox forwarding daemon's full environment
-  useSandbox(
-    local({
-      env: { ...process.env },
-    })
-  );
+  // 2. Attach local host sandbox with Flue's shell-essential environment allowlist.
+  useSandbox(local());
 
   // 3. Mount tools
   const tools = createPokeTools(sharedContexts);

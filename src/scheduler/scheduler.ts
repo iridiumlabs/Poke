@@ -1,12 +1,16 @@
 import { PokeDatabase, AutomationRecord } from '../db/database.js';
 import { computeNextRun } from './timezone.js';
 import { getLogger } from '../logger/logger.js';
+import { createAutomationTriggerSignal } from '../agent/signals.js';
+
+const AUTOMATION_DISPATCH_RETRY_MS = 30_000;
 
 export type DispatchAutomationSignalFn = (signalBody: string) => Promise<void>;
 
 export class AutomationScheduler {
   private timer: NodeJS.Timeout | null = null;
   private isRunning = false;
+  private isTicking = false;
   private onDispatchSignal: DispatchAutomationSignalFn | null = null;
 
   constructor(private db: PokeDatabase) {}
@@ -27,7 +31,7 @@ export class AutomationScheduler {
 
     // Start poll loop
     this.timer = setInterval(() => {
-      this.tick();
+      void this.tick();
     }, intervalMs);
   }
 
@@ -46,6 +50,14 @@ export class AutomationScheduler {
 
     for (const auto of automations) {
       if (!auto.enabled) continue;
+
+      if (auto.last_outcome === 'claimed') {
+        // A process died after claiming this occurrence. Retry the same occurrence
+        // rather than skipping it or assuming that a hand-off completed.
+        this.db.updateAutomation(auto.id, { last_outcome: null });
+        logger.warn({ autoId: auto.id }, 'Recovered an automation claim left by a previous process');
+        continue;
+      }
 
       if (auto.next_run_at && auto.next_run_at < now) {
         if (auto.schedule_type === 'once') {
@@ -76,11 +88,24 @@ export class AutomationScheduler {
   }
 
   async tick(): Promise<void> {
-    const now = Date.now();
-    const dueAutomations = this.db.getDueAutomations(now);
+    if (this.isTicking) return;
+    this.isTicking = true;
 
-    for (const auto of dueAutomations) {
-      await this.triggerAutomation(auto, now);
+    try {
+      const now = Date.now();
+      const dueAutomations = this.db.getDueAutomations(now);
+
+      for (const auto of dueAutomations) {
+        try {
+          await this.triggerAutomation(auto, now);
+        } catch (err: any) {
+          getLogger().error({ autoId: auto.id, err: err.message }, 'Automation trigger failed');
+        }
+      }
+    } catch (err: any) {
+      getLogger().error({ err: err.message }, 'Automation scheduler tick failed');
+    } finally {
+      this.isTicking = false;
     }
   }
 
@@ -88,44 +113,63 @@ export class AutomationScheduler {
     const logger = getLogger().child({ autoId: auto.id, autoName: auto.name });
     logger.info('Triggering scheduled automation');
 
-    const scheduledDateIso = new Date(auto.next_run_at || triggerTimeMs).toISOString();
-    const signalXml = `<automation_trigger id="${auto.id}" name="${auto.name}" scheduled_at="${scheduledDateIso}">\n${auto.instruction}\n</automation_trigger>`;
+    const scheduledAt = auto.next_run_at;
+    if (scheduledAt === null || scheduledAt === undefined || !this.db.claimDueAutomation(auto.id, scheduledAt, triggerTimeMs)) {
+      return;
+    }
 
-    // Persist claim before delivery
-    this.db.updateAutomation(auto.id, {
-      last_run_at: triggerTimeMs,
-      last_outcome: 'claimed',
-    });
+    let signalXml: string;
+    try {
+      signalXml = createAutomationTriggerSignal({
+        id: auto.id,
+        name: auto.name,
+        scheduledAt: new Date(scheduledAt).toISOString(),
+        instruction: auto.instruction,
+      });
+    } catch (err: any) {
+      logger.error({ err: err.message }, 'Failed to construct automation signal');
+      this.db.updateAutomation(auto.id, {
+        next_run_at: Date.now() + AUTOMATION_DISPATCH_RETRY_MS,
+        last_outcome: `dispatch_error: ${err.message}`,
+      });
+      return;
+    }
 
-    if (this.onDispatchSignal) {
+    let nextRun: number | null = null;
+    let enabled = auto.enabled;
+    if (auto.schedule_type === 'once') {
+      enabled = 0;
+    } else {
       try {
-        await this.onDispatchSignal(signalXml);
-
-        // Compute next run time and advance schedule only after successful delivery
-        let nextRun: number | null = null;
-        let newEnabled = auto.enabled;
-
-        if (auto.schedule_type === 'once') {
-          nextRun = null;
-          newEnabled = 0; // Disabled once finished
-        } else {
-          try {
-            nextRun = computeNextRun(auto.schedule_type, auto.schedule_value, Date.now());
-          } catch (err: any) {
-            logger.error({ err: err.message }, 'Failed to compute next run for recurring automation');
-          }
-        }
-
-        this.db.updateAutomation(auto.id, {
-          next_run_at: nextRun,
-          enabled: newEnabled,
-          last_outcome: 'dispatched',
-        });
-        logger.info('Automation trigger dispatched to main agent');
+        nextRun = computeNextRun(auto.schedule_type, auto.schedule_value, Date.now());
       } catch (err: any) {
-        logger.error({ err: err.message }, 'Failed to dispatch automation signal');
-        this.db.updateAutomation(auto.id, { last_outcome: `dispatch_error: ${err.message}` });
+        logger.error({ err: err.message }, 'Failed to compute next run for recurring automation');
+        this.db.updateAutomation(auto.id, {
+          next_run_at: Date.now() + AUTOMATION_DISPATCH_RETRY_MS,
+          last_outcome: `dispatch_error: ${err.message}`,
+        });
+        return;
       }
+    }
+
+    try {
+      if (!this.onDispatchSignal) {
+        throw new Error('Automation dispatcher is unavailable.');
+      }
+      await this.onDispatchSignal(signalXml);
+
+      this.db.updateAutomation(auto.id, {
+        next_run_at: nextRun,
+        enabled,
+        last_outcome: 'dispatched',
+      });
+      logger.info('Automation trigger dispatched to main agent');
+    } catch (err: any) {
+      logger.error({ err: err.message }, 'Failed to dispatch automation signal');
+      this.db.updateAutomation(auto.id, {
+        next_run_at: Date.now() + AUTOMATION_DISPATCH_RETRY_MS,
+        last_outcome: `dispatch_error: ${err.message}`,
+      });
     }
   }
 

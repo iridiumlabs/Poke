@@ -30,6 +30,10 @@ export interface WhatsAppSocketLike {
 }
 
 export function splitLongTextMessage(text: string, maxLength = 4000): string[] {
+  if (!Number.isInteger(maxLength) || maxLength < 1) {
+    throw new RangeError('maxLength must be a positive integer.');
+  }
+
   if (text.length <= maxLength) {
     return [text];
   }
@@ -43,31 +47,36 @@ export function splitLongTextMessage(text: string, maxLength = 4000): string[] {
       break;
     }
 
-    // Try splitting on code block boundary first
+    // Prefer a complete code block when its closing fence fits in this message.
     let splitIdx = remaining.lastIndexOf('\n```', maxLength);
     if (splitIdx > maxLength / 2) {
-      // Split at the end of the code block or before it
-      splitIdx = remaining.indexOf('\n', splitIdx + 1);
-      if (splitIdx === -1 || splitIdx > maxLength) {
-        splitIdx = remaining.lastIndexOf('\n\n', maxLength);
-      }
-    } else {
-      // Try paragraph boundary
+      const closingLineEnd = remaining.indexOf('\n', splitIdx + 1);
+      splitIdx = closingLineEnd > 0 && closingLineEnd <= maxLength ? closingLineEnd : -1;
+    }
+
+    if (splitIdx < maxLength / 3) {
+      // Try paragraph, line, then word boundaries.
       splitIdx = remaining.lastIndexOf('\n\n', maxLength);
       if (splitIdx === -1 || splitIdx < maxLength / 3) {
-        // Try line break
         splitIdx = remaining.lastIndexOf('\n', maxLength);
       }
       if (splitIdx === -1 || splitIdx < maxLength / 3) {
-        // Try space
         splitIdx = remaining.lastIndexOf(' ', maxLength);
-      }
-      if (splitIdx === -1) {
-        splitIdx = maxLength;
       }
     }
 
-    chunks.push(remaining.slice(0, splitIdx).trimEnd());
+    if (splitIdx <= 0 || splitIdx > maxLength) {
+      splitIdx = maxLength;
+    }
+
+    let chunk = remaining.slice(0, splitIdx).trimEnd();
+    if (!chunk) {
+      // Whitespace-only boundaries must still make progress.
+      splitIdx = Math.min(maxLength, remaining.length);
+      chunk = remaining.slice(0, splitIdx);
+    }
+
+    chunks.push(chunk);
     remaining = remaining.slice(splitIdx).trimStart();
   }
 
