@@ -18,13 +18,38 @@ describe('SkillRegistry Live Discovery', () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
-  it('seeds default skills (skill-builder and automations)', () => {
+  it('seeds the skill-manager and automations skills with their operating contracts', () => {
     registry.seedDefaultSkills();
     const skills = registry.listSkills();
     const names = skills.map((s) => s.name);
 
-    expect(names).toContain('skill-builder');
+    expect(names).toContain('skill-manager');
     expect(names).toContain('automations');
+
+    const skillManager = registry.getSkill('skill-manager');
+    expect(skillManager?.description).toContain('Install, create, or revise agent skills');
+    expect(skillManager?.body).toContain('Treat the `description` as a context pointer');
+    expect(skillManager?.body).toContain('every supporting file as one package');
+
+    const automations = registry.getSkill('automations');
+    expect(automations?.description).toContain('schedule, repeat, list, change, pause, resume, or delete');
+    expect(automations?.body).toContain('Cron and interval automations do not replay');
+    expect(automations?.body).toContain('Do not store credentials');
+  });
+
+  it('does not overwrite a customized default skill', () => {
+    const skillDir = path.join(tempDir, 'automations');
+    fs.mkdirSync(skillDir);
+    const customSkill = `---
+name: automations
+description: My custom automations
+---
+Custom instructions`;
+    fs.writeFileSync(path.join(skillDir, 'SKILL.md'), customSkill);
+
+    registry.seedDefaultSkills();
+
+    expect(fs.readFileSync(path.join(skillDir, 'SKILL.md'), 'utf8')).toBe(customSkill);
   });
 
   it('discovers dynamically installed skills without restarting', () => {
