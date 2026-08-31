@@ -1,0 +1,69 @@
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { runDoctor } from '../../src/cli/doctor.js';
+import { redactSecrets } from '../../src/logger/logger.js';
+import { ConfigManager } from '../../src/config/config.js';
+import { PokeDatabase } from '../../src/db/database.js';
+
+describe('CLI & Diagnostics', () => {
+  let tempDir: string;
+  let config: ConfigManager;
+  let db: PokeDatabase;
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'poke-cli-test-'));
+    config = new ConfigManager(tempDir);
+    db = new PokeDatabase(tempDir);
+  });
+
+  afterEach(() => {
+    db.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('redacts sensitive API keys and tokens completely from logs and objects', () => {
+    const rawObject = {
+      apiKey: 'sk-1234567890abcdef12345678',
+      user: 'arham',
+      credentials: {
+        deepgramApiKey: 'dg-abcdef1234567890abcdef12',
+        commandCodeApiKey: 'cm_abcdef1234567890',
+      },
+      message: 'Authorization: Bearer mySecretToken123456789',
+    };
+
+    const redacted = redactSecrets(rawObject);
+    expect(redacted.apiKey).toBe('[REDACTED]');
+    expect(redacted.credentials.deepgramApiKey).toBe('[REDACTED]');
+    expect(redacted.credentials.commandCodeApiKey).toBe('[REDACTED]');
+    expect(redacted.message).toContain('Bearer [REDACTED]');
+  });
+
+  it('poke doctor returns failure when mandatory fields are missing', async () => {
+    // Unconfigured directory should fail doctor check
+    const { success, checks } = await runDoctor(tempDir);
+    expect(success).toBe(false);
+
+    const ownerCheck = checks.find((c) => c.name === 'Owner Phone Number');
+    expect(ownerCheck?.passed).toBe(false);
+  });
+
+  it('poke doctor passes when all requirements are satisfied', async () => {
+    config.setOwnerPhoneNumber('+92 300 1234567');
+    config.updateCredentials({
+      exaApiKey: 'exa-key-123',
+      deepgramApiKey: 'dg-key-123',
+      commandCodeApiKey: 'cmd-key-123',
+    });
+    config.setMainModel({ provider: 'commandcode', model: 'claude-sonnet-4-6' });
+
+    const { checks } = await runDoctor(tempDir);
+    const ownerCheck = checks.find((c) => c.name === 'Owner Phone Number');
+    expect(ownerCheck?.passed).toBe(true);
+
+    const exaCheck = checks.find((c) => c.name === 'Exa API Key');
+    expect(exaCheck?.passed).toBe(true);
+  });
+});

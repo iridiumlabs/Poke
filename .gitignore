@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.poke/
+.agents/skills/*
+!.agents/skills/writing-for-agents/
+*.log
+.DS_Store

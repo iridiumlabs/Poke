@@ -1,0 +1,47 @@
+{
+  "name": "poke",
+  "version": "1.0.0",
+  "description": "Private, WhatsApp-first personal agent running on a dedicated Ubuntu VPS",
+  "type": "module",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "bin": {
+    "poke": "./dist/bin/poke.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "poke": "tsx bin/poke.ts",
+    "start": "node dist/bin/poke.js start"
+  },
+  "keywords": [
+    "agent",
+    "whatsapp",
+    "poke",
+    "flue",
+    "personal-agent"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@flue/runtime": "^2.0.3",
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
+    "better-sqlite3": "^13.0.3",
+    "command-code": "^1.38.2",
+    "commander": "^15.0.0",
+    "composio-core": "^0.5.39",
+    "cron-parser": "^5.10.0",
+    "exa-js": "^2.19.0",
+    "pino": "^10.3.1",
+    "valibot": "^1.4.2"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^26.4.0",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
+  }
+}

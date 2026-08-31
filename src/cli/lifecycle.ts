@@ -1,0 +1,204 @@
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { spawn, execSync } from 'child_process';
+import { resolvePokePaths } from '../config/paths.js';
+import { PokeDaemon } from '../daemon/daemon.js';
+
+export function isSystemdAvailable(): boolean {
+  try {
+    execSync('systemctl --user list-units --type=service', { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function isSystemdServiceInstalled(): boolean {
+  const serviceFile = path.join(os.homedir(), '.config/systemd/user/poke.service');
+  return fs.existsSync(serviceFile);
+}
+
+export function isSystemdServiceActive(): boolean {
+  if (!isSystemdAvailable() || !isSystemdServiceInstalled()) return false;
+  try {
+    const output = execSync('systemctl --user is-active poke.service', { encoding: 'utf8' }).trim();
+    return output === 'active';
+  } catch {
+    return false;
+  }
+}
+
+export function installSystemdService(): boolean {
+  try {
+    const userSystemdDir = path.join(os.homedir(), '.config/systemd/user');
+    if (!fs.existsSync(userSystemdDir)) {
+      fs.mkdirSync(userSystemdDir, { recursive: true, mode: 0o755 });
+    }
+
+    const nodePath = process.execPath;
+    const pokeBinPath = path.resolve('dist/bin/poke.js');
+    const workingDir = path.resolve('.');
+
+    const unitContent = `[Unit]
+Description=Poke WhatsApp Personal Agent Daemon
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=${workingDir}
+ExecStart=${nodePath} ${pokeBinPath} start --foreground
+Restart=on-failure
+RestartSec=5
+KillMode=process
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=default.target
+`;
+
+    const serviceFile = path.join(userSystemdDir, 'poke.service');
+    fs.writeFileSync(serviceFile, unitContent, { mode: 0o644 });
+
+    execSync('systemctl --user daemon-reload', { stdio: 'ignore' });
+    execSync('systemctl --user enable poke.service', { stdio: 'ignore' });
+
+    console.log(`✓ Installed and enabled systemd user service at ${serviceFile}`);
+    return true;
+  } catch (err: any) {
+    console.log(`Could not configure systemd service: ${err.message}`);
+    return false;
+  }
+}
+
+export function uninstallSystemdService(): boolean {
+  try {
+    execSync('systemctl --user stop poke.service', { stdio: 'ignore' });
+    execSync('systemctl --user disable poke.service', { stdio: 'ignore' });
+    const serviceFile = path.join(os.homedir(), '.config/systemd/user/poke.service');
+    if (fs.existsSync(serviceFile)) {
+      fs.unlinkSync(serviceFile);
+    }
+    execSync('systemctl --user daemon-reload', { stdio: 'ignore' });
+    console.log('✓ Stopped and removed systemd user service');
+    return true;
+  } catch (err: any) {
+    console.log(`Could not remove systemd service: ${err.message}`);
+    return false;
+  }
+}
+
+export async function runStart(options: { foreground?: boolean }, customHome?: string): Promise<void> {
+  const paths = resolvePokePaths(customHome);
+  const pidFile = path.join(paths.root, 'daemon.pid');
+
+  // If foreground mode requested, start directly
+  if (options.foreground) {
+    console.log('Starting Poke daemon in foreground...');
+    const daemon = new PokeDaemon(customHome);
+    await daemon.start();
+    return;
+  }
+
+  // Check if systemd user service is installed and we can use it
+  if (isSystemdServiceInstalled() && isSystemdAvailable()) {
+    try {
+      execSync('systemctl --user start poke.service');
+      console.log('✓ Started Poke daemon via systemd user service (poke.service).');
+      return;
+    } catch (err: any) {
+      console.log(`Failed to start via systemd (${err.message}), falling back to background process.`);
+    }
+  }
+
+  if (fs.existsSync(pidFile)) {
+    const rawPid = fs.readFileSync(pidFile, 'utf8').trim();
+    const pid = parseInt(rawPid, 10);
+    if (!isNaN(pid)) {
+      try {
+        process.kill(pid, 0);
+        console.log(`Poke daemon is already running (PID: ${pid}).`);
+        return;
+      } catch {
+        fs.unlinkSync(pidFile);
+      }
+    }
+  }
+
+  console.log('Starting Poke daemon in background...');
+  const scriptPath = path.resolve('dist/bin/poke.js');
+  const child = spawn(process.execPath, [scriptPath, 'start', '--foreground'], {
+    detached: true,
+    stdio: 'ignore',
+    env: { ...process.env, ...(customHome ? { POKE_HOME: customHome } : {}) },
+  });
+
+  child.unref();
+  console.log(`✓ Poke daemon started in background (PID: ${child.pid}).`);
+}
+
+export async function runStop(customHome?: string): Promise<void> {
+  // If systemd service is active, stop it via systemctl
+  if (isSystemdServiceInstalled() && isSystemdAvailable()) {
+    try {
+      execSync('systemctl --user stop poke.service');
+      console.log('✓ Stopped Poke daemon via systemd.');
+      return;
+    } catch {
+      // Fall through to PID check
+    }
+  }
+
+  const paths = resolvePokePaths(customHome);
+  const pidFile = path.join(paths.root, 'daemon.pid');
+
+  if (!fs.existsSync(pidFile)) {
+    console.log('Poke daemon is not running.');
+    return;
+  }
+
+  const rawPid = fs.readFileSync(pidFile, 'utf8').trim();
+  const pid = parseInt(rawPid, 10);
+  if (isNaN(pid)) {
+    console.log('Invalid PID file found, removing.');
+    fs.unlinkSync(pidFile);
+    return;
+  }
+
+  try {
+    process.kill(pid, 'SIGTERM');
+    console.log(`Sent SIGTERM to Poke daemon (PID: ${pid}). Waiting for graceful shutdown...`);
+
+    // Wait up to 5 seconds for shutdown
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 250));
+      try {
+        process.kill(pid, 0);
+      } catch {
+        console.log('✓ Poke daemon stopped successfully.');
+        return;
+      }
+    }
+
+    console.log('Daemon did not stop in time, sending SIGKILL...');
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {}
+    if (fs.existsSync(pidFile)) {
+      fs.unlinkSync(pidFile);
+    }
+    console.log('✓ Poke daemon terminated.');
+  } catch (err: any) {
+    console.log(`Daemon was not running: ${err.message}`);
+    if (fs.existsSync(pidFile)) {
+      fs.unlinkSync(pidFile);
+    }
+  }
+}
+
+export async function runRestart(options: { foreground?: boolean }, customHome?: string): Promise<void> {
+  console.log('Restarting Poke daemon...');
+  await runStop(customHome);
+  await new Promise((r) => setTimeout(r, 1000));
+  await runStart(options, customHome);
+}

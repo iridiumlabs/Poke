@@ -1,0 +1,141 @@
+import { getLogger } from '../logger/logger.js';
+
+export interface RetryOptions {
+  maxAttempts?: number;
+  delaysMs?: number[];
+  jitter?: boolean;
+}
+
+export const DEFAULT_PROVIDER_RETRY_DELAYS_MS = [2000, 5000, 10000, 20000];
+
+export class NonRetryableError extends Error {
+  constructor(message: string, public readonly statusCode?: number, public readonly cause?: unknown) {
+    super(message);
+    this.name = 'NonRetryableError';
+  }
+}
+
+export function isTransientError(error: any): boolean {
+  if (error instanceof NonRetryableError) {
+    return false;
+  }
+
+  const status = error.status || error.statusCode || error.response?.status;
+  if (status) {
+    // 429 Too Many Requests, 5xx Server Errors are transient
+    if (status === 429 || (status >= 500 && status < 600)) {
+      return true;
+    }
+    // 400 Bad Request, 401 Unauthorized, 403 Forbidden, 404 Not Found, etc. are NOT transient
+    if (status >= 400 && status < 500) {
+      return false;
+    }
+  }
+
+  // Network / connection errors
+  const code = error.code || error.cause?.code;
+  if (code) {
+    const transientCodes = [
+      'ECONNRESET',
+      'ETIMEDOUT',
+      'ECONNREFUSED',
+      'EAI_AGAIN',
+      'ENOTFOUND',
+      'UND_ERR_CONNECT_TIMEOUT',
+      'UND_ERR_SOCKET',
+    ];
+    if (transientCodes.includes(code)) {
+      return true;
+    }
+  }
+
+  const msg = (error.message || '').toLowerCase();
+  if (
+    msg.includes('rate limit') ||
+    msg.includes('too many requests') ||
+    msg.includes('timeout') ||
+    msg.includes('service unavailable') ||
+    msg.includes('gateway timeout') ||
+    msg.includes('bad gateway') ||
+    msg.includes('temporarily unavailable')
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+export function extractRetryAfterMs(error: any): number | null {
+  const headers = error.headers || error.response?.headers;
+  if (!headers) return null;
+
+  const retryAfterHeader =
+    headers.get?.('retry-after') || headers['retry-after'] || headers['Retry-After'];
+  if (!retryAfterHeader) return null;
+
+  const seconds = Number(retryAfterHeader);
+  if (!isNaN(seconds) && seconds > 0) {
+    return seconds * 1000;
+  }
+
+  const dateMs = Date.parse(retryAfterHeader);
+  if (!isNaN(dateMs)) {
+    const diff = dateMs - Date.now();
+    return diff > 0 ? diff : null;
+  }
+
+  return null;
+}
+
+export async function withProviderRetry<T>(
+  operation: (attempt: number) => Promise<T>,
+  options?: RetryOptions
+): Promise<T> {
+  const delays = options?.delaysMs || DEFAULT_PROVIDER_RETRY_DELAYS_MS;
+  const maxAttempts = options?.maxAttempts || delays.length + 1; // 1 initial + 4 retries = 5 attempts
+  const logger = getLogger();
+
+  let lastError: any = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await operation(attempt);
+    } catch (err: any) {
+      lastError = err;
+
+      if (!isTransientError(err)) {
+        logger.warn(
+          { attempt, error: err.message, status: err.status || err.statusCode },
+          'Encountered non-retryable provider error'
+        );
+        throw err;
+      }
+
+      if (attempt >= maxAttempts) {
+        logger.error(
+          { totalAttempts: maxAttempts, error: err.message },
+          'Provider retry attempts exhausted'
+        );
+        throw err;
+      }
+
+      const retryAfterMs = extractRetryAfterMs(err);
+      let delayMs = retryAfterMs !== null ? retryAfterMs : delays[attempt - 1] || 20000;
+
+      if (options?.jitter !== false) {
+        // Add up to ±10% jitter
+        const jitter = (Math.random() * 0.2 - 0.1) * delayMs;
+        delayMs = Math.max(100, Math.round(delayMs + jitter));
+      }
+
+      logger.info(
+        { attempt, nextAttempt: attempt + 1, delayMs, error: err.message },
+        'Transient provider error, scheduling retry'
+      );
+
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+
+  throw lastError;
+}
