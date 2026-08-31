@@ -192,4 +192,45 @@ describe('WorkerManager', () => {
     expect(dispatched[0]).toContain('id="job-&quot;&lt;&amp;"');
     expect(dispatched[0]).toContain('name="crashed &quot;worker&quot; &amp; task"');
   });
+
+  it('retries undelivered finished worker jobs during runtime without restart', async () => {
+    let failDispatch = true;
+    const dispatched: string[] = [];
+
+    workerManager.setCompletionDispatcher(async (signal) => {
+      if (failDispatch) {
+        throw new Error('Temporary dispatch outage');
+      }
+      dispatched.push(signal);
+    });
+
+    const finishedJob = db.createWorkerJob({
+      id: 'job-undelivered-1',
+      name: 'delayed-dispatch-job',
+      instruction: 'Do work',
+      status: 'completed',
+    });
+    db.updateWorkerJob(finishedJob.id, {
+      finished_at: Date.now(),
+      result: 'Finished job result',
+    });
+
+    // Try processing undelivered completions while dispatch is failing
+    workerManager.processUndeliveredCompletions();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(db.getWorkerJob(finishedJob.id)?.completion_dispatched_at).toBeNull();
+    expect(dispatched).toHaveLength(0);
+
+    // Dispatcher recovers
+    failDispatch = false;
+    workerManager.processUndeliveredCompletions();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const updated = db.getWorkerJob(finishedJob.id);
+    expect(updated?.completion_dispatched_at).not.toBeNull();
+    expect(dispatched).toHaveLength(1);
+    expect(dispatched[0]).toContain('id="job-undelivered-1"');
+    expect(dispatched[0]).toContain('Finished job result');
+  });
 });

@@ -35,18 +35,21 @@ export function isSystemdServiceActive(): boolean {
   }
 }
 
-export function installSystemdService(): boolean {
-  try {
-    const userSystemdDir = path.join(os.homedir(), '.config/systemd/user');
-    if (!fs.existsSync(userSystemdDir)) {
-      fs.mkdirSync(userSystemdDir, { recursive: true, mode: 0o755 });
-    }
+export function generateSystemdServiceUnit(customHome?: string): string {
+  const nodePath = process.execPath;
+  const { pokeBinPath, workingDir } = resolvePokeInstallationPaths();
+  const quoteSystemdArgument = (value: string) => `"${value.replace(/[\\"]/g, '\\$&')}"`;
 
-    const nodePath = process.execPath;
-    const { pokeBinPath, workingDir } = resolvePokeInstallationPaths();
-    const quoteSystemdArgument = (value: string) => `"${value.replace(/[\\"]/g, '\\$&')}"`;
+  const envLines = ['Environment="NODE_ENV=production"'];
+  const pokeHome = customHome || process.env.POKE_HOME;
+  if (pokeHome) {
+    envLines.push(`Environment=${quoteSystemdArgument(`POKE_HOME=${path.resolve(pokeHome)}`)}`);
+  }
+  if (process.env.POKE_SKILLS_HOME) {
+    envLines.push(`Environment=${quoteSystemdArgument(`POKE_SKILLS_HOME=${path.resolve(process.env.POKE_SKILLS_HOME)}`)}`);
+  }
 
-    const unitContent = `[Unit]
+  return `[Unit]
 Description=Poke WhatsApp Personal Agent Daemon
 After=network.target
 
@@ -57,12 +60,21 @@ ExecStart=${quoteSystemdArgument(nodePath)} ${quoteSystemdArgument(pokeBinPath)}
 Restart=on-failure
 RestartSec=5
 KillMode=process
-Environment=NODE_ENV=production
+${envLines.join('\n')}
 
 [Install]
 WantedBy=default.target
 `;
+}
 
+export function installSystemdService(customHome?: string): boolean {
+  try {
+    const userSystemdDir = path.join(os.homedir(), '.config/systemd/user');
+    if (!fs.existsSync(userSystemdDir)) {
+      fs.mkdirSync(userSystemdDir, { recursive: true, mode: 0o755 });
+    }
+
+    const unitContent = generateSystemdServiceUnit(customHome);
     const serviceFile = path.join(userSystemdDir, 'poke.service');
     fs.writeFileSync(serviceFile, unitContent, { mode: 0o644 });
 
@@ -109,7 +121,7 @@ export async function runStart(options: { foreground?: boolean }, customHome?: s
   // Ensure systemd user service is installed and started if systemd is available
   if (isSystemdAvailable()) {
     if (!isSystemdServiceInstalled()) {
-      installSystemdService();
+      installSystemdService(customHome);
     }
     try {
       execSync('systemctl --user start poke.service');

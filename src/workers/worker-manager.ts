@@ -19,6 +19,7 @@ export class WorkerManager {
   private isStopped = false;
   private onDispatchCompletion: DispatchSignalFn | null = null;
   private completionDispatches = new Set<string>();
+  private retryInterval: NodeJS.Timeout | null = null;
 
   constructor(
     private db: PokeDatabase,
@@ -27,14 +28,24 @@ export class WorkerManager {
     private supermemory: SupermemoryToolHandler,
     private composio: ComposioToolHandler,
     private skills: SkillRegistry
-  ) {}
+  ) {
+    this.retryInterval = setInterval(() => {
+      this.processUndeliveredCompletions();
+    }, 5000);
+    this.retryInterval.unref?.();
+  }
 
   setCompletionDispatcher(fn: DispatchSignalFn): void {
     this.onDispatchCompletion = fn;
+    this.processUndeliveredCompletions();
   }
 
   stop(): void {
     this.isStopped = true;
+    if (this.retryInterval) {
+      clearInterval(this.retryInterval);
+      this.retryInterval = null;
+    }
     for (const [, runner] of this.activeRunners.entries()) {
       runner.abort();
     }
@@ -70,6 +81,14 @@ export class WorkerManager {
     return record;
   }
 
+  processUndeliveredCompletions(): void {
+    if (this.isStopped || !this.db.isOpen() || !this.onDispatchCompletion) return;
+    const undelivered = this.db.getUndeliveredFinishedWorkerJobs();
+    for (const job of undelivered) {
+      void this.dispatchCompletion(job);
+    }
+  }
+
   reconcileStartupJobs(): void {
     if (!this.db.isOpen()) return;
     const runningJobs = this.db.getRunningWorkerJobs();
@@ -87,10 +106,7 @@ export class WorkerManager {
       }
     }
 
-    const undelivered = this.db.getUndeliveredFinishedWorkerJobs();
-    for (const job of undelivered) {
-      void this.dispatchCompletion(job);
-    }
+    this.processUndeliveredCompletions();
   }
 
   async processQueue(): Promise<void> {
@@ -98,6 +114,7 @@ export class WorkerManager {
     this.isProcessing = true;
 
     try {
+      this.processUndeliveredCompletions();
       if (!this.db.isOpen()) return;
       const runningJobs = this.db.getRunningWorkerJobs();
       const availableSlots = MAX_CONCURRENT_WORKERS - runningJobs.length;

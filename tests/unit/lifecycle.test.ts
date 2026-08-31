@@ -31,4 +31,24 @@ describe('daemon lifecycle helpers', () => {
     // process.pid is running
     expect(isLivePokeDaemon({ pid: process.pid, startTime: 'invalid-non-matching-time' }, 'nonexistent')).toBe(false);
   });
+
+  it('preserves configured POKE_HOME and POKE_SKILLS_HOME in the generated systemd unit', async () => {
+    const { generateSystemdServiceUnit } = await import('../../src/cli/lifecycle.js');
+    const customHome = '/custom/poke/home';
+    const oldSkillsHome = process.env.POKE_SKILLS_HOME;
+    process.env.POKE_SKILLS_HOME = '/custom/skills/home';
+
+    try {
+      const unit = generateSystemdServiceUnit(customHome);
+      expect(unit).toContain('Environment="POKE_HOME=/custom/poke/home"');
+      expect(unit).toContain('Environment="POKE_SKILLS_HOME=/custom/skills/home"');
+      expect(unit).toContain('Environment="NODE_ENV=production"');
+    } finally {
+      if (oldSkillsHome !== undefined) {
+        process.env.POKE_SKILLS_HOME = oldSkillsHome;
+      } else {
+        delete process.env.POKE_SKILLS_HOME;
+      }
+    }
+  });
 });
