@@ -381,4 +381,87 @@ describe('WhatsApp Gateway & Sender', () => {
     expect(gateway.getConnectionState()).toBe('disconnected');
     expect((gateway as any).isConnecting).toBe(false);
   });
+
+  it('persists progress before sending next WhatsApp part and does not resend completed parts on retry', async () => {
+    let callCount = 0;
+    const mockSocket = {
+      sendMessage: vi.fn().mockImplementation(async (_jid: string, content: any) => {
+        callCount++;
+        if (callCount === 2) {
+          throw new Error('Network error on second part');
+        }
+        return { key: { id: `sent-part-${callCount}` } };
+      }),
+    };
+
+    const sender = new WhatsAppSender(
+      () => mockSocket,
+      '923001234567@s.whatsapp.net',
+      db,
+      new DeepgramHandler(undefined, tempDir)
+    );
+
+    const idempotencyKey = 'turn-retry-multipart-send';
+    const longText = `First chunk: ${'a'.repeat(3000)}\n\nSecond chunk: ${'b'.repeat(3000)}`;
+
+    // First attempt fails at chunk 2 (callCount === 2)
+    await expect(
+      sender.send({ mode: 'message', text: longText }, idempotencyKey)
+    ).rejects.toThrow('Network error on second part');
+
+    expect(mockSocket.sendMessage).toHaveBeenCalledTimes(2);
+    // Part 0 is recorded in DB
+    expect(db.checkIdempotency(`${idempotencyKey}:part:0`)).not.toBeNull();
+    // Part 1 is not recorded in DB
+    expect(db.checkIdempotency(`${idempotencyKey}:part:1`)).toBeNull();
+    // Top-level key is not recorded yet
+    expect(db.checkIdempotency(idempotencyKey)).toBeNull();
+
+    // Second attempt (retry with same idempotency key) should skip part 0 and only send part 1
+    const res = await sender.send({ mode: 'message', text: longText }, idempotencyKey);
+    expect(mockSocket.sendMessage).toHaveBeenCalledTimes(3); // Called once more for part 1 only!
+    expect(db.checkIdempotency(`${idempotencyKey}:part:1`)).not.toBeNull();
+    expect(db.checkIdempotency(idempotencyKey)).not.toBeNull();
+    expect(res.messageId).toBe('sent-part-3');
+  });
+
+  it('handles rejection from reconnect timer start() without unhandled rejection and reschedules reconnect', async () => {
+    vi.useFakeTimers();
+    try {
+      const gateway = new WhatsAppGateway(
+        config,
+        db,
+        async () => {},
+        async () => {},
+        tempDir
+      );
+
+      let startAttempts = 0;
+      vi.spyOn(gateway, 'start').mockImplementation(async () => {
+        startAttempts++;
+        if (startAttempts === 1) {
+          throw new Error('Connection refused during reconnect');
+        }
+      });
+
+      // Trigger reconnect
+      (gateway as any).scheduleReconnect();
+      expect((gateway as any).reconnectTimer).not.toBeNull();
+
+      // Fast-forward first reconnect timer -> start() fails
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(startAttempts).toBe(1);
+      // It should have caught the error and rescheduled another reconnect timer
+      expect((gateway as any).reconnectTimer).not.toBeNull();
+
+      // Fast-forward second reconnect timer -> start() succeeds
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(startAttempts).toBe(2);
+
+      await gateway.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
+

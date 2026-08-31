@@ -50,23 +50,25 @@ export class ConfigManager {
       return defaultConfig;
     }
 
+    const raw = fs.readFileSync(this.paths.configFile, 'utf8');
+    let parsed: any;
     try {
-      const raw = fs.readFileSync(this.paths.configFile, 'utf8');
-      const parsed = JSON.parse(raw);
-      this.configCache = {
-        ...getDefaultConfig(),
-        ...parsed,
-        timezone: DEFAULT_TIMEZONE, // Invariant: always Asia/Karachi
-        credentials: {
-          ...parsed.credentials,
-        },
-      };
-      return this.configCache!;
-    } catch (err) {
-      const defaultConfig = getDefaultConfig();
-      this.configCache = defaultConfig;
-      return defaultConfig;
+      parsed = JSON.parse(raw);
+    } catch (err: any) {
+      throw new Error(
+        `Failed to parse configuration file at ${this.paths.configFile}: ${err.message}`
+      );
     }
+
+    this.configCache = {
+      ...getDefaultConfig(),
+      ...parsed,
+      timezone: DEFAULT_TIMEZONE, // Invariant: always Asia/Karachi
+      credentials: {
+        ...parsed?.credentials,
+      },
+    };
+    return this.configCache!;
   }
 
   saveConfig(config: PokeConfig): void {

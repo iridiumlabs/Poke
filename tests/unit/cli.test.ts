@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -107,4 +107,37 @@ describe('CLI & Diagnostics', () => {
       program.parseAsync(['node', 'poke', 'model', 'wroker'], { from: 'node' })
     ).rejects.toThrow('Model target must be "main" or "worker".');
   });
+
+  it('poke status parses structured PID record from claimDaemonPidFile', async () => {
+    const { runStatus } = await import('../../src/cli/status.js');
+    const pidFile = path.join(tempDir, 'daemon.pid');
+    fs.writeFileSync(pidFile, JSON.stringify({ pid: process.pid, startTime: 'fake-start-time' }));
+
+    const consoleLogs: string[] = [];
+    const logSpy = vi.spyOn(console, 'log').mockImplementation((...args: any[]) => {
+      consoleLogs.push(args.join(' '));
+    });
+
+    try {
+      await runStatus(tempDir);
+      const statusOutput = consoleLogs.join('\n');
+      // When process start time doesn't match a live daemon on Linux or is not live poke daemon, it handles without throwing NaN errors
+      expect(statusOutput).toContain('POKE STATUS');
+      expect(statusOutput).not.toContain('PID: NaN');
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it('ConfigManager loadConfig throws when config.json is malformed instead of overwriting with defaults', () => {
+    const configFile = path.join(tempDir, 'config.json');
+    fs.writeFileSync(configFile, '{"ownerPhoneNumber": "923001234567", invalid-json}');
+
+    const cm = new ConfigManager(tempDir);
+    expect(() => cm.loadConfig()).toThrow(/Failed to parse configuration file/);
+
+    // Ensure malformed file was not overwritten
+    expect(fs.readFileSync(configFile, 'utf8')).toContain('invalid-json');
+  });
 });
+

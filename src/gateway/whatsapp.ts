@@ -137,7 +137,6 @@ export class WhatsAppGateway {
       this.sock = makeWASocket({
         version,
         auth: state,
-        printQRInTerminal: true,
         logger: logger.child({ module: 'baileys' }) as any,
       });
 
@@ -158,15 +157,7 @@ export class WhatsAppGateway {
           const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
           logger.warn({ statusCode, shouldReconnect }, 'WhatsApp connection closed');
           if (shouldReconnect && !this.isStopped) {
-            if (this.reconnectTimer) {
-              clearTimeout(this.reconnectTimer);
-            }
-            this.reconnectTimer = setTimeout(() => {
-              this.reconnectTimer = null;
-              if (!this.isStopped) {
-                void this.start();
-              }
-            }, 3000);
+            this.scheduleReconnect();
           }
         } else if (connection === 'open') {
           this.connectionState = 'connected';
@@ -447,6 +438,28 @@ export class WhatsAppGateway {
     } finally {
       this.inFlightInbound.delete(idempotencyKey);
     }
+  }
+
+  private scheduleReconnect(): void {
+    if (this.isStopped) return;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+    }
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      if (this.isStopped) return;
+      try {
+        await this.start();
+      } catch (err: any) {
+        getLogger().error(
+          { err: err?.message || String(err) },
+          'WhatsApp reconnect attempt failed; rescheduling'
+        );
+        if (!this.isStopped) {
+          this.scheduleReconnect();
+        }
+      }
+    }, 3000);
   }
 
   async stop(): Promise<void> {

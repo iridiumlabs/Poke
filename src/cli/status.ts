@@ -3,6 +3,8 @@ import path from 'path';
 import { ConfigManager } from '../config/config.js';
 import { PokeDatabase } from '../db/database.js';
 import { resolvePokePaths } from '../config/paths.js';
+import { resolvePokeInstallationPaths } from '../config/installation.js';
+import { readDaemonPidFile, isLivePokeDaemon } from '../daemon/pid-file.js';
 import { CompactionManager } from '../context/compaction-manager.js';
 
 export async function runStatus(customHome?: string): Promise<void> {
@@ -16,16 +18,11 @@ export async function runStatus(customHome?: string): Promise<void> {
   let pid: number | null = null;
 
   if (fs.existsSync(pidFile)) {
-    const rawPid = fs.readFileSync(pidFile, 'utf8').trim();
-    pid = parseInt(rawPid, 10);
-    if (!isNaN(pid)) {
-      try {
-        // Check if process is alive
-        process.kill(pid, 0);
-        isRunning = true;
-      } catch {
-        isRunning = false;
-      }
+    const record = readDaemonPidFile(pidFile);
+    const { pokeBinPath } = resolvePokeInstallationPaths();
+    if (record && isLivePokeDaemon(record, pokeBinPath)) {
+      isRunning = true;
+      pid = record.pid;
     }
   }
 
