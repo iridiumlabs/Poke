@@ -110,8 +110,12 @@ describe('CLI & Diagnostics', () => {
 
   it('poke status parses structured PID record from claimDaemonPidFile', async () => {
     const { runStatus } = await import('../../src/cli/status.js');
+    const { readDaemonPidFile } = await import('../../src/daemon/pid-file.js');
     const pidFile = path.join(tempDir, 'daemon.pid');
-    fs.writeFileSync(pidFile, JSON.stringify({ pid: process.pid, startTime: 'fake-start-time' }));
+    fs.writeFileSync(pidFile, JSON.stringify({ pid: 12345, startTime: 'fake-start-time' }));
+
+    const record = readDaemonPidFile(pidFile);
+    expect(record).toEqual({ pid: 12345, startTime: 'fake-start-time' });
 
     const consoleLogs: string[] = [];
     const logSpy = vi.spyOn(console, 'log').mockImplementation((...args: any[]) => {
@@ -121,7 +125,6 @@ describe('CLI & Diagnostics', () => {
     try {
       await runStatus(tempDir);
       const statusOutput = consoleLogs.join('\n');
-      // When process start time doesn't match a live daemon on Linux or is not live poke daemon, it handles without throwing NaN errors
       expect(statusOutput).toContain('POKE STATUS');
       expect(statusOutput).not.toContain('PID: NaN');
     } finally {

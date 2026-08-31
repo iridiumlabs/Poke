@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'fs';
 import path from 'path';
 import { PokeDatabase } from '../db/database.js';
@@ -27,6 +28,10 @@ export interface WhatsAppSocketLike {
     content: any,
     options?: any
   ): Promise<any>;
+}
+
+function computePayloadHash(payload: unknown): string {
+  return crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
 }
 
 export function splitLongTextMessage(text: string, maxLength = 4000): string[] {
@@ -97,13 +102,16 @@ export class WhatsAppSender {
 
   async send(params: SendParams, idempotencyKey?: string): Promise<SendResult> {
     const logger = getLogger();
+    const topPayloadHash = computePayloadHash(params);
 
     // Idempotency check
     if (idempotencyKey) {
       const existing = this.db.checkIdempotency(idempotencyKey);
       if (existing && existing.response_data) {
-        logger.info({ idempotencyKey }, 'Returning cached WhatsApp send response due to idempotency');
-        return JSON.parse(existing.response_data);
+        if (!existing.payload_hash || existing.payload_hash === topPayloadHash || existing.payload_hash === JSON.stringify(params)) {
+          logger.info({ idempotencyKey }, 'Returning cached WhatsApp send response due to idempotency');
+          return JSON.parse(existing.response_data);
+        }
       }
     }
 
@@ -117,10 +125,20 @@ export class WhatsAppSender {
     let partIndex = 0;
 
     if (params.mode === 'voice') {
+      const voicePartPayload = {
+        mode: 'voice',
+        text: params.text,
+        reply_to: params.reply_to,
+      };
+      const partPayloadHash = computePayloadHash(voicePartPayload);
       const partKey = idempotencyKey ? `${idempotencyKey}:part:${partIndex}` : undefined;
       const cachedPart = partKey ? this.db.checkIdempotency(partKey) : null;
 
-      if (cachedPart && cachedPart.response_data) {
+      if (
+        cachedPart &&
+        cachedPart.response_data &&
+        (cachedPart.payload_hash === partPayloadHash || cachedPart.payload_hash === '')
+      ) {
         try {
           const parsed = JSON.parse(cachedPart.response_data);
           if (parsed.messageId) messageId = parsed.messageId;
@@ -157,11 +175,12 @@ export class WhatsAppSender {
           this.db.recordIdempotency(
             partKey,
             'whatsapp_send_part',
-            '',
+            partPayloadHash,
             JSON.stringify({ messageId })
           );
         }
       }
+      partIndex++;
     } else {
       // mode === "message"
       const chunks = splitLongTextMessage(params.text);
@@ -169,10 +188,20 @@ export class WhatsAppSender {
       for (let i = 0; i < chunks.length; i++) {
         const chunk = chunks[i];
         const isFirst = i === 0;
+        const chunkPartPayload = {
+          mode: 'message',
+          chunk,
+          reply_to: isFirst ? params.reply_to : undefined,
+        };
+        const partPayloadHash = computePayloadHash(chunkPartPayload);
         const partKey = idempotencyKey ? `${idempotencyKey}:part:${partIndex}` : undefined;
         const cachedPart = partKey ? this.db.checkIdempotency(partKey) : null;
 
-        if (cachedPart && cachedPart.response_data) {
+        if (
+          cachedPart &&
+          cachedPart.response_data &&
+          (cachedPart.payload_hash === partPayloadHash || cachedPart.payload_hash === '')
+        ) {
           try {
             const parsed = JSON.parse(cachedPart.response_data);
             if (parsed.messageId) messageId = parsed.messageId;
@@ -200,75 +229,87 @@ export class WhatsAppSender {
             this.db.recordIdempotency(
               partKey,
               'whatsapp_send_part',
-              '',
+              partPayloadHash,
               JSON.stringify({ messageId })
             );
           }
         }
         partIndex++;
       }
+    }
 
-      // Send attachments if present
-      if (params.attachments && params.attachments.length > 0) {
-        for (const att of params.attachments) {
-          const partKey = idempotencyKey ? `${idempotencyKey}:part:${partIndex}` : undefined;
-          const cachedPart = partKey ? this.db.checkIdempotency(partKey) : null;
+    // Send attachments if present
+    if (params.attachments && params.attachments.length > 0) {
+      for (const att of params.attachments) {
+        const attPartPayload = {
+          attachment: {
+            path: att.path,
+            filename: att.filename,
+            mimeType: att.mimeType,
+          },
+        };
+        const partPayloadHash = computePayloadHash(attPartPayload);
+        const partKey = idempotencyKey ? `${idempotencyKey}:part:${partIndex}` : undefined;
+        const cachedPart = partKey ? this.db.checkIdempotency(partKey) : null;
 
-          if (cachedPart && cachedPart.response_data) {
-            try {
-              const parsed = JSON.parse(cachedPart.response_data);
-              if (parsed.messageId) messageId = parsed.messageId;
-            } catch {
-              // ignore
-            }
-          } else {
-            if (!fs.existsSync(att.path)) {
-              throw new Error(`Attachment file not found: ${att.path}`);
-            }
-
-            const buffer = fs.readFileSync(att.path);
-            const mime = att.mimeType || 'application/octet-stream';
-            const filename = att.filename || path.basename(att.path);
-
-            let msg: any;
-            if (mime.startsWith('image/')) {
-              msg = await sock.sendMessage(targetJid, {
-                image: buffer,
-                caption: filename !== path.basename(att.path) ? filename : undefined,
-              });
-            } else if (mime.startsWith('video/')) {
-              msg = await sock.sendMessage(targetJid, {
-                video: buffer,
-                caption: filename,
-              });
-            } else if (mime.startsWith('audio/')) {
-              msg = await sock.sendMessage(targetJid, {
-                audio: buffer,
-                mimetype: mime,
-              });
-            } else {
-              msg = await sock.sendMessage(targetJid, {
-                document: buffer,
-                mimetype: mime,
-                fileName: filename,
-              });
-            }
-
-            if (msg?.key?.id) {
-              messageId = msg.key.id;
-            }
-
-            if (partKey) {
-              this.db.recordIdempotency(
-                partKey,
-                'whatsapp_send_part',
-                '',
-                JSON.stringify({ messageId })
-              );
-            }
+        if (
+          cachedPart &&
+          cachedPart.response_data &&
+          (cachedPart.payload_hash === partPayloadHash || cachedPart.payload_hash === '')
+        ) {
+          try {
+            const parsed = JSON.parse(cachedPart.response_data);
+            if (parsed.messageId) messageId = parsed.messageId;
+          } catch {
+            // ignore
           }
-          partIndex++;
+        } else {
+          if (!fs.existsSync(att.path)) {
+            throw new Error(`Attachment file not found: ${att.path}`);
+          }
+
+          const buffer = fs.readFileSync(att.path);
+          const mime = att.mimeType || 'application/octet-stream';
+          const filename = att.filename || path.basename(att.path);
+
+          let msg: any;
+          if (mime.startsWith('image/')) {
+            msg = await sock.sendMessage(targetJid, {
+              image: buffer,
+              caption: filename !== path.basename(att.path) ? filename : undefined,
+            });
+          } else if (mime.startsWith('video/')) {
+            msg = await sock.sendMessage(targetJid, {
+              video: buffer,
+              caption: filename,
+            });
+          } else if (mime.startsWith('audio/')) {
+            msg = await sock.sendMessage(targetJid, {
+              audio: buffer,
+              mimetype: mime,
+            });
+          } else {
+            msg = await sock.sendMessage(targetJid, {
+              document: buffer,
+              mimetype: mime,
+              fileName: filename,
+            });
+          }
+
+          if (msg?.key?.id) {
+            messageId = msg.key.id;
+          }
+
+          if (partKey) {
+            this.db.recordIdempotency(
+              partKey,
+              'whatsapp_send_part',
+              partPayloadHash,
+              JSON.stringify({ messageId })
+            );
+          }
         }
+        partIndex++;
       }
     }
 
@@ -282,7 +323,7 @@ export class WhatsAppSender {
       this.db.recordIdempotency(
         idempotencyKey,
         'whatsapp_send',
-        JSON.stringify(params),
+        topPayloadHash,
         JSON.stringify(result)
       );
     }

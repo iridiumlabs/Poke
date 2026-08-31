@@ -463,5 +463,79 @@ describe('WhatsApp Gateway & Sender', () => {
       vi.useRealTimers();
     }
   });
+
+  it('sends attachments alongside voice notes in voice mode', async () => {
+    const sentMessages: any[] = [];
+    const mockSocket = {
+      sendMessage: vi.fn().mockImplementation(async (_jid: string, content: any) => {
+        sentMessages.push(content);
+        return { key: { id: `sent-msg-${sentMessages.length}` } };
+      }),
+    };
+
+    const dummyAttachmentPath = path.join(tempDir, 'sample.jpg');
+    fs.writeFileSync(dummyAttachmentPath, 'fake-image-bytes');
+
+    const fakeAudioPath = path.join(tempDir, 'voice.ogg');
+    fs.writeFileSync(fakeAudioPath, 'fake-audio-bytes');
+
+    const fakeDeepgram = {
+      synthesizeToAudioFile: vi.fn().mockResolvedValue({
+        audioPath: fakeAudioPath,
+        mimeType: 'audio/ogg; codecs=opus',
+      }),
+    } as unknown as DeepgramHandler;
+
+    const sender = new WhatsAppSender(
+      () => mockSocket,
+      '923001234567@s.whatsapp.net',
+      db,
+      fakeDeepgram
+    );
+
+    const res = await sender.send({
+      mode: 'voice',
+      text: 'Voice note with image',
+      attachments: [{ path: dummyAttachmentPath, filename: 'sample.jpg', mimeType: 'image/jpeg' }],
+    });
+
+    expect(mockSocket.sendMessage).toHaveBeenCalledTimes(2);
+    expect(sentMessages[0].audio).toBeDefined();
+    expect(sentMessages[1].image).toBeDefined();
+    expect(res.mode).toBe('voice');
+  });
+
+  it('treats part idempotency payload hash mismatch as a cache miss on retry with altered content', async () => {
+    let callCount = 0;
+    const mockSocket = {
+      sendMessage: vi.fn().mockImplementation(async () => {
+        callCount++;
+        return { key: { id: `sent-part-${callCount}` } };
+      }),
+    };
+
+    const sender = new WhatsAppSender(
+      () => mockSocket,
+      '923001234567@s.whatsapp.net',
+      db,
+      new DeepgramHandler(undefined, tempDir)
+    );
+
+    const idempotencyKey = 'part-hash-mismatch-test';
+
+    // Pre-record a part with a different payload hash
+    db.recordIdempotency(
+      `${idempotencyKey}:part:0`,
+      'whatsapp_send_part',
+      'old-payload-hash-different-content',
+      JSON.stringify({ messageId: 'old-cached-id' })
+    );
+
+    // Send with new content using same part key
+    const res = await sender.send({ mode: 'message', text: 'Brand new text content' }, idempotencyKey);
+    // Because hash mismatched, it should NOT reuse the old part, but invoke sendMessage
+    expect(mockSocket.sendMessage).toHaveBeenCalledTimes(1);
+    expect(res.messageId).toBe('sent-part-1');
+  });
 });
 
