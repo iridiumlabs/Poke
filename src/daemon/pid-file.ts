@@ -88,7 +88,7 @@ export function isLivePokeDaemon(record: DaemonPidRecord, expectedEntrypoint: st
 
   const args = getProcessArgs(record.pid);
   if (!args) {
-    return process.platform !== 'linux' ? isProcessRunning(record.pid) : false;
+    return Boolean(record.startTime && getProcessStartTime(record.pid) === record.startTime);
   }
 
   return (

@@ -334,4 +334,51 @@ describe('WhatsApp Gateway & Sender', () => {
     expect(stopAttempts).toBe(2);
     expect(db.checkIdempotency('inbound_msg:m-retry-stop')).not.toBeNull();
   });
+
+  it('records stop idempotency and does not send error when confirmation notice fails', async () => {
+    let stopped = false;
+    const gateway = new WhatsAppGateway(
+      config,
+      db,
+      async () => {},
+      async () => {
+        stopped = true;
+      },
+      tempDir
+    );
+
+    const sender = gateway.getSender();
+    vi.spyOn(sender, 'sendDirectNotice').mockRejectedValue(new Error('Network disconnected'));
+    const errorSpy = vi.spyOn(sender, 'sendDirectError').mockResolvedValue();
+
+    const msg = {
+      key: { remoteJid: '923001234567@s.whatsapp.net', id: 'm-stop-notice-fail' },
+      message: { conversation: '/stop' },
+    };
+
+    await gateway.handleIncomingMessage(msg);
+    expect(stopped).toBe(true);
+    expect(db.checkIdempotency('inbound_msg:m-stop-notice-fail')).not.toBeNull();
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  it('resets connectionState and isConnecting when start() throws', async () => {
+    const gateway = new WhatsAppGateway(
+      config,
+      db,
+      async () => {},
+      async () => {},
+      tempDir
+    );
+
+    // Mock resolvePokePaths or similar to throw in start
+    const pathsModule = await import('../../src/config/paths.js');
+    const spy = vi.spyOn(pathsModule, 'ensurePokeDirectories').mockImplementationOnce(() => {
+      throw new Error('Disk error');
+    });
+
+    await expect(gateway.start()).rejects.toThrow('Disk error');
+    expect(gateway.getConnectionState()).toBe('disconnected');
+    expect((gateway as any).isConnecting).toBe(false);
+  });
 });

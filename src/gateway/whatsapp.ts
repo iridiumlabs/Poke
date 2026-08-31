@@ -74,6 +74,8 @@ export class WhatsAppGateway {
   private inFlightInbound = new Set<string>();
   private sender: WhatsAppSender;
   private deepgram: DeepgramHandler;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private isStopped = false;
 
   constructor(
     private configManager: ConfigManager,
@@ -108,65 +110,97 @@ export class WhatsAppGateway {
 
   async start(): Promise<void> {
     if (this.sock || this.isConnecting) return;
+    this.isStopped = false;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     this.isConnecting = true;
     this.connectionState = 'connecting';
 
     const logger = getLogger();
     logger.info('Initializing WhatsApp Baileys gateway');
 
-    const paths = resolvePokePaths(this.customHome);
-    ensurePokeDirectories(paths);
+    try {
+      const paths = resolvePokePaths(this.customHome);
+      ensurePokeDirectories(paths);
 
-    const { state, saveCreds } = await useMultiFileAuthState(paths.whatsappDir);
-    const { version } = await fetchLatestBaileysVersion();
+      const { state, saveCreds } = await useMultiFileAuthState(paths.whatsappDir);
+      const { version } = await fetchLatestBaileysVersion();
 
-    this.sock = makeWASocket({
-      version,
-      auth: state,
-      printQRInTerminal: true,
-      logger: logger.child({ module: 'baileys' }) as any,
-    });
-
-    this.sock.ev.on('creds.update', saveCreds);
-
-    this.sock.ev.on('connection.update', (update: any) => {
-      const { connection, lastDisconnect, qr } = update;
-      if (qr) {
-        this.qrCode = qr;
-        logger.info('WhatsApp QR code generated');
-      }
-
-      if (connection === 'close') {
+      if (this.isStopped) {
+        this.isConnecting = false;
         this.connectionState = 'disconnected';
-        this.sock = null;
-        this.isConnecting = false;
-        const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-        logger.warn({ statusCode, shouldReconnect }, 'WhatsApp connection closed');
-        if (shouldReconnect) {
-          setTimeout(() => this.start(), 3000);
-        }
-      } else if (connection === 'open') {
-        this.connectionState = 'connected';
-        this.qrCode = null;
-        this.isConnecting = false;
-        logger.info('WhatsApp connected successfully');
-
-        const ownerPhone = this.configManager.getOwnerPhoneNumber();
-        if (ownerPhone) {
-          this.sender.setOwnerJid(`${ownerPhone}@s.whatsapp.net`);
-        }
+        return;
       }
-    });
 
-    this.sock.ev.on('messages.upsert', async (m: any) => {
-      if (m.type !== 'notify') return;
+      this.sock = makeWASocket({
+        version,
+        auth: state,
+        printQRInTerminal: true,
+        logger: logger.child({ module: 'baileys' }) as any,
+      });
 
-      for (const msg of m.messages) {
-        if (!msg.message || msg.key?.fromMe) continue;
-        await this.handleIncomingMessage(msg);
-      }
-    });
+      this.sock.ev.on('creds.update', saveCreds);
+
+      this.sock.ev.on('connection.update', (update: any) => {
+        const { connection, lastDisconnect, qr } = update;
+        if (qr) {
+          this.qrCode = qr;
+          logger.info('WhatsApp QR code generated');
+        }
+
+        if (connection === 'close') {
+          this.connectionState = 'disconnected';
+          this.sock = null;
+          this.isConnecting = false;
+          const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
+          const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+          logger.warn({ statusCode, shouldReconnect }, 'WhatsApp connection closed');
+          if (shouldReconnect && !this.isStopped) {
+            if (this.reconnectTimer) {
+              clearTimeout(this.reconnectTimer);
+            }
+            this.reconnectTimer = setTimeout(() => {
+              this.reconnectTimer = null;
+              if (!this.isStopped) {
+                void this.start();
+              }
+            }, 3000);
+          }
+        } else if (connection === 'open') {
+          this.connectionState = 'connected';
+          this.qrCode = null;
+          this.isConnecting = false;
+          logger.info('WhatsApp connected successfully');
+
+          const ownerPhone = this.configManager.getOwnerPhoneNumber();
+          if (ownerPhone) {
+            this.sender.setOwnerJid(`${ownerPhone}@s.whatsapp.net`);
+          }
+        }
+      });
+
+      this.sock.ev.on('messages.upsert', (m: any) => {
+        if (m.type !== 'notify') return;
+
+        void (async () => {
+          for (const msg of m.messages) {
+            if (!msg.message || msg.key?.fromMe) continue;
+            try {
+              await this.handleIncomingMessage(msg);
+            } catch (err: any) {
+              logger.error({ err: err?.message || String(err) }, 'Failed to process incoming WhatsApp message');
+            }
+          }
+        })();
+      });
+    } catch (err: any) {
+      this.isConnecting = false;
+      this.connectionState = 'disconnected';
+      logger.error({ err: err?.message || String(err) }, 'Failed to initialize WhatsApp gateway');
+      throw err;
+    }
   }
 
   async handleIncomingMessage(msg: proto.IWebMessageInfo): Promise<void> {
@@ -235,17 +269,30 @@ export class WhatsAppGateway {
 
     if (isPureTextMessage && trimmedText === '/stop') {
       logger.info({ messageId }, 'Received exact /stop command. Triggering emergency brake.');
+      let stopSucceeded = false;
       try {
         await this.onStop();
         if (this.db.isOpen()) {
           this.db.recordIdempotency(idempotencyKey, 'whatsapp_inbound', messageId);
         }
-        await this.sender.sendDirectNotice('Stopped.');
+        stopSucceeded = true;
       } catch (err: any) {
         logger.error({ err: err.message }, 'Failed during /stop handling');
-        await this.sender.sendDirectError('Unable to stop active work. Please try /stop again.');
+        try {
+          await this.sender.sendDirectError('Unable to stop active work. Please try /stop again.');
+        } catch (sendErr: any) {
+          logger.error({ err: sendErr.message }, 'Failed to send stop failure notice');
+        }
       } finally {
         this.inFlightInbound.delete(idempotencyKey);
+      }
+
+      if (stopSucceeded) {
+        try {
+          await this.sender.sendDirectNotice('Stopped.');
+        } catch (err: any) {
+          logger.error({ err: err.message }, 'Failed to send stop confirmation notice');
+        }
       }
       return;
     }
@@ -403,6 +450,11 @@ export class WhatsAppGateway {
   }
 
   async stop(): Promise<void> {
+    this.isStopped = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     if (this.sock) {
       try {
         this.sock.end(undefined);
@@ -411,6 +463,7 @@ export class WhatsAppGateway {
       }
       this.sock = null;
     }
+    this.isConnecting = false;
     this.connectionState = 'disconnected';
   }
 }

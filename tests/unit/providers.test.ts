@@ -233,4 +233,41 @@ describe('ComposioToolHandler', () => {
     );
     expect(toolset.executeAction).toHaveBeenCalledTimes(1);
   });
+
+  it('invalidates cached catalog across setApiKey generations and ignores stale resolutions', async () => {
+    const handler = new ComposioToolHandler('initial-key');
+    let resolveFirst!: (value: any) => void;
+    const firstPromise = new Promise<any[]>((res) => {
+      resolveFirst = res;
+    });
+
+    const firstToolset = {
+      getTools: vi.fn().mockReturnValue(firstPromise),
+    };
+    (handler as any).toolset = firstToolset;
+
+    // Start in-flight catalog fetch for first generation
+    const search1 = handler.search({ query: 'first' });
+
+    // Rotate API key while first fetch is pending
+    handler.setApiKey('second-key');
+    const secondToolset = {
+      getTools: vi.fn().mockResolvedValue([
+        { function: { name: 'SECOND_TOOL', description: 'Second tool description' } },
+      ]),
+    };
+    (handler as any).toolset = secondToolset;
+
+    // Resolve the first (stale) catalog fetch
+    resolveFirst([{ function: { name: 'FIRST_TOOL', description: 'First tool description' } }]);
+    await expect(search1).resolves.toMatchObject({
+      actions: [{ name: 'FIRST_TOOL' }],
+    });
+
+    // A search on the new key should fetch with the new toolset
+    await expect(handler.search({ query: 'second' })).resolves.toMatchObject({
+      actions: [{ name: 'SECOND_TOOL' }],
+    });
+    expect(secondToolset.getTools).toHaveBeenCalledTimes(1);
+  });
 });

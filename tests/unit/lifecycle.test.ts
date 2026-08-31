@@ -26,4 +26,9 @@ describe('daemon lifecycle helpers', () => {
       await once(child, 'exit');
     }
   });
+
+  it('fails closed when pid is running but start time is missing or mismatched and args unavailable', () => {
+    // process.pid is running
+    expect(isLivePokeDaemon({ pid: process.pid, startTime: 'invalid-non-matching-time' }, 'nonexistent')).toBe(false);
+  });
 });
