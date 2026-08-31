@@ -34,12 +34,14 @@ export function readLogTail(logFile: string, requestedLines: number): string[] {
     while (position > 0 && bytesRead < MAX_TAIL_BYTES && newlines <= lineCount) {
       const length = Math.min(TAIL_CHUNK_BYTES, position, MAX_TAIL_BYTES - bytesRead);
       const chunk = Buffer.allocUnsafe(length);
-      fs.readSync(fd, chunk, 0, length, position - length);
-      chunks.unshift(chunk);
+      const readCount = fs.readSync(fd, chunk, 0, length, position - length);
+      if (readCount <= 0) break;
+      const slice = chunk.subarray(0, readCount);
+      chunks.unshift(slice);
       position -= length;
-      bytesRead += length;
+      bytesRead += readCount;
 
-      for (const byte of chunk) {
+      for (const byte of slice) {
         if (byte === 10) newlines += 1;
       }
     }

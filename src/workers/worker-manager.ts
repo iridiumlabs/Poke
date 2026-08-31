@@ -207,7 +207,7 @@ export class WorkerManager {
     }
   }
 
-  private async dispatchCompletion(job: WorkerJobRecord): Promise<void> {
+  private async dispatchCompletion(job: WorkerJobRecord, retryAttempt = 0): Promise<void> {
     if (
       !this.onDispatchCompletion ||
       !this.db.isOpen() ||
@@ -237,6 +237,16 @@ export class WorkerManager {
       logger.info('Dispatched worker completion signal to main agent');
     } catch (err: any) {
       logger.error({ err: err.message }, 'Failed to dispatch worker completion signal');
+      if (retryAttempt < 3 && !this.isStopped) {
+        setTimeout(() => {
+          if (!this.isStopped && this.db.isOpen()) {
+            const currentJob = this.db.getWorkerJob(job.id);
+            if (currentJob && !currentJob.completion_dispatched_at) {
+              void this.dispatchCompletion(currentJob, retryAttempt + 1);
+            }
+          }
+        }, Math.min(1000 * (retryAttempt + 1), 5000));
+      }
     } finally {
       this.completionDispatches.delete(job.id);
     }

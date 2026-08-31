@@ -159,6 +159,18 @@ export async function withProviderRetry<T>(
 
       const retryAfterMs = extractRetryAfterMs(err);
       const maxDelayMs = options?.maxDelayMs ?? MAX_PROVIDER_RETRY_DELAY_MS;
+      if (retryAfterMs !== null && retryAfterMs > maxDelayMs) {
+        logger.warn(
+          { attempt, retryAfterMs, maxDelayMs, error: err.message },
+          'Provider Retry-After exceeds maximum allowed delay'
+        );
+        const error = new NonRetryableError(
+          `Provider retry-after delay (${retryAfterMs}ms) exceeds maximum allowed delay (${maxDelayMs}ms): ${err.message}`
+        );
+        (error as any).status = err.status || err.statusCode;
+        (error as any).headers = err.headers;
+        throw error;
+      }
       let delayMs = Math.min(retryAfterMs !== null ? retryAfterMs : delays[attempt - 1] || 20000, maxDelayMs);
 
       if (options?.jitter !== false) {

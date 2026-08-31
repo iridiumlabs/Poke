@@ -71,6 +71,7 @@ export class WhatsAppGateway {
   private isConnecting = false;
   private qrCode: string | null = null;
   private connectionState: 'disconnected' | 'connecting' | 'connected' = 'disconnected';
+  private inFlightInbound = new Set<string>();
   private sender: WhatsAppSender;
   private deepgram: DeepgramHandler;
 
@@ -203,10 +204,12 @@ export class WhatsAppGateway {
     const messageId = msg.key?.id || `msg-${Date.now()}`;
     const idempotencyKey = `inbound_msg:${messageId}`;
 
-    if (this.db.isOpen() && this.db.checkIdempotency(idempotencyKey)) {
+    if (this.inFlightInbound.has(idempotencyKey) || (this.db.isOpen() && this.db.checkIdempotency(idempotencyKey))) {
       logger.info({ messageId }, 'Ignoring duplicate inbound message');
       return;
     }
+
+    this.inFlightInbound.add(idempotencyKey);
 
     logger.info({ messageId, remoteJid }, 'Received WhatsApp message from owner');
 
@@ -241,155 +244,161 @@ export class WhatsAppGateway {
       } catch (err: any) {
         logger.error({ err: err.message }, 'Failed during /stop handling');
         await this.sender.sendDirectError('Unable to stop active work. Please try /stop again.');
+      } finally {
+        this.inFlightInbound.delete(idempotencyKey);
       }
       return;
     }
 
-    // Handle Media & Attachments
-    const attachments: InboundMediaAttachment[] = [];
-    let isVoice = false;
+    try {
+      // Handle Media & Attachments
+      const attachments: InboundMediaAttachment[] = [];
+      let isVoice = false;
 
-    const paths = resolvePokePaths(this.customHome);
-    const msgInboxDir = path.join(paths.inboxDir, messageId);
+      const paths = resolvePokePaths(this.customHome);
+      const msgInboxDir = path.join(paths.inboxDir, messageId);
 
-    // Audio / Voice note
-    if (msgContent.audioMessage) {
-      try {
-        if (!fs.existsSync(msgInboxDir)) {
-          fs.mkdirSync(msgInboxDir, { recursive: true, mode: 0o700 });
-        }
-        const isPtt = Boolean(msgContent.audioMessage.ptt);
-        const ext = isPtt ? 'ogg' : 'mp3';
-        const filePath = path.join(msgInboxDir, `audio.${ext}`);
-        const buffer = await downloadMediaMessage(msg as WAMessage, 'buffer', {});
-        fs.writeFileSync(filePath, buffer as Buffer);
-
-        const mime = msgContent.audioMessage.mimetype || 'audio/ogg';
-        const size = (buffer as Buffer).length;
-
-        attachments.push({
-          path: filePath,
-          filename: `audio.${ext}`,
-          mimeType: mime,
-          size,
-          messageId,
-          caption: text || undefined,
-        });
-
-        // Transcribe voice note via Deepgram
-        if (this.deepgram) {
-          logger.info('Transcribing incoming voice note with Deepgram Nova-3');
-          try {
-            const transcript = await this.deepgram.transcribe(buffer as Buffer, mime);
-            if (transcript) {
-              text = transcript;
-              isVoice = true;
-              logger.info({ transcriptPreview: transcript.slice(0, 80) }, 'Voice note transcribed');
-            }
-          } catch (sttErr: any) {
-            logger.error({ err: sttErr.message }, 'Voice note transcription failed');
+      // Audio / Voice note
+      if (msgContent.audioMessage) {
+        try {
+          if (!fs.existsSync(msgInboxDir)) {
+            fs.mkdirSync(msgInboxDir, { recursive: true, mode: 0o700 });
           }
+          const isPtt = Boolean(msgContent.audioMessage.ptt);
+          const ext = isPtt ? 'ogg' : 'mp3';
+          const filePath = path.join(msgInboxDir, `audio.${ext}`);
+          const buffer = await downloadMediaMessage(msg as WAMessage, 'buffer', {});
+          fs.writeFileSync(filePath, buffer as Buffer);
+
+          const mime = msgContent.audioMessage.mimetype || 'audio/ogg';
+          const size = (buffer as Buffer).length;
+
+          attachments.push({
+            path: filePath,
+            filename: `audio.${ext}`,
+            mimeType: mime,
+            size,
+            messageId,
+            caption: text || undefined,
+          });
+
+          // Transcribe voice note via Deepgram
+          if (this.deepgram) {
+            logger.info('Transcribing incoming voice note with Deepgram Nova-3');
+            try {
+              const transcript = await this.deepgram.transcribe(buffer as Buffer, mime);
+              if (transcript) {
+                text = transcript;
+                isVoice = true;
+                logger.info({ transcriptPreview: transcript.slice(0, 80) }, 'Voice note transcribed');
+              }
+            } catch (sttErr: any) {
+              logger.error({ err: sttErr.message }, 'Voice note transcription failed');
+            }
+          }
+        } catch (err: any) {
+          logger.error({ err: err.message }, 'Failed to download or process audio message');
         }
-      } catch (err: any) {
-        logger.error({ err: err.message }, 'Failed to download or process audio message');
       }
-    }
 
-    // Image message
-    if (msgContent.imageMessage) {
-      try {
-        if (!fs.existsSync(msgInboxDir)) {
-          fs.mkdirSync(msgInboxDir, { recursive: true, mode: 0o700 });
+      // Image message
+      if (msgContent.imageMessage) {
+        try {
+          if (!fs.existsSync(msgInboxDir)) {
+            fs.mkdirSync(msgInboxDir, { recursive: true, mode: 0o700 });
+          }
+          const filePath = path.join(msgInboxDir, 'image.jpg');
+          const buffer = await downloadMediaMessage(msg as WAMessage, 'buffer', {});
+          fs.writeFileSync(filePath, buffer as Buffer);
+
+          attachments.push({
+            path: filePath,
+            filename: 'image.jpg',
+            mimeType: msgContent.imageMessage.mimetype || 'image/jpeg',
+            size: (buffer as Buffer).length,
+            messageId,
+            caption: text || undefined,
+            isImage: true,
+          });
+        } catch (err: any) {
+          logger.error({ err: err.message }, 'Failed to download image message');
         }
-        const filePath = path.join(msgInboxDir, 'image.jpg');
-        const buffer = await downloadMediaMessage(msg as WAMessage, 'buffer', {});
-        fs.writeFileSync(filePath, buffer as Buffer);
-
-        attachments.push({
-          path: filePath,
-          filename: 'image.jpg',
-          mimeType: msgContent.imageMessage.mimetype || 'image/jpeg',
-          size: (buffer as Buffer).length,
-          messageId,
-          caption: text || undefined,
-          isImage: true,
-        });
-      } catch (err: any) {
-        logger.error({ err: err.message }, 'Failed to download image message');
       }
-    }
 
-    // Document message with path traversal protection
-    if (msgContent.documentMessage) {
-      try {
-        if (!fs.existsSync(msgInboxDir)) {
-          fs.mkdirSync(msgInboxDir, { recursive: true, mode: 0o700 });
+      // Document message with path traversal protection
+      if (msgContent.documentMessage) {
+        try {
+          if (!fs.existsSync(msgInboxDir)) {
+            fs.mkdirSync(msgInboxDir, { recursive: true, mode: 0o700 });
+          }
+          const rawFilename = msgContent.documentMessage.fileName || 'document.bin';
+          const filename = path.basename(rawFilename) || 'document.bin';
+          const filePath = path.resolve(msgInboxDir, filename);
+
+          if (!filePath.startsWith(path.resolve(msgInboxDir))) {
+            throw new Error(`Invalid document path: ${filePath}`);
+          }
+
+          const buffer = await downloadMediaMessage(msg as WAMessage, 'buffer', {});
+          fs.writeFileSync(filePath, buffer as Buffer);
+
+          attachments.push({
+            path: filePath,
+            filename,
+            mimeType: msgContent.documentMessage.mimetype || 'application/octet-stream',
+            size: (buffer as Buffer).length,
+            messageId,
+            caption: text || undefined,
+          });
+        } catch (err: any) {
+          logger.error({ err: err.message }, 'Failed to download document message');
         }
-        const rawFilename = msgContent.documentMessage.fileName || 'document.bin';
-        const filename = path.basename(rawFilename) || 'document.bin';
-        const filePath = path.resolve(msgInboxDir, filename);
-
-        if (!filePath.startsWith(path.resolve(msgInboxDir))) {
-          throw new Error(`Invalid document path: ${filePath}`);
-        }
-
-        const buffer = await downloadMediaMessage(msg as WAMessage, 'buffer', {});
-        fs.writeFileSync(filePath, buffer as Buffer);
-
-        attachments.push({
-          path: filePath,
-          filename,
-          mimeType: msgContent.documentMessage.mimetype || 'application/octet-stream',
-          size: (buffer as Buffer).length,
-          messageId,
-          caption: text || undefined,
-        });
-      } catch (err: any) {
-        logger.error({ err: err.message }, 'Failed to download document message');
       }
-    }
 
-    // Video message
-    if (msgContent.videoMessage) {
-      try {
-        if (!fs.existsSync(msgInboxDir)) {
-          fs.mkdirSync(msgInboxDir, { recursive: true, mode: 0o700 });
+      // Video message
+      if (msgContent.videoMessage) {
+        try {
+          if (!fs.existsSync(msgInboxDir)) {
+            fs.mkdirSync(msgInboxDir, { recursive: true, mode: 0o700 });
+          }
+          const filePath = path.join(msgInboxDir, 'video.mp4');
+          const buffer = await downloadMediaMessage(msg as WAMessage, 'buffer', {});
+          fs.writeFileSync(filePath, buffer as Buffer);
+
+          attachments.push({
+            path: filePath,
+            filename: 'video.mp4',
+            mimeType: msgContent.videoMessage.mimetype || 'video/mp4',
+            size: (buffer as Buffer).length,
+            messageId,
+            caption: text || undefined,
+          });
+        } catch (err: any) {
+          logger.error({ err: err.message }, 'Failed to download video message');
         }
-        const filePath = path.join(msgInboxDir, 'video.mp4');
-        const buffer = await downloadMediaMessage(msg as WAMessage, 'buffer', {});
-        fs.writeFileSync(filePath, buffer as Buffer);
-
-        attachments.push({
-          path: filePath,
-          filename: 'video.mp4',
-          mimeType: msgContent.videoMessage.mimetype || 'video/mp4',
-          size: (buffer as Buffer).length,
-          messageId,
-          caption: text || undefined,
-        });
-      } catch (err: any) {
-        logger.error({ err: err.message }, 'Failed to download video message');
       }
-    }
 
-    // Build normalized message
-    const formattedText = formatInboundMessageText(text, attachments);
-    const normalized: NormalizedInboundMessage = {
-      messageId,
-      from: senderNumber,
-      text: formattedText,
-      isVoice,
-      attachments,
-      rawMessage: msg,
-    };
+      // Build normalized message
+      const formattedText = formatInboundMessageText(text, attachments);
+      const normalized: NormalizedInboundMessage = {
+        messageId,
+        from: senderNumber,
+        text: formattedText,
+        isVoice,
+        attachments,
+        rawMessage: msg,
+      };
 
-    // Dispatch immediately into the main agent
-    await this.onDispatch(normalized);
+      // Dispatch immediately into the main agent
+      await this.onDispatch(normalized);
 
-    // Only acknowledge the inbound message after dispatch admission succeeds, so a
-    // transient runtime failure can be retried by a redelivery.
-    if (this.db.isOpen()) {
-      this.db.recordIdempotency(idempotencyKey, 'whatsapp_inbound', messageId);
+      // Only acknowledge the inbound message after dispatch admission succeeds, so a
+      // transient runtime failure can be retried by a redelivery.
+      if (this.db.isOpen()) {
+        this.db.recordIdempotency(idempotencyKey, 'whatsapp_inbound', messageId);
+      }
+    } finally {
+      this.inFlightInbound.delete(idempotencyKey);
     }
   }
 

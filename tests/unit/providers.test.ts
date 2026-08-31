@@ -68,7 +68,7 @@ describe('Provider Retry & Error Classification', () => {
         operationStarted();
         const error = new Error('Too many requests');
         (error as any).status = 429;
-        (error as any).headers = new Headers({ 'retry-after': '86400' });
+        (error as any).headers = new Headers({ 'retry-after': '10' });
         throw error;
       },
       { signal: controller.signal, jitter: false }
@@ -77,6 +77,23 @@ describe('Provider Retry & Error Classification', () => {
     await started;
     controller.abort(new Error('runtime stopped'));
     await expect(retry).rejects.toThrow('runtime stopped');
+    expect(attempts).toBe(1);
+  });
+
+  it('fails fast without retry when Retry-After exceeds maxDelayMs', async () => {
+    let attempts = 0;
+    const retry = withProviderRetry(
+      async () => {
+        attempts++;
+        const error = new Error('Too many requests');
+        (error as any).status = 429;
+        (error as any).headers = new Headers({ 'retry-after': '86400' });
+        throw error;
+      },
+      { maxDelayMs: 5000, jitter: false }
+    );
+
+    await expect(retry).rejects.toThrow(/exceeds maximum allowed delay/);
     expect(attempts).toBe(1);
   });
 });
@@ -106,6 +123,25 @@ describe('CommandCodeCatalog', () => {
       const models = await CommandCodeCatalog.fetchLiveModels('test-key');
       expect(models).toHaveLength(1);
       expect(models[0].capabilities.reasoningEfforts).toEqual(['high']);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('returns empty list when live catalog data or models property is not an array', async () => {
+    const originalFetch = global.fetch;
+    global.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          data: { invalid: 'object' },
+          models: 'not-an-array',
+        }),
+        { status: 200 }
+      )) as typeof fetch;
+
+    try {
+      const models = await CommandCodeCatalog.fetchLiveModels('test-key');
+      expect(models).toEqual([]);
     } finally {
       global.fetch = originalFetch;
     }

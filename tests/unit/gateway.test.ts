@@ -255,6 +255,34 @@ describe('WhatsApp Gateway & Sender', () => {
     expect(dispatchCount).toBe(1);
   });
 
+  it('prevents concurrent duplicate dispatches during in-flight processing', async () => {
+    let dispatchCount = 0;
+    const gateway = new WhatsAppGateway(
+      config,
+      db,
+      async () => {
+        dispatchCount++;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      },
+      async () => {},
+      tempDir
+    );
+
+    const msg = {
+      key: { remoteJid: '923001234567@s.whatsapp.net', id: 'm-concurrent-test' },
+      message: { conversation: 'Testing concurrent inbound idempotency' },
+    };
+
+    await Promise.all([
+      gateway.handleIncomingMessage(msg),
+      gateway.handleIncomingMessage(msg),
+      gateway.handleIncomingMessage(msg),
+    ]);
+
+    expect(dispatchCount).toBe(1);
+    expect(db.checkIdempotency('inbound_msg:m-concurrent-test')).not.toBeNull();
+  });
+
   it('does not acknowledge an inbound message when dispatch admission fails', async () => {
     let shouldFail = true;
     let dispatchCount = 0;

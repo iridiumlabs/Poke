@@ -34,7 +34,11 @@ export class FireworksCatalog {
       return await res.json();
     });
 
-    const modelsList: any[] = Array.isArray(rawData) ? rawData : rawData?.data || [];
+    const modelsList: any[] = Array.isArray(rawData)
+      ? rawData
+      : Array.isArray(rawData?.data)
+        ? rawData.data
+        : [];
     const result: ModelInfo[] = [];
 
     for (const item of modelsList) {

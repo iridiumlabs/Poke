@@ -170,7 +170,13 @@ export class CommandCodeCatalog {
     });
 
     const packageMeta = this.extractPackageMetadata();
-    const modelsList: any[] = Array.isArray(rawData) ? rawData : rawData?.data || rawData?.models || [];
+    const modelsList: any[] = Array.isArray(rawData)
+      ? rawData
+      : Array.isArray(rawData?.data)
+        ? rawData.data
+        : Array.isArray(rawData?.models)
+          ? rawData.models
+          : [];
 
     const result: ModelInfo[] = [];
 

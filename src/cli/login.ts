@@ -25,7 +25,7 @@ export async function runLogin(customHome?: string, inputRl?: readline.Interface
     const choice = await promptQuestion(rl, '\nSelect provider [1-3]: ');
 
     if (choice === '1' || choice.toLowerCase().includes('command')) {
-      const key = await promptSecret(rl, 'Enter Command Code Provider API key: ', !inputRl);
+      const key = await promptSecret(rl, 'Enter Command Code Provider API key: ', true);
       if (key) {
         console.log('Validating Command Code credentials...');
         try {
@@ -39,7 +39,7 @@ export async function runLogin(customHome?: string, inputRl?: readline.Interface
         }
       }
     } else if (choice === '2' || choice.toLowerCase().includes('fireworks')) {
-      const key = await promptSecret(rl, 'Enter Fireworks AI API key: ', !inputRl);
+      const key = await promptSecret(rl, 'Enter Fireworks AI API key: ', true);
       if (key) {
         console.log('Validating Fireworks credentials...');
         try {
@@ -53,7 +53,7 @@ export async function runLogin(customHome?: string, inputRl?: readline.Interface
         }
       }
     } else if (choice === '3' || choice.toLowerCase().includes('codex')) {
-      const token = await promptSecret(rl, 'Enter Codex Access Token: ', !inputRl);
+      const token = await promptSecret(rl, 'Enter Codex Access Token: ', true);
       if (token) {
         configManager.updateCredentials({
           codexAuth: {

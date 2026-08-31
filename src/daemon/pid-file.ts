@@ -61,6 +61,8 @@ export function isProcessRunning(pid: number): boolean {
 }
 
 function getProcessArgs(pid: number): string[] | null {
+  if (process.platform !== 'linux') return null;
+
   try {
     const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8');
     return cmdline.split('\0').filter(Boolean);
@@ -85,7 +87,9 @@ export function isLivePokeDaemon(record: DaemonPidRecord, expectedEntrypoint: st
   }
 
   const args = getProcessArgs(record.pid);
-  if (!args) return false;
+  if (!args) {
+    return process.platform !== 'linux' ? isProcessRunning(record.pid) : false;
+  }
 
   return (
     args.some((arg) => matchesEntrypoint(arg, expectedEntrypoint)) &&

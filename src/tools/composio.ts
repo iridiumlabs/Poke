@@ -11,9 +11,12 @@ export interface ComposioExecuteParams {
   params?: Record<string, any>;
 }
 
+export const COMPOSIO_CATALOG_TTL_MS = 5 * 60 * 1000;
+
 export class ComposioToolHandler {
   private toolset: OpenAIToolSet | null = null;
   private catalogPromise: Promise<any[]> | null = null;
+  private catalogExpiresAt = 0;
 
   constructor(private apiKey?: string) {
     if (apiKey) {
@@ -28,6 +31,7 @@ export class ComposioToolHandler {
   setApiKey(apiKey: string): void {
     this.apiKey = apiKey;
     this.catalogPromise = null;
+    this.catalogExpiresAt = 0;
     try {
       this.toolset = new OpenAIToolSet({ apiKey });
     } catch (err: any) {
@@ -84,13 +88,18 @@ export class ComposioToolHandler {
   }
 
   private async getCatalog(): Promise<any[]> {
-    if (!this.catalogPromise) {
+    const now = Date.now();
+    if (!this.catalogPromise || now >= this.catalogExpiresAt) {
       const toolset = this.toolset;
       this.catalogPromise = toolset!
         .getTools({ actions: [] })
-        .then((tools) => Array.from(tools || []))
+        .then((tools) => {
+          this.catalogExpiresAt = Date.now() + COMPOSIO_CATALOG_TTL_MS;
+          return Array.from(tools || []);
+        })
         .catch((err) => {
           this.catalogPromise = null;
+          this.catalogExpiresAt = 0;
           throw err;
         });
     }

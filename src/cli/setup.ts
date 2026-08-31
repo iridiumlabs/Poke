@@ -34,7 +34,7 @@ export async function runSetup(customHome?: string, inputRl?: readline.Interface
     const compPrompt = existingCreds.composioApiKey
       ? 'Composio API key [already set, press enter to keep]: '
       : 'Composio API key (optional, press enter to skip): ';
-    const composioKey = await promptSecret(rl, compPrompt, !inputRl);
+    const composioKey = await promptSecret(rl, compPrompt, true);
     if (composioKey) {
       configManager.updateCredentials({ composioApiKey: composioKey });
       console.log('✓ Composio API key updated');
@@ -44,7 +44,7 @@ export async function runSetup(customHome?: string, inputRl?: readline.Interface
     const superPrompt = existingCreds.supermemoryApiKey
       ? 'Supermemory API key [already set, press enter to keep]: '
       : 'Supermemory API key (optional, press enter to skip): ';
-    const superKey = await promptSecret(rl, superPrompt, !inputRl);
+    const superKey = await promptSecret(rl, superPrompt, true);
     if (superKey) {
       configManager.updateCredentials({ supermemoryApiKey: superKey });
       console.log('✓ Supermemory API key updated');
@@ -54,7 +54,7 @@ export async function runSetup(customHome?: string, inputRl?: readline.Interface
     const exaPrompt = existingCreds.exaApiKey
       ? 'Exa API key [already set, press enter to keep]: '
       : 'Exa API key (for web search/fetch): ';
-    const exaKey = await promptSecret(rl, exaPrompt, !inputRl);
+    const exaKey = await promptSecret(rl, exaPrompt, true);
     if (exaKey) {
       configManager.updateCredentials({ exaApiKey: exaKey });
       console.log('✓ Exa API key updated');
@@ -64,7 +64,7 @@ export async function runSetup(customHome?: string, inputRl?: readline.Interface
     const dgPrompt = existingCreds.deepgramApiKey
       ? 'Deepgram API key [already set, press enter to keep]: '
       : 'Deepgram API key (for voice notes STT & TTS): ';
-    const dgKey = await promptSecret(rl, dgPrompt, !inputRl);
+    const dgKey = await promptSecret(rl, dgPrompt, true);
     if (dgKey) {
       configManager.updateCredentials({ deepgramApiKey: dgKey });
       console.log('✓ Deepgram API key updated');

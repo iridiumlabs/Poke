@@ -51,7 +51,7 @@ Description=Poke WhatsApp Personal Agent Daemon
 After=network.target
 
 [Service]
-Type=simple
+Type=exec
 WorkingDirectory=${quoteSystemdArgument(workingDir)}
 ExecStart=${quoteSystemdArgument(nodePath)} ${quoteSystemdArgument(pokeBinPath)} start --foreground
 Restart=on-failure
@@ -169,8 +169,6 @@ export async function runStop(customHome?: string): Promise<void> {
     console.log('Stale PID file detected, removing.');
     if (record) {
       removeDaemonPidFileIfMatches(pidFile, record);
-    } else {
-      fs.unlinkSync(pidFile);
     }
     return;
   }

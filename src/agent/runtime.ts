@@ -111,7 +111,9 @@ export class PokeRuntime {
             this.compactionManager.onCompactionSuccess();
           }
         }) as any;
-      } catch {}
+      } catch (err: any) {
+        getLogger().warn({ err: err?.message || err }, 'Failed to subscribe to Flue compaction events');
+      }
 
       // Obtain stable handle for owner
       this.agentHandle = init(PokeMainAgent, { id: MAIN_AGENT_INSTANCE_ID });
