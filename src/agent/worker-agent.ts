@@ -45,7 +45,7 @@ export function PokeWorkerAgent() {
 
   const initialData = useInitialData<{ cwd?: string }>();
 
-  // 2. Attach local host sandbox and job cwd without exposing Poke credentials.
+  // 2. Attach local host sandbox and job cwd with the daemon's full environment.
   useSandbox(
     local({
       cwd: initialData?.cwd,

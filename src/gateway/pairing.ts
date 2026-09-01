@@ -111,6 +111,7 @@ export class WhatsAppPairingService {
 
     let activeSocket: PairingSocket | undefined;
     let committed = false;
+    let pendingSaveCreds: Promise<void> = Promise.resolve();
     const cancelWaiter = new AbortController();
     const signal = request.signal
       ? AbortSignal.any([request.signal, cancelWaiter.signal])
@@ -121,9 +122,10 @@ export class WhatsAppPairingService {
       const socket = connection.socket;
       activeSocket = socket;
       socket.ev.on('creds.update', () => {
-        void Promise.resolve(connection.saveCreds()).catch((error: unknown) => {
+        const savePromise = Promise.resolve(connection.saveCreds()).catch((error: unknown) => {
           getLogger().warn({ err: error instanceof Error ? error.message : String(error) }, 'Failed to persist pairing credentials');
         });
+        pendingSaveCreds = pendingSaveCreds.then(() => savePromise);
       });
       return socket;
     };
@@ -154,6 +156,7 @@ export class WhatsAppPairingService {
         await Promise.resolve(activeSocket.end());
         activeSocket = undefined;
       }
+      await pendingSaveCreds;
       await this.commitStagedSession(stagingDirectory);
       committed = true;
       return { paired: true, pairedAccount };

@@ -166,4 +166,39 @@ describe('WhatsAppPairingService', () => {
     expect(socket2.end).toHaveBeenCalled();
     expect(fs.readFileSync(path.join(paths.whatsappDir, 'creds.json'), 'utf8')).toBe('new-staged');
   });
+
+  it('awaits pending credential saves before committing the staged session', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'poke-pairing-'));
+    directories.push(home);
+    const paths = resolvePokePaths(home);
+    const socket = new FakeSocket();
+    let saveCompleted = false;
+
+    const service = new WhatsAppPairingService(paths, {
+      async create(stagingDirectory) {
+        return {
+          socket,
+          saveCreds: async () => {
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            fs.writeFileSync(path.join(stagingDirectory, 'creds.json'), 'persisted-creds');
+            saveCompleted = true;
+          },
+        };
+      },
+    });
+
+    const pairPromise = service.pair({ method: { type: 'qr' } });
+
+    // Allow createSocket to run and register listeners
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    socket.ev.emit('creds.update', {});
+    socket.ev.emit('connection.update', { connection: 'open' });
+
+    const result = await pairPromise;
+
+    expect(result.paired).toBe(true);
+    expect(saveCompleted).toBe(true);
+    expect(fs.readFileSync(path.join(paths.whatsappDir, 'creds.json'), 'utf8')).toBe('persisted-creds');
+  });
 });
