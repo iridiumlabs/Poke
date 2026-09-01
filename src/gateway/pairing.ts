@@ -128,27 +128,20 @@ export class WhatsAppPairingService {
     };
 
     try {
-      const initialSocket = await createSocket();
-
-      const open = this.waitForOpen(
-        initialSocket,
-        createSocket,
-        { ...request, signal },
-        request.timeoutMs || DEFAULT_PAIRING_TIMEOUT_MS
-      );
-      // A code request can fail before we await `open`. Attach a rejection
-      // handler now so that failure does not become an unhandled rejection.
-      void open.catch(() => undefined);
-
-      if (phoneNumber) {
-        request.onStatus?.('Requesting a WhatsApp pairing code…');
-        const code = await initialSocket.requestPairingCode(phoneNumber);
-        request.onPairingCode?.(formatPairingCode(code));
-      } else {
+      if (request.method.type === 'qr') {
         request.onStatus?.('Scan the WhatsApp QR code to pair this account.');
       }
 
-      const pairedAccount = await open;
+      const initialSocket = await createSocket();
+
+      const pairedAccount = await this.waitForOpen(
+        initialSocket,
+        createSocket,
+        { ...request, signal },
+        phoneNumber,
+        request.timeoutMs || DEFAULT_PAIRING_TIMEOUT_MS
+      );
+
       if (activeSocket) {
         await Promise.resolve(activeSocket.end());
         activeSocket = undefined;
@@ -185,11 +178,13 @@ export class WhatsAppPairingService {
     initialSocket: PairingSocket,
     recreateSocket: () => Promise<PairingSocket>,
     request: PairingRequest,
+    phoneNumber: string | undefined,
     timeoutMs: number
   ): Promise<string | undefined> {
     return await new Promise<string | undefined>((resolve, reject) => {
       let settled = false;
       let currentSocket = initialSocket;
+      let pairingCodeRequested = false;
 
       const finish = (outcome: () => void) => {
         if (settled) return;
@@ -208,7 +203,30 @@ export class WhatsAppPairingService {
       };
 
       const onUpdate = (update: PairingConnectionUpdate) => {
-        if (update.qr) request.onQr?.(update.qr);
+        if (settled) return;
+
+        if (update.qr && request.method.type === 'qr') {
+          request.onQr?.(update.qr);
+        }
+
+        if (
+          phoneNumber &&
+          !pairingCodeRequested &&
+          (update.qr || (update.connection && update.connection !== 'close'))
+        ) {
+          pairingCodeRequested = true;
+          request.onStatus?.('Requesting a WhatsApp pairing code…');
+          void currentSocket.requestPairingCode(phoneNumber).then(
+            (code) => {
+              if (settled) return;
+              request.onPairingCode?.(formatPairingCode(code));
+            },
+            (err: unknown) => {
+              finish(() => reject(err instanceof Error ? err : new Error(String(err))));
+            }
+          );
+        }
+
         if (update.connection === 'open') {
           const rawId = currentSocket.user?.id || '';
           const pairedAccount = rawId ? normalizePhoneNumber(rawId.replace(/@.*$/, '').split(':')[0]) : undefined;
