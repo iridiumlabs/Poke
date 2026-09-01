@@ -99,11 +99,13 @@ describe('PokeRuntime: Submission Delivery & Replay Recovery', () => {
     expect(directErrorSpy).not.toHaveBeenCalled();
 
     // Check delivery record was attached in DB and settled upon read completion
-    const delivery = db.getSubmissionDeliveryBySourceKey(sourceKey);
-    expect(delivery).toMatchObject({
-      source_key: sourceKey,
-      submission_id: submissionId,
-      status: 'completed',
+    await vi.waitFor(() => {
+      const delivery = db.getSubmissionDeliveryBySourceKey(sourceKey);
+      expect(delivery).toMatchObject({
+        source_key: sourceKey,
+        submission_id: submissionId,
+        status: 'completed',
+      });
     });
   });
 
@@ -144,9 +146,11 @@ describe('PokeRuntime: Submission Delivery & Replay Recovery', () => {
       idempotencyKey: sourceKey,
     });
     expect(receipt).toEqual({ submissionId });
-    expect(db.getSubmissionDeliveryBySourceKey(sourceKey)).toMatchObject({
-      submission_id: submissionId,
-      status: 'completed',
+    await vi.waitFor(() => {
+      expect(db.getSubmissionDeliveryBySourceKey(sourceKey)).toMatchObject({
+        submission_id: submissionId,
+        status: 'completed',
+      });
     });
 
     // 2. Persistent failure cleans up unattached row
@@ -260,11 +264,13 @@ describe('PokeRuntime: Submission Delivery & Replay Recovery', () => {
     expect(directErrorSpy).not.toHaveBeenCalled();
 
     // Delivery record was attached in DB and settled
-    const delivery = db.getSubmissionDeliveryBySourceKey(sourceKey);
-    expect(delivery).toMatchObject({
-      source_key: sourceKey,
-      submission_id: admittedSubmissionId,
-      status: 'completed',
+    await vi.waitFor(() => {
+      const delivery = db.getSubmissionDeliveryBySourceKey(sourceKey);
+      expect(delivery).toMatchObject({
+        source_key: sourceKey,
+        submission_id: admittedSubmissionId,
+        status: 'completed',
+      });
     });
   });
 
