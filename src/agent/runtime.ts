@@ -94,16 +94,23 @@ export class PokeRuntime {
         }
       }
 
-      // Register the exact selected Command Code definitions with Flue. The
-      // live catalog is authoritative for its reasoning, image, and context
-      // metadata; leaving it dynamic makes every model look text-only.
+      // Register the exact selected Command Code and Fireworks definitions with Flue.
+      // Their metadata is authoritative for reasoning, image, and context capabilities.
       const commandCodeModels = [
         mainModel?.provider === 'commandcode' ? mainValidation.modelInfo : undefined,
         workerModel?.provider === 'commandcode' ? workerValidation.modelInfo : undefined,
       ]
         .filter((model): model is NonNullable<typeof model> => Boolean(model))
         .filter((model, index, all) => all.findIndex((candidate) => candidate.id === model.id) === index);
-      registerAllProviders(providerRegistry.models, commandCodeModels);
+
+      const fireworksModels = [
+        mainModel?.provider === 'fireworks' ? mainValidation.modelInfo : undefined,
+        workerModel?.provider === 'fireworks' ? workerValidation.modelInfo : undefined,
+      ]
+        .filter((model): model is NonNullable<typeof model> => Boolean(model))
+        .filter((model, index, all) => all.findIndex((candidate) => candidate.id === model.id) === index);
+
+      registerAllProviders(providerRegistry.models, commandCodeModels, fireworksModels);
 
       const toolContexts = {
         sender: this.sender,

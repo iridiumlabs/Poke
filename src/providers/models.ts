@@ -9,14 +9,15 @@ import {
   type Provider,
 } from '@earendil-works/pi-ai';
 import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy';
-import { fireworksProvider } from '@earendil-works/pi-ai/providers/fireworks';
 import { openaiCodexProvider } from '@earendil-works/pi-ai/providers/openai-codex';
 import type { ModelInfo, ReasoningEffort } from '../config/types.js';
+import { COMMAND_CODE_MANUAL_CATALOG } from './commandcode.js';
 
 export const CODEX_PROVIDER_ID = 'openai-codex';
 export const FIREWORKS_PROVIDER_ID = 'fireworks';
 export const COMMAND_CODE_PROVIDER_ID = 'commandcode';
-const COMMAND_CODE_BASE_URL = 'https://api.commandcode.ai/provider/v1';
+export const COMMAND_CODE_BASE_URL = 'https://api.commandcode.ai/provider/v1';
+export const FIREWORKS_BASE_URL = 'https://api.fireworks.ai/inference/v1';
 
 const REASONING_EFFORTS = new Set<ReasoningEffort>(['low', 'medium', 'high', 'xhigh', 'max']);
 
@@ -55,7 +56,7 @@ export function createCommandCodeRuntimeModel(info: ModelInfo): Model<'openai-co
 }
 
 export function createCommandCodeCredentialProvider(
-  runtimeModels: readonly ModelInfo[] = []
+  runtimeModels: readonly ModelInfo[] = COMMAND_CODE_MANUAL_CATALOG
 ): Provider<'openai-completions'> {
   const provider = createProvider({
     id: COMMAND_CODE_PROVIDER_ID,
@@ -88,11 +89,74 @@ export function createCommandCodeCredentialProvider(
   return provider;
 }
 
+export function createFireworksRuntimeModel(info: ModelInfo): Model<'openai-completions'> {
+  const supportedEfforts = new Set(info.capabilities.reasoningEfforts);
+  const reasoning = supportedEfforts.size > 0;
+  const thinkingLevelMap = reasoning
+    ? {
+        off: null,
+        minimal: null,
+        low: supportedEfforts.has('low') ? 'low' : null,
+        medium: supportedEfforts.has('medium') ? 'medium' : null,
+        high: supportedEfforts.has('high') ? 'high' : null,
+        xhigh: supportedEfforts.has('xhigh') ? 'xhigh' : null,
+        max: supportedEfforts.has('max') ? 'max' : null,
+      }
+    : undefined;
+  const contextWindow = Math.max(1, info.capabilities.contextWindow || 128000);
+
+  return {
+    id: info.id,
+    name: info.name || info.id,
+    api: 'openai-completions',
+    provider: FIREWORKS_PROVIDER_ID,
+    baseUrl: FIREWORKS_BASE_URL,
+    reasoning,
+    ...(thinkingLevelMap ? { thinkingLevelMap } : {}),
+    input: info.capabilities.acceptsImages ? ['text', 'image'] : ['text'],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow,
+    maxTokens: Math.min(16384, contextWindow),
+    compat: { supportsReasoningEffort: reasoning },
+  };
+}
+
+export function createFireworksCredentialProvider(
+  runtimeModels: readonly ModelInfo[] = []
+): Provider<'openai-completions'> {
+  const provider = createProvider({
+    id: FIREWORKS_PROVIDER_ID,
+    name: 'Fireworks',
+    baseUrl: FIREWORKS_BASE_URL,
+    auth: {
+      apiKey: {
+        name: 'Fireworks API key',
+        resolve: async ({ credential }) => {
+          if (!credential?.key) return undefined;
+          return {
+            auth: { apiKey: credential.key },
+            source: 'Poke credential store',
+          };
+        },
+      },
+    },
+    models: runtimeModels.map(createFireworksRuntimeModel),
+    api: openAICompletionsApi(),
+  }) as unknown as Provider<'openai-completions'>;
+
+  (provider as any)[Symbol.for('flue.dynamicModelTemplate')] = {
+    api: 'openai-completions',
+    baseUrl: FIREWORKS_BASE_URL,
+  };
+
+  return provider;
+}
+
 /** The one app-owned pi-ai collection. OAuth refreshes use this locked store. */
 export function createPokeModels(credentials: CredentialStore): MutableModels {
   const models = createModels({ credentials });
-  models.setProvider(createCommandCodeCredentialProvider());
-  models.setProvider(fireworksProvider());
+  models.setProvider(createCommandCodeCredentialProvider(COMMAND_CODE_MANUAL_CATALOG));
+  models.setProvider(createFireworksCredentialProvider());
   models.setProvider(openaiCodexProvider());
   return models;
 }

@@ -60,7 +60,7 @@ export async function runLogin(
   const credentials = dependencies.credentials || new FileCredentialStore(config.getPaths().credentialsFile);
   await migrateLegacyProviderCredentials(config, credentials);
   const models = dependencies.models || createPokeModels(credentials);
-  const validateCommandCode = dependencies.validateCommandCode || CommandCodeCatalog.fetchLiveModels;
+  const validateCommandCode = dependencies.validateCommandCode || CommandCodeCatalog.validateApiKey;
   const validateFireworks = dependencies.validateFireworks || FireworksCatalog.fetchLiveModels;
 
   ui.note('Poke login');
