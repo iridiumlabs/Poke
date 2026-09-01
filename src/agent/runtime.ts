@@ -223,6 +223,7 @@ export class PokeRuntime {
     );
 
     const sourceKey = whatsappMessageId ? `whatsapp:${whatsappMessageId}` : undefined;
+    let messagePayload: any;
     try {
       await this.ensurePreflightCompaction();
       this.compactionManager.recordActivity();
@@ -246,7 +247,7 @@ export class PokeRuntime {
         })
         .filter(Boolean);
 
-      const messagePayload = {
+      messagePayload = {
         kind: 'user' as const,
         body: whatsappMessageId ? `[WhatsApp message ID: ${whatsappMessageId}]\n\n${body}` : body,
         ...(flueAttachments.length > 0 ? { attachments: flueAttachments as any } : {}),
@@ -271,16 +272,29 @@ export class PokeRuntime {
       return receipt;
     } catch (err: any) {
       logger.error({ err: err.message }, 'Failed to dispatch user message to agent');
-      // A transport error can arrive after Flue durably accepted the keyed
-      // submission. Reattach to that row before reporting locally, otherwise
-      // the later settlement observer would send the same error twice.
-      const recoveredSubmissionId = sourceKey ? this.findOwnerSubmissionId(sourceKey) : null;
-      if (sourceKey && recoveredSubmissionId) {
-        this.db.attachSubmissionDelivery(sourceKey, recoveredSubmissionId);
-        this.watchSubmissionSettlement(recoveredSubmissionId);
-      } else {
-        await this.sender.sendDirectError(`Inference failed: ${err.message}`);
+      // A transport or downstream error can arrive after Flue durably accepted
+      // the keyed submission. Replaying the dispatch with the same key converges
+      // on the accepted submission and returns its receipt without running a second turn.
+      if (sourceKey && this.agentHandle && messagePayload) {
+        try {
+          const replayReceipt = await this.agentHandle.dispatch({
+            message: messagePayload as any,
+            idempotencyKey: sourceKey,
+          });
+          this.db.attachSubmissionDelivery(sourceKey, replayReceipt.submissionId);
+          this.watchSubmissionSettlement(replayReceipt.submissionId);
+          return replayReceipt;
+        } catch (replayErr: any) {
+          logger.warn(
+            { err: replayErr?.message || String(replayErr) },
+            'Failed to recover submission through idempotency replay'
+          );
+        }
       }
+      if (sourceKey) {
+        this.db.removeUnattachedSubmissionDelivery(sourceKey);
+      }
+      await this.sender.sendDirectError(`Inference failed: ${err.message}`);
       throw err;
     }
   }
@@ -308,21 +322,47 @@ export class PokeRuntime {
       this.db.reserveSubmissionDelivery({ sourceKey: signal.idempotencyKey, source });
     }
 
-    const receipt = await this.agentHandle.dispatch({
-      message: {
-        kind: 'signal' as any,
-        type: signal.type,
-        tagName: signal.tagName,
-        attributes: signal.attributes,
-        body: signal.body,
-      } as any,
-      ...(signal.idempotencyKey ? { idempotencyKey: signal.idempotencyKey } : {}),
-    });
-    if (source && signal.idempotencyKey) {
-      this.db.attachSubmissionDelivery(signal.idempotencyKey, receipt.submissionId);
-      this.watchSubmissionSettlement(receipt.submissionId);
+    const signalMessage = {
+      kind: 'signal' as const,
+      type: signal.type,
+      tagName: signal.tagName,
+      attributes: signal.attributes,
+      body: signal.body,
+    };
+
+    try {
+      const receipt = await this.agentHandle.dispatch({
+        message: signalMessage as any,
+        ...(signal.idempotencyKey ? { idempotencyKey: signal.idempotencyKey } : {}),
+      });
+      if (source && signal.idempotencyKey) {
+        this.db.attachSubmissionDelivery(signal.idempotencyKey, receipt.submissionId);
+        this.watchSubmissionSettlement(receipt.submissionId);
+      }
+      return receipt;
+    } catch (err: any) {
+      logger.error({ err: err?.message || String(err) }, 'Failed to dispatch signal to agent');
+      if (source && signal.idempotencyKey && this.agentHandle) {
+        try {
+          const replayReceipt = await this.agentHandle.dispatch({
+            message: signalMessage as any,
+            idempotencyKey: signal.idempotencyKey,
+          });
+          this.db.attachSubmissionDelivery(signal.idempotencyKey, replayReceipt.submissionId);
+          this.watchSubmissionSettlement(replayReceipt.submissionId);
+          return replayReceipt;
+        } catch (replayErr: any) {
+          logger.warn(
+            { err: replayErr?.message || String(replayErr) },
+            'Failed to recover signal submission through idempotency replay'
+          );
+        }
+      }
+      if (source && signal.idempotencyKey) {
+        this.db.removeUnattachedSubmissionDelivery(signal.idempotencyKey);
+      }
+      throw err;
     }
-    return receipt;
   }
 
   async abortAll(): Promise<void> {
@@ -512,13 +552,25 @@ export class PokeRuntime {
 
   private recoverSubmissionDeliveries(): void {
     for (const delivery of this.db.getPendingSubmissionDeliveries()) {
-      const submissionId = delivery.submission_id || this.findOwnerSubmissionId(delivery.source_key);
-      if (!submissionId) continue;
-      if (!delivery.submission_id) {
-        this.db.attachSubmissionDelivery(delivery.source_key, submissionId);
+      let submissionId = delivery.submission_id;
+      if (!submissionId) {
+        const derivedSubmissionId = this.deriveOwnerSubmissionId(delivery.source_key);
+        if (this.db.hasFlueSubmission(derivedSubmissionId)) {
+          submissionId = derivedSubmissionId;
+          this.db.attachSubmissionDelivery(delivery.source_key, submissionId);
+        } else {
+          this.db.removeUnattachedSubmissionDelivery(delivery.source_key);
+          continue;
+        }
       }
       this.watchSubmissionSettlement(submissionId);
     }
+  }
+
+  private deriveOwnerSubmissionId(sourceKey: string): string {
+    const preimage = `flue-submission-key\n${PokeMainAgent.name}\n${MAIN_AGENT_INSTANCE_ID}\n${sourceKey}`;
+    const digest = crypto.createHash('sha256').update(preimage).digest('hex').slice(0, 32);
+    return `sub_ik_${digest}`;
   }
 
   /**
@@ -542,10 +594,6 @@ export class PokeRuntime {
         error: { message: (error?.cause as Error)?.message || error?.message || 'Inference failed' },
       }))
       .finally(() => this.watchedSubmissionSettlements.delete(submissionId));
-  }
-
-  private findOwnerSubmissionId(sourceKey: string): string | null {
-    return this.db.getSubmissionDeliveryBySourceKey(sourceKey)?.submission_id || null;
   }
 
   private async handleSubmissionSettlement(event: {
