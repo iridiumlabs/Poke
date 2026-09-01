@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { withProviderRetry, isTransientError, NonRetryableError } from '../../src/providers/retry.js';
 import { CommandCodeCatalog } from '../../src/providers/commandcode.js';
 import { ProviderRegistry, normalizeCatalogModelId } from '../../src/providers/provider-registry.js';
+import { FileCredentialStore } from '../../src/providers/credential-store.js';
 import { ComposioToolHandler } from '../../src/tools/composio.js';
 
 describe('Provider Retry & Error Classification', () => {
@@ -165,7 +166,9 @@ describe('resolveFlueModelSpecifier', () => {
       'accounts/fireworks/models/deepseek-r1'
     );
 
-    const fetchModels = vi.spyOn(ProviderRegistry, 'fetchModels').mockResolvedValue([
+    const directory = await import('node:fs/promises').then(({ mkdtemp }) => mkdtemp('/tmp/poke-provider-test-'));
+    const registry = new ProviderRegistry(new FileCredentialStore(`${directory}/credentials.json`));
+    const fetchModels = vi.spyOn(registry, 'fetchModels').mockResolvedValue([
       {
         id: 'gpt-4o',
         name: 'gpt-4o',
@@ -174,92 +177,111 @@ describe('resolveFlueModelSpecifier', () => {
     ]);
     try {
       await expect(
-        ProviderRegistry.validateSelection(
-          { provider: 'codex', model: 'openai-codex/gpt-4o' },
-          {}
-        )
+        registry.validateSelection({ provider: 'codex', model: 'openai-codex/gpt-4o' })
       ).resolves.toMatchObject({ valid: true, modelInfo: { id: 'gpt-4o' } });
     } finally {
       fetchModels.mockRestore();
+      await import('node:fs/promises').then(({ rm }) => rm(directory, { recursive: true, force: true }));
     }
   });
 
-  it('uses environment credentials while validating a provider selection', async () => {
-    const previousKey = process.env.COMMANDCODE_API_KEY;
-    process.env.COMMANDCODE_API_KEY = 'env-command-code-key';
+  it('uses only the private credential store for provider catalogs', async () => {
+    const directory = await import('node:fs/promises').then(({ mkdtemp }) => mkdtemp('/tmp/poke-provider-test-'));
+    const credentials = new FileCredentialStore(`${directory}/credentials.json`);
+    await credentials.modify('commandcode', async () => ({ type: 'api_key', key: 'stored-command-code-key' }));
+    const registry = new ProviderRegistry(credentials);
     const fetchLiveModels = vi.spyOn(CommandCodeCatalog, 'fetchLiveModels').mockResolvedValue([]);
 
     try {
-      await ProviderRegistry.fetchModels('commandcode', {});
-      expect(fetchLiveModels).toHaveBeenCalledWith('env-command-code-key');
+      await registry.fetchModels('commandcode');
+      expect(fetchLiveModels).toHaveBeenCalledWith('stored-command-code-key');
     } finally {
       fetchLiveModels.mockRestore();
-      if (previousKey === undefined) {
-        delete process.env.COMMANDCODE_API_KEY;
-      } else {
-        process.env.COMMANDCODE_API_KEY = previousKey;
-      }
+      await import('node:fs/promises').then(({ rm }) => rm(directory, { recursive: true, force: true }));
     }
+  });
+
+  it('rejects an absent model selection instead of silently picking a fallback', async () => {
+    const { resolveFlueModelSpecifier } = await import('../../src/providers/provider-registry.js');
+    expect(() => resolveFlueModelSpecifier()).toThrow(/No model is configured/);
+  });
+
+  it('attaches Flue dynamicModelTemplate to Command Code credential provider', async () => {
+    const { createCommandCodeCredentialProvider, withPokeCredentialResolver, createPokeModels } = await import('../../src/providers/models.js');
+    const dynamicKey = Symbol.for('flue.dynamicModelTemplate');
+    const provider = createCommandCodeCredentialProvider();
+    expect((provider as any)[dynamicKey]).toEqual({
+      api: 'openai-completions',
+      baseUrl: 'https://api.commandcode.ai/provider/v1',
+    });
+
+    const credentials = new FileCredentialStore('/tmp/test-creds.json');
+    const models = createPokeModels(credentials);
+    const resolved = withPokeCredentialResolver(provider, models);
+    expect((resolved as any)[dynamicKey]).toEqual({
+      api: 'openai-completions',
+      baseUrl: 'https://api.commandcode.ai/provider/v1',
+    });
   });
 });
 
 describe('ComposioToolHandler', () => {
   it('caches the locally filtered catalog and does not retry externally mutating actions', async () => {
-    const handler = new ComposioToolHandler('test-key');
-    const toolset = {
-      getTools: vi.fn().mockResolvedValue([
+    const client = {
+      listTools: vi.fn().mockResolvedValue([
         {
-          function: {
-            name: 'GMAIL_SEND_EMAIL',
-            description: 'Send an email through Gmail.',
-            parameters: { type: 'object' },
-          },
+          slug: 'GMAIL_SEND_EMAIL',
+          name: 'GMAIL_SEND_EMAIL',
+          description: 'Send an email through Gmail.',
+          inputParameters: { type: 'object' },
         },
       ]),
-      executeAction: vi.fn().mockRejectedValue(new Error('connection reset after action')),
+      execute: vi.fn().mockRejectedValue(new Error('connection reset after action')),
     };
-    (handler as any).toolset = toolset;
+    const handler = new ComposioToolHandler('test-key', () => client);
 
     await expect(handler.search({ query: 'email' })).resolves.toMatchObject({
       actions: [{ name: 'GMAIL_SEND_EMAIL' }],
     });
-    await expect(handler.search({ query: 'gmail' })).resolves.toMatchObject({
+    await expect(handler.search({ query: 'email' })).resolves.toMatchObject({
       actions: [{ name: 'GMAIL_SEND_EMAIL' }],
     });
-    expect(toolset.getTools).toHaveBeenCalledTimes(1);
+    expect(client.listTools).toHaveBeenCalledTimes(1);
 
     await expect(handler.execute({ action: 'GMAIL_SEND_EMAIL' })).rejects.toThrow(
       'connection reset after action'
     );
-    expect(toolset.executeAction).toHaveBeenCalledTimes(1);
+    expect(client.execute).toHaveBeenCalledWith('GMAIL_SEND_EMAIL', {});
+    expect(client.execute).toHaveBeenCalledTimes(1);
   });
 
   it('invalidates cached catalog across setApiKey generations and ignores stale resolutions', async () => {
-    const handler = new ComposioToolHandler('initial-key');
     let resolveFirst!: (value: any) => void;
     const firstPromise = new Promise<any[]>((res) => {
       resolveFirst = res;
     });
 
-    const firstToolset = {
-      getTools: vi.fn().mockReturnValue(firstPromise),
+    const firstClient = {
+      listTools: vi.fn().mockReturnValue(firstPromise),
+      execute: vi.fn(),
     };
-    (handler as any).toolset = firstToolset;
+    const secondClient = {
+      listTools: vi.fn().mockResolvedValue([
+        { slug: 'SECOND_TOOL', name: 'SECOND_TOOL', description: 'Second tool description' },
+      ]),
+      execute: vi.fn(),
+    };
+    const clients = [firstClient, secondClient];
+    const handler = new ComposioToolHandler('initial-key', () => clients.shift()!);
 
     // Start in-flight catalog fetch for first generation
     const search1 = handler.search({ query: 'first' });
 
     // Rotate API key while first fetch is pending
     handler.setApiKey('second-key');
-    const secondToolset = {
-      getTools: vi.fn().mockResolvedValue([
-        { function: { name: 'SECOND_TOOL', description: 'Second tool description' } },
-      ]),
-    };
-    (handler as any).toolset = secondToolset;
 
     // Resolve the first (stale) catalog fetch
-    resolveFirst([{ function: { name: 'FIRST_TOOL', description: 'First tool description' } }]);
+    resolveFirst([{ slug: 'FIRST_TOOL', name: 'FIRST_TOOL', description: 'First tool description' }]);
     await expect(search1).resolves.toMatchObject({
       actions: [{ name: 'FIRST_TOOL' }],
     });
@@ -268,6 +290,6 @@ describe('ComposioToolHandler', () => {
     await expect(handler.search({ query: 'second' })).resolves.toMatchObject({
       actions: [{ name: 'SECOND_TOOL' }],
     });
-    expect(secondToolset.getTools).toHaveBeenCalledTimes(1);
+    expect(secondClient.listTools).toHaveBeenCalledTimes(1);
   });
 });

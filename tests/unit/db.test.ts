@@ -97,4 +97,32 @@ describe('PokeDatabase', () => {
     expect(lastErr?.source).toBe('provider');
     expect(lastErr?.message).toBe('Timeout error');
   });
+
+  it('does not persist credentials embedded in operational errors', () => {
+    const secret = 'super-secret-token-value';
+    db.recordOperationalError('provider', `Authorization: Bearer ${secret}`, `token=${secret}`);
+
+    const last = db.getLastOperationalError();
+    expect(last?.message).not.toContain(secret);
+    expect(last?.details).not.toContain(secret);
+  });
+
+  it('persists a delivery intent before a transport result and preserves an unknown outcome', () => {
+    const first = db.reserveOutgoingDelivery('send-1:part:0', 'whatsapp_send_part', 'payload-hash');
+    expect(first.created).toBe(true);
+    expect(first.record.status).toBe('pending');
+
+    const retry = db.reserveOutgoingDelivery('send-1:part:0', 'whatsapp_send_part', 'payload-hash');
+    expect(retry.created).toBe(false);
+    expect(retry.record.status).toBe('pending');
+
+    db.completeOutgoingDelivery(
+      'send-1:part:0',
+      'whatsapp_send_part',
+      'payload-hash',
+      JSON.stringify({ messageId: 'wa-123' })
+    );
+    expect(db.getOutgoingDelivery('send-1:part:0')).toMatchObject({ status: 'sent' });
+    expect(db.checkIdempotency('send-1:part:0')?.response_data).toContain('wa-123');
+  });
 });

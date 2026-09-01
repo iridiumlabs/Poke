@@ -97,6 +97,10 @@ describe('Integration: End-to-End Poke Agent Flows', () => {
       data: { capability: 'automations' },
     } as any);
     expect(config.getActiveCapabilities()).toContain('automations');
+    await expect(
+      tools.loadToolsTool.run({ data: { capability: 'untrusted-capability' } } as any)
+    ).rejects.toThrow('Unknown conditional capability');
+    expect(config.getActiveCapabilities()).not.toContain('untrusted-capability');
 
     const autoResult = await tools.automationTool.run({
       data: {

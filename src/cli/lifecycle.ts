@@ -35,6 +35,13 @@ export function isSystemdServiceActive(): boolean {
   }
 }
 
+export function isDaemonRunning(customHome?: string): boolean {
+  if (isSystemdServiceActive()) return true;
+  const paths = resolvePokePaths(customHome);
+  const record = readDaemonPidFile(path.join(paths.root, 'daemon.pid'));
+  return Boolean(record && isLivePokeDaemon(record, resolvePokeInstallationPaths().pokeBinPath));
+}
+
 export function generateSystemdServiceUnit(customHome?: string): string {
   const nodePath = process.execPath;
   const { pokeBinPath, workingDir } = resolvePokeInstallationPaths();

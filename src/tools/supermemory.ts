@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { getLogger } from '../logger/logger.js';
 import { withProviderRetry } from '../providers/retry.js';
 import { providerRequestSignal } from '../providers/fetch.js';
@@ -16,15 +15,15 @@ export interface MemoryRecallParams {
 export interface MemoryItem {
   id: string;
   content: string;
-  metadata?: Record<string, any>;
+  metadata?: Record<string, unknown>;
   score?: number;
   created_at?: string;
 }
 
-export class SupermemoryToolHandler {
-  private baseUrl = 'https://api.supermemory.ai/v3';
+const SUPERMEMORY_V4_URL = 'https://api.supermemory.ai/v4';
 
-  constructor(private apiKey?: string, private containerId: string = 'owner') {}
+export class SupermemoryToolHandler {
+  constructor(private apiKey?: string, private readonly containerTag = 'poke-owner') {}
 
   setApiKey(apiKey: string): void {
     this.apiKey = apiKey;
@@ -34,54 +33,53 @@ export class SupermemoryToolHandler {
     if (!this.apiKey) {
       throw new Error('Supermemory API key is not configured. Add it via `poke setup`.');
     }
+    if (!params.content.trim()) {
+      throw new Error('Memory content is required.');
+    }
 
-    const logger = getLogger();
-    logger.info({ containerId: this.containerId }, 'Saving memory to Supermemory');
-    const customId = `poke-${randomUUID()}`;
-    const savedAt = new Date().toISOString();
-
-    return await withProviderRetry(async () => {
-      const res = await fetch(`${this.baseUrl}/memories`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${this.apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        signal: providerRequestSignal(),
-        body: JSON.stringify({
-          content: params.content,
-          containerId: this.containerId,
-          customId,
-          metadata: {
-            ...params.metadata,
-            savedAt,
-          },
-        }),
-      });
-
-      if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        const err = new Error(`Supermemory save returned ${res.status}: ${text}`);
-        (err as any).status = res.status;
-        (err as any).headers = res.headers;
-        throw err;
-      }
-
-      const data = (await res.json()) as any;
-      return { success: true, id: data.id || data.memoryId || data.uuid };
+    getLogger().info({ containerTag: this.containerTag }, 'Saving memory to Supermemory');
+    // The v4 memories endpoint has no Poke-controlled idempotency key. Do not
+    // replay an ambiguous mutation after a transport failure.
+    const response = await fetch(`${SUPERMEMORY_V4_URL}/memories`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      signal: providerRequestSignal(),
+      body: JSON.stringify({
+        containerTag: this.containerTag,
+        memories: [{ content: params.content, metadata: params.metadata }],
+      }),
     });
+    if (!response.ok) {
+      throw providerError('Supermemory save', response.status, response.headers);
+    }
+
+    const data = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+    const memories = Array.isArray(data.memories) ? data.memories : [];
+    const first = memories[0] as Record<string, unknown> | undefined;
+    return {
+      success: true,
+      ...(typeof first?.id === 'string'
+        ? { id: first.id }
+        : typeof data.id === 'string'
+          ? { id: data.id }
+          : {}),
+    };
   }
 
   async recall(params: MemoryRecallParams): Promise<{ results: MemoryItem[] }> {
     if (!this.apiKey) {
       throw new Error('Supermemory API key is not configured. Add it via `poke setup`.');
     }
+    if (!params.query.trim()) {
+      throw new Error('Memory search query is required.');
+    }
 
-    const logger = getLogger();
-    logger.info({ query: params.query, containerId: this.containerId }, 'Recalling memories from Supermemory');
-
+    getLogger().info({ containerTag: this.containerTag }, 'Recalling memories from Supermemory');
     return await withProviderRetry(async () => {
-      const res = await fetch(`${this.baseUrl}/search`, {
+      const response = await fetch(`${SUPERMEMORY_V4_URL}/search`, {
         method: 'POST',
         headers: {
           Authorization: `Bearer ${this.apiKey}`,
@@ -90,34 +88,49 @@ export class SupermemoryToolHandler {
         },
         signal: providerRequestSignal(),
         body: JSON.stringify({
-          query: params.query,
-          containerId: this.containerId,
+          q: params.query,
+          containerTag: this.containerTag,
+          searchMode: 'memories',
           limit: Math.min(params.limit || 5, 10),
         }),
       });
-
-      if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        const err = new Error(`Supermemory recall returned ${res.status}: ${text}`);
-        (err as any).status = res.status;
-        (err as any).headers = res.headers;
-        throw err;
+      if (!response.ok) {
+        throw providerError('Supermemory search', response.status, response.headers);
       }
-
-      const data = (await res.json()) as any;
-      const memories = Array.isArray(data)
-        ? data
-        : data.results || data.memories || data.data || [];
-
-      const results: MemoryItem[] = memories.map((m: any) => ({
-        id: m.id || m.memoryId || m.uuid || '',
-        content: m.content || m.text || m.body || '',
-        metadata: m.metadata,
-        score: m.score ?? m.similarity,
-        created_at: m.createdAt || m.created_at,
-      }));
-
-      return { results };
+      const data = (await response.json()) as Record<string, unknown>;
+      const hits = Array.isArray(data.results) ? data.results : [];
+      return {
+        results: hits.flatMap((hit): MemoryItem[] => {
+          if (!hit || typeof hit !== 'object') return [];
+          const value = hit as Record<string, unknown>;
+          const content = value.memory ?? value.content ?? value.chunk;
+          if (typeof content !== 'string') return [];
+          return [{
+            id: typeof value.id === 'string' ? value.id : '',
+            content,
+            ...(value.metadata && typeof value.metadata === 'object'
+              ? { metadata: value.metadata as Record<string, unknown> }
+              : {}),
+            ...(typeof value.similarity === 'number'
+              ? { score: value.similarity }
+              : typeof value.score === 'number'
+                ? { score: value.score }
+                : {}),
+            ...(typeof value.createdAt === 'string'
+              ? { created_at: value.createdAt }
+              : typeof value.created_at === 'string'
+                ? { created_at: value.created_at }
+                : {}),
+          }];
+        }),
+      };
     });
   }
+}
+
+function providerError(operation: string, status: number, headers: Headers): Error {
+  const error = new Error(`${operation} returned ${status}.`);
+  (error as any).status = status;
+  (error as any).headers = headers;
+  return error;
 }

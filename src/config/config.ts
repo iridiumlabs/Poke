@@ -28,10 +28,14 @@ export function getDefaultConfig(): PokeConfig {
 export class ConfigManager {
   private paths: PokePaths;
   private configCache: PokeConfig | null = null;
+  private readonly initialize: boolean;
 
-  constructor(customHome?: string) {
+  constructor(customHome?: string, options: { initialize?: boolean } = {}) {
     this.paths = resolvePokePaths(customHome);
-    ensurePokeDirectories(this.paths);
+    this.initialize = options.initialize !== false;
+    if (this.initialize) {
+      ensurePokeDirectories(this.paths);
+    }
   }
 
   getPaths(): PokePaths {
@@ -45,7 +49,9 @@ export class ConfigManager {
 
     if (!fs.existsSync(this.paths.configFile)) {
       const defaultConfig = getDefaultConfig();
-      this.saveConfig(defaultConfig);
+      if (this.initialize) {
+        this.saveConfig(defaultConfig);
+      }
       this.configCache = defaultConfig;
       return defaultConfig;
     }
@@ -105,6 +111,16 @@ export class ConfigManager {
     this.saveConfig(config);
   }
 
+  getWhatsAppAccount(): string | undefined {
+    return this.loadConfig().whatsappAccount;
+  }
+
+  setWhatsAppAccount(phoneNumber: string | undefined): void {
+    const config = this.loadConfig();
+    config.whatsappAccount = phoneNumber;
+    this.saveConfig(config);
+  }
+
   getCredentials(): ServiceCredentials {
     const config = this.loadConfig();
     return config.credentials;
@@ -116,6 +132,16 @@ export class ConfigManager {
       ...config.credentials,
       ...credentials,
     };
+    this.saveConfig(config);
+  }
+
+  clearProviderCredentials(): void {
+    const config = this.loadConfig();
+    const { fireworksApiKey, commandCodeApiKey, codexAuth, ...retained } = config.credentials;
+    void fireworksApiKey;
+    void commandCodeApiKey;
+    void codexAuth;
+    config.credentials = retained;
     this.saveConfig(config);
   }
 

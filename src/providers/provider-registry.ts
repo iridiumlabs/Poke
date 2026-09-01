@@ -1,157 +1,131 @@
-import {
-  ModelInfo,
-  ModelSelection,
-  ProviderType,
-  ServiceCredentials,
-} from '../config/types.js';
+import { setProvider } from '@flue/runtime';
+import type { CredentialStore, Models } from '@earendil-works/pi-ai';
+import { fireworksProvider } from '@earendil-works/pi-ai/providers/fireworks';
+import { openaiCodexProvider } from '@earendil-works/pi-ai/providers/openai-codex';
+import type { ModelInfo, ModelSelection, ProviderType } from '../config/types.js';
 import { CommandCodeCatalog } from './commandcode.js';
 import { FireworksCatalog } from './fireworks.js';
-import { CodexCatalog } from './codex.js';
-import { setProvider } from '@flue/runtime';
-import { createProvider } from '@earendil-works/pi-ai';
-import { openAICompletionsApi } from '@earendil-works/pi-ai/api/openai-completions.lazy';
-import { openaiCodexProvider } from '@earendil-works/pi-ai/providers/openai-codex';
-import { fireworksProvider } from '@earendil-works/pi-ai/providers/fireworks';
+import { redactSecrets } from '../logger/logger.js';
+import {
+  CODEX_PROVIDER_ID,
+  COMMAND_CODE_PROVIDER_ID,
+  FIREWORKS_PROVIDER_ID,
+  createCommandCodeCredentialProvider,
+  createPokeModels,
+  getAuthenticatedModels,
+  withPokeCredentialResolver,
+} from './models.js';
 
 export function resolveFlueModelSpecifier(selection?: ModelSelection): string {
-  if (!selection || !selection.model) {
-    return 'openai-codex/gpt-4o';
+  if (!selection?.model) {
+    throw new Error('No model is configured. Run `poke model` and `poke model worker`.');
   }
-  const provider = selection.provider || 'codex';
-  const providerPrefix = provider === 'codex' ? 'openai-codex' : provider;
 
-  if (
-    selection.model.startsWith('openai-codex/') ||
-    selection.model.startsWith('commandcode/') ||
-    selection.model.startsWith('fireworks/') ||
-    selection.model.startsWith('codex/')
-  ) {
+  const providerPrefix = selection.provider === 'codex' ? CODEX_PROVIDER_ID : selection.provider;
+  if (selection.model.startsWith(`${providerPrefix}/`)) {
     return selection.model;
   }
-
-  return `${providerPrefix}/${selection.model}`;
+  return `${providerPrefix}/${normalizeCatalogModelId(selection.model, selection.provider)}`;
 }
 
 export function normalizeCatalogModelId(model: string, provider?: ProviderType): string {
   const prefixes =
     provider === 'codex'
-      ? ['openai-codex/', 'codex/']
+      ? [`${CODEX_PROVIDER_ID}/`, 'codex/']
       : provider === 'commandcode'
-        ? ['commandcode/']
+        ? [`${COMMAND_CODE_PROVIDER_ID}/`]
         : provider === 'fireworks'
-          ? ['fireworks/']
-          : ['openai-codex/', 'codex/', 'commandcode/', 'fireworks/'];
+          ? [`${FIREWORKS_PROVIDER_ID}/`]
+          : [`${CODEX_PROVIDER_ID}/`, 'codex/', `${COMMAND_CODE_PROVIDER_ID}/`, `${FIREWORKS_PROVIDER_ID}/`];
 
   for (const prefix of prefixes) {
-    if (model.startsWith(prefix)) {
-      return model.slice(prefix.length);
-    }
+    if (model.startsWith(prefix)) return model.slice(prefix.length);
   }
   return model;
 }
 
-export function createCommandCodeProvider() {
-  const DYNAMIC_MODEL_TEMPLATE = Symbol.for('flue.dynamicModelTemplate');
-  const provider = createProvider({
-    id: 'commandcode',
-    name: 'Command Code',
-    baseUrl: 'https://api.commandcode.ai/provider/v1',
-    auth: {
-      apiKey: {
-        name: 'Command Code API key',
-        resolve: async ({ ctx, credential }: any) => {
-          const key = (await ctx?.env?.('COMMANDCODE_API_KEY')) || process.env.COMMANDCODE_API_KEY || credential?.key;
-          if (!key) return undefined;
-          return {
-            auth: { apiKey: key },
-            source: 'COMMANDCODE_API_KEY',
-          };
-        },
-      },
-    },
-    models: [],
-    api: openAICompletionsApi(),
-  });
-  (provider as any)[DYNAMIC_MODEL_TEMPLATE] = {
-    api: 'openai-completions',
-    baseUrl: 'https://api.commandcode.ai/provider/v1',
-  };
-  return provider;
+/** Registers Flue adapters whose request-time auth resolves from Poke's store. */
+export function registerAllProviders(models: Models): void {
+  setProvider(withPokeCredentialResolver(createCommandCodeCredentialProvider(), models));
+  setProvider(withPokeCredentialResolver(fireworksProvider(), models));
+  setProvider(withPokeCredentialResolver(openaiCodexProvider(), models));
 }
 
-export function registerAllProviders(): void {
-  try {
-    setProvider(createCommandCodeProvider());
-  } catch {}
-  try {
-    setProvider(fireworksProvider());
-  } catch {}
-  try {
-    const codex = openaiCodexProvider();
-    setProvider(codex);
-    const codexAlias = { ...codex, id: 'codex' };
-    setProvider(codexAlias as any);
-  } catch {}
+import { isTransientError } from './retry.js';
+
+export interface ModelValidationResult {
+  valid: boolean;
+  error?: string;
+  transient?: boolean;
+  modelInfo?: ModelInfo;
 }
 
-export class ProviderRegistry {
-  static async fetchModels(
-    provider: ProviderType,
-    credentials: ServiceCredentials
-  ): Promise<ModelInfo[]> {
+export interface ProviderCatalog {
+  fetchModels(provider: ProviderType): Promise<ModelInfo[]>;
+  validateSelection(selection: ModelSelection): Promise<ModelValidationResult>;
+}
+
+export class ProviderRegistry implements ProviderCatalog {
+  readonly models: Models;
+
+  constructor(private readonly credentials: CredentialStore, models?: Models) {
+    this.models = models || createPokeModels(credentials);
+  }
+
+  async fetchModels(provider: ProviderType): Promise<ModelInfo[]> {
     switch (provider) {
       case 'commandcode': {
-        const apiKey = credentials.commandCodeApiKey || process.env.COMMANDCODE_API_KEY;
+        const auth = await this.models.getAuth(COMMAND_CODE_PROVIDER_ID);
+        const apiKey = auth?.auth.apiKey;
         if (!apiKey) {
-          throw new Error('Command Code API key is missing. Run `poke login` to authenticate.');
+          throw new Error('Command Code is not authenticated. Run `poke login`.');
         }
         return await CommandCodeCatalog.fetchLiveModels(apiKey);
       }
       case 'fireworks': {
-        const apiKey = credentials.fireworksApiKey || process.env.FIREWORKS_API_KEY;
+        const auth = await this.models.getAuth(FIREWORKS_PROVIDER_ID);
+        const apiKey = auth?.auth.apiKey;
         if (!apiKey) {
-          throw new Error('Fireworks API key is missing. Run `poke login` to authenticate.');
+          throw new Error('Fireworks is not authenticated. Run `poke login`.');
         }
         return await FireworksCatalog.fetchLiveModels(apiKey);
       }
-      case 'codex': {
-        return await CodexCatalog.fetchLiveModels(
-          credentials.codexAuth?.accessToken || process.env.OPENAI_CODEX_ACCESS_TOKEN || process.env.OPENAI_API_KEY
-        );
-      }
+      case 'codex':
+        return await getAuthenticatedModels(this.models, CODEX_PROVIDER_ID);
       default:
-        throw new Error(`Unsupported provider: ${provider}`);
+        throw new Error(`Unsupported model provider: ${String(provider)}`);
     }
   }
 
-  static async validateSelection(
-    selection: ModelSelection,
-    credentials: ServiceCredentials
-  ): Promise<{ valid: boolean; error?: string; modelInfo?: ModelInfo }> {
+  async validateSelection(selection: ModelSelection): Promise<ModelValidationResult> {
     try {
-      const models = await this.fetchModels(selection.provider, credentials);
+      const models = await this.fetchModels(selection.provider);
       const modelId = normalizeCatalogModelId(selection.model, selection.provider);
-      const found = models.find((m) => m.id === modelId);
-
+      const found = models.find((model) => model.id === modelId);
       if (!found) {
         return {
           valid: false,
-          error: `Model "${selection.model}" not found in ${selection.provider} live catalog.`,
+          error: `Model "${selection.model}" is not available from ${selection.provider}. Run \`poke model\` to choose another one.`,
         };
       }
-
-      if (selection.reasoningEffort) {
-        if (!found.capabilities.reasoningEfforts.includes(selection.reasoningEffort)) {
-          return {
-            valid: false,
-            error: `Reasoning effort "${selection.reasoningEffort}" is not supported for ${selection.model}. Valid options: ${found.capabilities.reasoningEfforts.join(', ') || 'none (default only)'}`,
-          };
-        }
+      if (
+        selection.reasoningEffort &&
+        !found.capabilities.reasoningEfforts.includes(selection.reasoningEffort)
+      ) {
+        return {
+          valid: false,
+          error: `Reasoning effort "${selection.reasoningEffort}" is not supported for ${selection.model}.`,
+        };
       }
-
       return { valid: true, modelInfo: found };
-    } catch (err: any) {
-      return { valid: false, error: err.message };
+    } catch (error: unknown) {
+      return {
+        valid: false,
+        transient: isTransientError(error),
+        error: error instanceof Error
+          ? redactSecrets(error.message)
+          : 'Unable to validate the selected model.',
+      };
     }
   }
 }

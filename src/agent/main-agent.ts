@@ -9,6 +9,7 @@ import {
 import { local } from '@flue/runtime/node';
 import { MAIN_AGENT_SYSTEM_PROMPT } from './prompts.js';
 import { createPokeTools, ToolContexts } from './tools.js';
+import { createPokeSandboxEnvironment } from './sandbox-env.js';
 import { resolveFlueModelSpecifier } from '../providers/provider-registry.js';
 import { CompactionManager, RECENT_TOKENS_RETENTION } from '../context/compaction-manager.js';
 
@@ -42,8 +43,8 @@ export function PokeMainAgent() {
     },
   });
 
-  // 2. Attach local host sandbox with Flue's shell-essential environment allowlist.
-  useSandbox(local());
+  // 2. Attach the trusted host sandbox with the daemon's full environment.
+  useSandbox(local({ env: createPokeSandboxEnvironment() }));
 
   // 3. Mount tools
   const tools = createPokeTools(sharedContexts);

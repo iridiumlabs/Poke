@@ -159,8 +159,7 @@ export class CommandCodeCatalog {
       });
 
       if (!res.ok) {
-        const errBody = await res.text().catch(() => '');
-        const error = new Error(`Command Code returned ${res.status}: ${errBody}`);
+        const error = new Error(`Command Code returned ${res.status}.`);
         (error as any).status = res.status;
         (error as any).headers = res.headers;
         throw error;

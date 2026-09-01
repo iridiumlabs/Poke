@@ -14,6 +14,7 @@ import { getLogger } from '../logger/logger.js';
 import { resolvePokePaths, ensurePokeDirectories } from '../config/paths.js';
 import { resolvePokeInstallationPaths } from '../config/installation.js';
 import { claimDaemonPidFile, removeOwnedDaemonPidFile } from './pid-file.js';
+import { assertSupportedNodeVersion } from '../config/node-version.js';
 
 export class PokeDaemon {
   private configManager: ConfigManager;
@@ -31,6 +32,7 @@ export class PokeDaemon {
   private isRunning = false;
   private ownsPidFile = false;
   private signalHandlers: Array<[NodeJS.Signals, () => void]> = [];
+  private heartbeatInterval: NodeJS.Timeout | null = null;
 
   constructor(customHome?: string) {
     const paths = resolvePokePaths(customHome);
@@ -63,7 +65,7 @@ export class PokeDaemon {
       this.db,
       async (inbound) => {
         // Dispatch incoming WhatsApp message to main agent
-        await this.runtime.dispatchUserMessage(inbound.text, inbound.attachments);
+        await this.runtime.dispatchUserMessage(inbound.text, inbound.attachments, inbound.messageId);
       },
       async () => {
         // Exact /stop handler
@@ -118,6 +120,8 @@ export class PokeDaemon {
   async start(): Promise<void> {
     if (this.isRunning) return;
 
+    assertSupportedNodeVersion();
+
     const logger = getLogger();
     logger.info({ pid: process.pid }, 'Starting Poke daemon');
 
@@ -131,8 +135,11 @@ export class PokeDaemon {
     this.isRunning = true;
 
     try {
+      this.compactionManager.setMainAgentBusy(false);
       await this.runtime.start();
       await this.gateway.start();
+      this.gateway.heartbeat();
+      this.heartbeatInterval = setInterval(() => this.gateway.heartbeat(), 30_000);
 
       const onSignal = (signal: NodeJS.Signals) => {
         logger.info({ signal }, 'Received shutdown signal');
@@ -157,6 +164,11 @@ export class PokeDaemon {
   async stop(): Promise<void> {
     if (!this.isRunning && !this.db.isOpen()) return;
     this.isRunning = false;
+
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
 
     const logger = getLogger();
     logger.info('Stopping Poke daemon gracefully');

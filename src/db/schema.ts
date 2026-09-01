@@ -70,4 +70,21 @@ export const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    name: '002_outgoing_deliveries',
+    up: `
+      CREATE TABLE IF NOT EXISTS outgoing_deliveries (
+        key TEXT PRIMARY KEY,
+        action_type TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('pending', 'sent')),
+        response_data TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_outgoing_deliveries_status_updated
+        ON outgoing_deliveries(status, updated_at);
+    `,
+  },
 ];

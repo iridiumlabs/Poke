@@ -139,9 +139,18 @@ export const SENSITIVE_KEYS = [
 export function redactSecrets(obj: any): any {
   if (obj === null || obj === undefined) return obj;
   if (typeof obj === 'string') {
-    // Redact Bearer tokens and potential API keys in strings
-    let cleaned = obj.replace(/Bearer\s+[A-Za-z0-9_\-\.]+/gi, 'Bearer [REDACTED]');
+    // Errors often carry a provider's response text. Remove common
+    // authorization forms before the value reaches logs, status, or WhatsApp.
+    let cleaned = obj.replace(/\b(Bearer|Token)\s+[A-Za-z0-9._~+/=-]+/gi, '$1 [REDACTED]');
     cleaned = cleaned.replace(/(?:sk-|dg-|fw-|cm_)[A-Za-z0-9_\-]{16,}/gi, '[REDACTED_KEY]');
+    cleaned = cleaned.replace(
+      /([?&](?:api[_-]?key|access[_-]?token|refresh[_-]?token|token)=)[^&#\s]+/gi,
+      '$1[REDACTED]'
+    );
+    cleaned = cleaned.replace(
+      /\b(api[_-]?key|access[_-]?token|refresh[_-]?token|token)\s*([=:])\s*["']?[^,\s"']+/gi,
+      '$1$2[REDACTED]'
+    );
     return cleaned;
   }
   if (Array.isArray(obj)) {
@@ -159,6 +168,11 @@ export function redactSecrets(obj: any): any {
     return result;
   }
   return obj;
+}
+
+function redactLogError(value: unknown): unknown {
+  const serialized = value instanceof Error ? pino.stdSerializers.err(value) : value;
+  return redactSecrets(serialized);
 }
 
 let rootLogger: pino.Logger | null = null;
@@ -190,8 +204,8 @@ export function getLogger(customHome?: string): pino.Logger {
         censor: '[REDACTED]',
       },
       serializers: {
-        err: pino.stdSerializers.err,
-        error: pino.stdSerializers.err,
+        err: redactLogError,
+        error: redactLogError,
       },
       timestamp: pino.stdTimeFunctions.isoTime,
     },

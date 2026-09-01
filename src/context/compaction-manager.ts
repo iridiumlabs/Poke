@@ -63,6 +63,7 @@ export class CompactionManager {
 
   setMainAgentBusy(busy: boolean): void {
     this.isMainAgentBusy = busy;
+    this.db.setState('main_agent_busy', busy ? 'true' : 'false');
     if (busy) {
       this.recordActivity();
     }

@@ -24,8 +24,7 @@ export class FireworksCatalog {
       });
 
       if (!res.ok) {
-        const errBody = await res.text().catch(() => '');
-        const error = new Error(`Fireworks returned ${res.status}: ${errBody}`);
+        const error = new Error(`Fireworks returned ${res.status}.`);
         (error as any).status = res.status;
         (error as any).headers = res.headers;
         throw error;

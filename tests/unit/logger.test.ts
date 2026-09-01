@@ -74,4 +74,15 @@ describe('Logger and BoundedLogStream', () => {
     expect(redacted.nested.token).toBe('[REDACTED]');
     expect(redacted.nested.safe).toBe('public-value');
   });
+
+  it('redacts credentials embedded in logged error strings', () => {
+    const logger = getLogger(tempDir);
+    const secret = 'super-secret-token-value';
+
+    logger.error({ err: `Authorization: Bearer ${secret}` }, 'Provider request failed');
+
+    const content = fs.readFileSync(path.join(tempDir, 'logs', 'poke.log'), 'utf8');
+    expect(content).not.toContain(secret);
+    expect(content).toContain('Bearer [REDACTED]');
+  });
 });

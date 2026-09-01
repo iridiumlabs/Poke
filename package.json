@@ -9,10 +9,12 @@
     "poke": "./dist/bin/poke.js"
   },
   "scripts": {
+    "preinstall": "node scripts/check-node-version.mjs",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "check:install-scripts": "node scripts/check-install-scripts.mjs",
     "poke": "tsx bin/poke.ts",
     "start": "node dist/bin/poke.js start"
   },
@@ -25,24 +27,38 @@
   ],
   "author": "",
   "license": "ISC",
+  "engines": {
+    "node": ">=24.20.0 <25"
+  },
+  "packageManager": "npm@11.19.0",
   "dependencies": {
+    "@composio/core": "0.18.0",
     "@earendil-works/pi-ai": "0.83.0",
     "@flue/runtime": "^2.0.3",
+    "@inquirer/prompts": "8.7.0",
     "@whiskeysockets/baileys": "^7.0.0-rc14",
     "better-sqlite3": "^13.0.3",
     "command-code": "^1.38.2",
     "commander": "^15.0.0",
-    "composio-core": "^0.5.39",
     "cron-parser": "^5.10.0",
     "exa-js": "^2.19.0",
     "pino": "^10.3.1",
+    "qrcode-terminal": "0.12.0",
     "valibot": "^1.4.2"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
     "@types/node": "^26.4.0",
+    "@types/qrcode-terminal": "0.12.2",
     "tsx": "^4.23.13",
     "typescript": "^7.0.2",
     "vitest": "^4.1.11"
+  },
+  "allowScripts": {
+    "@whiskeysockets/baileys@7.0.0-rc14": true,
+    "better-sqlite3@13.0.3": true,
+    "esbuild@0.28.2": true,
+    "@google/genai": false,
+    "protobufjs": false
   }
 }

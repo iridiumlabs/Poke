@@ -51,7 +51,10 @@ export class ExaToolHandler {
     }
 
     const logger = getLogger();
-    logger.info({ query: params.query }, 'Executing web search via Exa');
+    logger.info(
+      { queryLength: params.query.length, requestedResults: Math.min(params.num_results || 5, 10) },
+      'Executing web search via Exa'
+    );
 
     return await withProviderRetry(async () => {
       const res = await this.client!.searchAndContents(params.query, {
@@ -82,7 +85,7 @@ export class ExaToolHandler {
     }
 
     const logger = getLogger();
-    logger.info({ url: params.url }, 'Fetching webpage content via Exa');
+    logger.info({ requestedCharacters: Math.min(params.max_characters || 15000, 30000) }, 'Fetching webpage content via Exa');
 
     const maxChars = Math.min(params.max_characters || 15000, 30000);
 

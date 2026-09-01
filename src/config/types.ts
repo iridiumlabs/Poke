@@ -19,8 +19,11 @@ export interface ServiceCredentials {
   supermemoryApiKey?: string;
   exaApiKey?: string;
   deepgramApiKey?: string;
+  /** @deprecated Read only to migrate existing installations into credentials.json. */
   fireworksApiKey?: string;
+  /** @deprecated Read only to migrate existing installations into credentials.json. */
   commandCodeApiKey?: string;
+  /** @deprecated Legacy token state cannot be refreshed and is discarded during migration. */
   codexAuth?: {
     accessToken?: string;
     refreshToken?: string;
@@ -31,6 +34,7 @@ export interface ServiceCredentials {
 
 export interface PokeConfig {
   ownerPhoneNumber?: string;
+  whatsappAccount?: string;
   timezone: 'Asia/Karachi';
   credentials: ServiceCredentials;
   mainModel?: ModelSelection;

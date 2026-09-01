@@ -14,6 +14,7 @@ import { DeepgramHandler } from './deepgram.js';
 import { WhatsAppSender } from './sender.js';
 import { getLogger } from '../logger/logger.js';
 import { resolvePokePaths, ensurePokeDirectories } from '../config/paths.js';
+import { writeGatewayRuntimeStatus } from './runtime-status.js';
 
 export interface InboundMediaAttachment {
   path: string;
@@ -63,8 +64,17 @@ export function formatInboundMessageText(
   return lines.join('\n');
 }
 
+export function formatVoiceTranscript(transcript: string): string {
+  return `[voice] ${transcript.trim()}`;
+}
+
 export type MessageDispatchFn = (msg: NormalizedInboundMessage) => Promise<void>;
 export type StopHandlerFn = () => Promise<void>;
+
+export interface WhatsAppGatewayDependencies {
+  downloadMedia?: (message: WAMessage) => Promise<Buffer>;
+  deepgram?: DeepgramHandler;
+}
 
 export class WhatsAppGateway {
   private sock: any = null;
@@ -76,16 +86,31 @@ export class WhatsAppGateway {
   private deepgram: DeepgramHandler;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private isStopped = false;
+  private lastConnectedAt: number | undefined;
+  private pairedAccount: string | undefined;
+  private readonly downloadMedia: (message: WAMessage) => Promise<Buffer>;
 
   constructor(
     private configManager: ConfigManager,
     private db: PokeDatabase,
     private onDispatch: MessageDispatchFn,
     private onStop: StopHandlerFn,
-    private customHome?: string
+    private customHome?: string,
+    dependencies: WhatsAppGatewayDependencies = {}
   ) {
+    this.downloadMedia = dependencies.downloadMedia || (async (message) =>
+      (await downloadMediaMessage(
+        message,
+        'buffer',
+        {},
+        {
+          logger: getLogger().child({ module: 'baileys-media' }) as any,
+          reuploadRequest: (msg: WAMessage) => this.sock?.updateMediaMessage(msg),
+        }
+      )) as Buffer
+    );
     const creds = this.configManager.getCredentials();
-    this.deepgram = new DeepgramHandler(creds.deepgramApiKey, customHome);
+    this.deepgram = dependencies.deepgram || new DeepgramHandler(creds.deepgramApiKey, customHome);
     const ownerPhone = this.configManager.getOwnerPhoneNumber() || '';
     const ownerJid = ownerPhone ? `${ownerPhone}@s.whatsapp.net` : '';
     this.sender = new WhatsAppSender(
@@ -108,6 +133,10 @@ export class WhatsAppGateway {
     return this.qrCode;
   }
 
+  heartbeat(): void {
+    this.writeRuntimeStatus();
+  }
+
   async start(): Promise<void> {
     if (this.sock || this.isConnecting) return;
     this.isStopped = false;
@@ -117,6 +146,7 @@ export class WhatsAppGateway {
     }
     this.isConnecting = true;
     this.connectionState = 'connecting';
+    this.writeRuntimeStatus();
 
     const logger = getLogger();
     logger.info('Initializing WhatsApp Baileys gateway');
@@ -131,6 +161,7 @@ export class WhatsAppGateway {
       if (this.isStopped) {
         this.isConnecting = false;
         this.connectionState = 'disconnected';
+        this.writeRuntimeStatus('Daemon stopped before gateway initialization completed.');
         return;
       }
 
@@ -154,6 +185,7 @@ export class WhatsAppGateway {
           this.sock = null;
           this.isConnecting = false;
           const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
+          this.writeRuntimeStatus(statusCode ? `Connection closed (${statusCode}).` : 'Connection closed.');
           const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
           logger.warn({ statusCode, shouldReconnect }, 'WhatsApp connection closed');
           if (shouldReconnect && !this.isStopped) {
@@ -163,6 +195,12 @@ export class WhatsAppGateway {
           this.connectionState = 'connected';
           this.qrCode = null;
           this.isConnecting = false;
+          this.lastConnectedAt = Date.now();
+          const rawAccount = this.sock?.user?.id || '';
+          this.pairedAccount = rawAccount
+            ? normalizePhoneNumber(rawAccount.replace(/@.*$/, '').split(':')[0])
+            : undefined;
+          this.writeRuntimeStatus();
           logger.info('WhatsApp connected successfully');
 
           const ownerPhone = this.configManager.getOwnerPhoneNumber();
@@ -189,6 +227,7 @@ export class WhatsAppGateway {
     } catch (err: any) {
       this.isConnecting = false;
       this.connectionState = 'disconnected';
+      this.writeRuntimeStatus('Gateway initialization failed.');
       logger.error({ err: err?.message || String(err) }, 'Failed to initialize WhatsApp gateway');
       throw err;
     }
@@ -197,6 +236,7 @@ export class WhatsAppGateway {
   async handleIncomingMessage(msg: proto.IWebMessageInfo): Promise<void> {
     const logger = getLogger();
     const remoteJid = msg.key?.remoteJid || '';
+    const messageId = msg.key?.id || `msg-${Date.now()}`;
 
     // Ignore status broadcasts and groups
     if (remoteJid === 'status@broadcast' || remoteJid.endsWith('@g.us')) {
@@ -218,15 +258,11 @@ export class WhatsAppGateway {
     });
 
     if (!ownerNumber || !matchedJid) {
-      logger.warn(
-        { rawCandidates, ownerNumber, remoteJid },
-        'Ignoring message from non-owner'
-      );
+      logger.warn({ messageId }, 'Ignoring message from non-owner');
       return;
     }
 
     const senderNumber = normalizePhoneNumber(matchedJid.replace(/@.*$/, ''));
-    const messageId = msg.key?.id || `msg-${Date.now()}`;
     const idempotencyKey = `inbound_msg:${messageId}`;
 
     if (this.inFlightInbound.has(idempotencyKey) || (this.db.isOpen() && this.db.checkIdempotency(idempotencyKey))) {
@@ -236,7 +272,7 @@ export class WhatsAppGateway {
 
     this.inFlightInbound.add(idempotencyKey);
 
-    logger.info({ messageId, remoteJid }, 'Received WhatsApp message from owner');
+    logger.info({ messageId }, 'Received WhatsApp message from owner');
 
     // Extract text and attachments
     const msgContent = msg.message!;
@@ -305,7 +341,7 @@ export class WhatsAppGateway {
           const isPtt = Boolean(msgContent.audioMessage.ptt);
           const ext = isPtt ? 'ogg' : 'mp3';
           const filePath = path.join(msgInboxDir, `audio.${ext}`);
-          const buffer = await downloadMediaMessage(msg as WAMessage, 'buffer', {});
+          const buffer = await this.downloadMedia(msg as WAMessage);
           fs.writeFileSync(filePath, buffer as Buffer);
 
           const mime = msgContent.audioMessage.mimetype || 'audio/ogg';
@@ -326,16 +362,33 @@ export class WhatsAppGateway {
             try {
               const transcript = await this.deepgram.transcribe(buffer as Buffer, mime);
               if (transcript) {
-                text = transcript;
+                text = formatVoiceTranscript(transcript);
                 isVoice = true;
-                logger.info({ transcriptPreview: transcript.slice(0, 80) }, 'Voice note transcribed');
+                logger.info({ messageId, transcriptLength: transcript.length }, 'Voice note transcribed');
+              } else {
+                logger.warn({ messageId }, 'Voice note transcription was empty');
+                await this.reportInboundMediaFailure(
+                  messageId,
+                  'Poke could not transcribe the voice message. Please send it again.'
+                );
+                if (!text.trim()) return;
               }
             } catch (sttErr: any) {
               logger.error({ err: sttErr.message }, 'Voice note transcription failed');
+              await this.reportInboundMediaFailure(
+                messageId,
+                'Poke could not transcribe the voice message. Please send it again.'
+              );
+              if (!text.trim()) return;
             }
           }
         } catch (err: any) {
           logger.error({ err: err.message }, 'Failed to download or process audio message');
+          await this.reportInboundMediaFailure(
+            messageId,
+            'Poke could not download the audio message. Please send it again.'
+          );
+          if (!text.trim()) return;
         }
       }
 
@@ -346,7 +399,7 @@ export class WhatsAppGateway {
             fs.mkdirSync(msgInboxDir, { recursive: true, mode: 0o700 });
           }
           const filePath = path.join(msgInboxDir, 'image.jpg');
-          const buffer = await downloadMediaMessage(msg as WAMessage, 'buffer', {});
+          const buffer = await this.downloadMedia(msg as WAMessage);
           fs.writeFileSync(filePath, buffer as Buffer);
 
           attachments.push({
@@ -360,6 +413,11 @@ export class WhatsAppGateway {
           });
         } catch (err: any) {
           logger.error({ err: err.message }, 'Failed to download image message');
+          await this.reportInboundMediaFailure(
+            messageId,
+            'Poke could not download the image. Please send it again.'
+          );
+          if (!text.trim()) return;
         }
       }
 
@@ -377,7 +435,7 @@ export class WhatsAppGateway {
             throw new Error(`Invalid document path: ${filePath}`);
           }
 
-          const buffer = await downloadMediaMessage(msg as WAMessage, 'buffer', {});
+          const buffer = await this.downloadMedia(msg as WAMessage);
           fs.writeFileSync(filePath, buffer as Buffer);
 
           attachments.push({
@@ -390,6 +448,11 @@ export class WhatsAppGateway {
           });
         } catch (err: any) {
           logger.error({ err: err.message }, 'Failed to download document message');
+          await this.reportInboundMediaFailure(
+            messageId,
+            'Poke could not download the document. Please send it again.'
+          );
+          if (!text.trim()) return;
         }
       }
 
@@ -400,7 +463,7 @@ export class WhatsAppGateway {
             fs.mkdirSync(msgInboxDir, { recursive: true, mode: 0o700 });
           }
           const filePath = path.join(msgInboxDir, 'video.mp4');
-          const buffer = await downloadMediaMessage(msg as WAMessage, 'buffer', {});
+          const buffer = await this.downloadMedia(msg as WAMessage);
           fs.writeFileSync(filePath, buffer as Buffer);
 
           attachments.push({
@@ -413,6 +476,11 @@ export class WhatsAppGateway {
           });
         } catch (err: any) {
           logger.error({ err: err.message }, 'Failed to download video message');
+          await this.reportInboundMediaFailure(
+            messageId,
+            'Poke could not download the video. Please send it again.'
+          );
+          if (!text.trim()) return;
         }
       }
 
@@ -462,6 +530,17 @@ export class WhatsAppGateway {
     }, 3000);
   }
 
+  private async reportInboundMediaFailure(messageId: string, notice: string): Promise<void> {
+    try {
+      await this.sender.sendDirectError(notice);
+    } catch (error: unknown) {
+      getLogger().error(
+        { messageId, err: error instanceof Error ? error.message : String(error) },
+        'Failed to report inbound media failure'
+      );
+    }
+  }
+
   async stop(): Promise<void> {
     this.isStopped = true;
     if (this.reconnectTimer) {
@@ -478,5 +557,22 @@ export class WhatsAppGateway {
     }
     this.isConnecting = false;
     this.connectionState = 'disconnected';
+    this.writeRuntimeStatus('Daemon stopped.');
+  }
+
+  private writeRuntimeStatus(reason?: string): void {
+    try {
+      const paths = resolvePokePaths(this.customHome);
+      writeGatewayRuntimeStatus(paths.runtimeStatusFile, {
+        state: this.connectionState,
+        updatedAt: Date.now(),
+        daemonPid: process.pid,
+        ...(this.pairedAccount ? { pairedAccount: this.pairedAccount } : {}),
+        ...(this.lastConnectedAt ? { lastConnectedAt: this.lastConnectedAt } : {}),
+        ...(reason ? { reason } : {}),
+      });
+    } catch (error: any) {
+      getLogger().warn({ err: error?.message || String(error) }, 'Failed to update WhatsApp runtime status');
+    }
   }
 }
