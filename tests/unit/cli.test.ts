@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { spawnSync, execSync } from 'child_process';
 import { runDoctor } from '../../src/cli/doctor.js';
 import { redactSecrets } from '../../src/logger/logger.js';
 import { ConfigManager } from '../../src/config/config.js';
@@ -434,5 +435,30 @@ describe('CLI & Diagnostics', () => {
     });
 
     expect(ui.notes.some((note) => note.length > 0 && note.includes('\u2588'))).toBe(true);
+  });
+
+  it('ensures compiled CLI has executable permissions and runs directly as a standalone binary', () => {
+    const projectRoot = path.resolve(__dirname, '../..');
+    const binPath = path.join(projectRoot, 'dist', 'bin', 'poke.js');
+
+    if (!fs.existsSync(binPath)) {
+      execSync('npm run build', { cwd: projectRoot, stdio: 'pipe' });
+    }
+
+    if (process.platform !== 'win32') {
+      const stat = fs.statSync(binPath);
+      const isExecutable = Boolean(stat.mode & fs.constants.S_IXUSR);
+      expect(isExecutable).toBe(true);
+    }
+
+    const pkg = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8'));
+    const result = spawnSync(binPath, ['--version'], {
+      encoding: 'utf8',
+      cwd: projectRoot,
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(result.stdout.trim()).toBe(pkg.version);
   });
 });
