@@ -312,7 +312,6 @@ Workers receive the tools they need to do real work:
 
 - Full filesystem and shell tools.
 - Exa `web_search` and `web_fetch`.
-- Supermemory recall, and memory writing only when the job explicitly needs it.
 - Composio search and execution meta-tools.
 - The same dynamically discovered skills as the main agent.
 - Conditionally loaded capabilities relevant to the job.
@@ -321,6 +320,7 @@ Workers must not receive:
 
 - `send`.
 - `jobs`.
+- `memory` or `recall`.
 - The main conversation transcript.
 - Authority to create more workers.
 
@@ -413,7 +413,7 @@ memory({
 
 The agent should retrieve memory when unseen personal history, preferences, prior decisions, people, projects, or commitments materially affect the answer. It should save stable facts and preferences that will matter later. Do not save every transient message or duplicate the entire transcript into Supermemory.
 
-Use one stable Supermemory user or container identity for the owner. Attach source and timestamp metadata where useful. Workers may recall relevant memory. They should write memory only when their self-contained job explicitly calls for it or the result is clearly durable.
+Use one stable Supermemory user or container identity for the owner. Attach source and timestamp metadata where useful. Memory tools belong to the main agent only; workers do not recall or write memory.
 
 ## 11. Composio
 

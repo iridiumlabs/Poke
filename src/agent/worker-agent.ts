@@ -50,12 +50,10 @@ export function PokeWorkerAgent() {
     })
   );
 
-  // 3. Mount worker tools (no send, no jobs)
+  // 3. Mount worker tools (no send, no jobs, no memory)
   const tools = createPokeTools(sharedWorkerContexts);
   useTool(tools.webSearchTool);
   useTool(tools.webFetchTool);
-  useTool(tools.recallTool);
-  useTool(tools.memoryTool);
   useTool(tools.composioSearchTool);
   useTool(tools.composioExecuteTool);
   for (const skill of sharedWorkerContexts.skills.getFlueSkills()) {
