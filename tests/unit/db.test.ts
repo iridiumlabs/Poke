@@ -174,13 +174,14 @@ describe('PokeDatabase', () => {
       next_run_at: conflictAt,
     });
     expect(db.claimDueAutomation('auto-admission-conflict', conflictAt, Date.now())).toBe(true);
-    db.updateAutomation('auto-admission-conflict', { last_outcome: 'edited concurrently' });
+    db.updateAutomation('auto-admission-conflict', { enabled: false });
     expect(
       db.finalizeAutomationDispatch('auto-admission-conflict', conflictAt, 'sub_ik_conflict', {
         next_run_at: null,
-        enabled: 0,
+        enabled: 1,
       })
     ).toBe(false);
+    expect(db.getAutomation('auto-admission-conflict')?.enabled).toBe(0);
     expect(db.getAutomationOccurrence('auto-admission-conflict', conflictAt)).toMatchObject({
       status: 'claimed',
       submission_id: null,

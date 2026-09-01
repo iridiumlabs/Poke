@@ -351,6 +351,7 @@ export class WhatsAppGateway {
       | undefined;
     const contextInfo = (msgContent as any).contextInfo || messageVariantWithContext?.contextInfo;
 
+    let replyPrefix = '';
     if (contextInfo?.quotedMessage) {
       const quoted = unwrapMessageContent(contextInfo.quotedMessage) || {};
       let quotedText =
@@ -371,7 +372,7 @@ export class WhatsAppGateway {
         ? contextInfo.stanzaId.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 256)
         : '';
       const quotedPreview = JSON.stringify(normalizeQuotedPreview(quotedText));
-      const replyPrefix = `[Replying to message ID${stanzaId ? `: ${stanzaId}` : ':'} ${quotedPreview}]\n\n`;
+      replyPrefix = `[Replying to message ID${stanzaId ? `: ${stanzaId}` : ':'} ${quotedPreview}]\n\n`;
       text = replyPrefix + text;
     }
 
@@ -413,7 +414,7 @@ export class WhatsAppGateway {
             try {
               const transcript = await this.deepgram.transcribe(buffer as Buffer, mime);
               if (transcript) {
-                text = formatVoiceTranscript(transcript);
+                text = replyPrefix + formatVoiceTranscript(transcript);
                 isVoice = true;
                 logger.info({ messageId, transcriptLength: transcript.length }, 'Voice note transcribed');
               } else {
@@ -422,7 +423,7 @@ export class WhatsAppGateway {
                   messageId,
                   'Poke could not transcribe the voice message. Please send it again.'
                 );
-                if (!text.trim()) return;
+                if (!text.trim() || text === replyPrefix) return;
               }
             } catch (sttErr: any) {
               logger.error({ err: sttErr.message }, 'Voice note transcription failed');
@@ -430,7 +431,7 @@ export class WhatsAppGateway {
                 messageId,
                 'Poke could not transcribe the voice message. Please send it again.'
               );
-              if (!text.trim()) return;
+              if (!text.trim() || text === replyPrefix) return;
             }
           }
         } catch (err: any) {
@@ -439,7 +440,7 @@ export class WhatsAppGateway {
             messageId,
             'Poke could not download the audio message. Please send it again.'
           );
-          if (!text.trim()) return;
+          if (!text.trim() || text === replyPrefix) return;
         }
       }
 

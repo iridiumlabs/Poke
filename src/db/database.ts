@@ -182,23 +182,6 @@ export class PokeDatabase {
     return null;
   }
 
-  /**
-   * Keyed Flue submissions have deterministic IDs, but the caller receives
-   * their receipt only after admission. This probe closes the crash window
-   * between Flue's durable admission and Poke attaching that receipt locally.
-   */
-  hasFlueSubmission(submissionId: string): boolean {
-    if (!this.isOpen()) return false;
-    try {
-      return Boolean(
-        this.db
-          .prepare('SELECT 1 FROM flue_agent_submissions WHERE submission_id = ? LIMIT 1')
-          .get(submissionId)
-      );
-    } catch {
-      return false;
-    }
-  }
 
   // --- Worker Jobs ---
   createWorkerJob(job: {
@@ -446,6 +429,10 @@ export class PokeDatabase {
       }
     }
 
+    if (!('last_outcome' in updates)) {
+      fields.push('last_outcome = NULL');
+    }
+
     fields.push('updated_at = ?');
     values.push(Date.now());
 
@@ -468,7 +455,7 @@ export class PokeDatabase {
          WHERE enabled = 1
            AND next_run_at IS NOT NULL
            AND next_run_at <= ?
-           AND (last_outcome IS NULL OR last_outcome != 'claimed')
+           AND (last_outcome IS NULL OR last_outcome NOT LIKE 'claimed%')
            AND (
              last_outcome IS NULL
              OR last_outcome NOT LIKE 'dispatch_error:%'
@@ -487,7 +474,7 @@ export class PokeDatabase {
         `SELECT * FROM automations
          WHERE enabled = 1
            AND next_run_at IS NOT NULL
-           AND (last_outcome IS NULL OR last_outcome != 'claimed')
+           AND (last_outcome IS NULL OR last_outcome NOT LIKE 'claimed%')
          ORDER BY next_run_at ASC
          LIMIT 1`
       )
@@ -495,8 +482,10 @@ export class PokeDatabase {
     return row || null;
   }
 
-  claimDueAutomation(id: string, scheduledAt: number, claimedAt: number): boolean {
+  claimDueAutomation(id: string, scheduledAt: number, claimedAt: number, claimToken?: string): boolean {
     if (!this.isOpen()) return false;
+    const token = claimToken || `${claimedAt}-${Math.random().toString(36).slice(2)}`;
+    const outcome = `claimed:${token}`;
     const claim = this.db.transaction(() => {
       const existing = this.db
         .prepare(
@@ -509,13 +498,13 @@ export class PokeDatabase {
       const result = this.db
         .prepare(
           `UPDATE automations
-           SET last_run_at = ?, last_outcome = 'claimed', updated_at = ?
+           SET last_run_at = ?, last_outcome = ?, updated_at = ?
            WHERE id = ?
              AND enabled = 1
              AND next_run_at = ?
-             AND (last_outcome IS NULL OR last_outcome != 'claimed')`
+             AND (last_outcome IS NULL OR last_outcome NOT LIKE 'claimed%')`
         )
-        .run(claimedAt, claimedAt, id, scheduledAt);
+        .run(claimedAt, outcome, claimedAt, id, scheduledAt);
       if (result.changes === 0) return false;
 
       this.db
@@ -537,11 +526,15 @@ export class PokeDatabase {
     id: string,
     scheduledAt: number,
     submissionId: string,
-    updates: { next_run_at: number | null; enabled: number }
+    updates: { next_run_at: number | null; enabled: number },
+    claimToken?: string
   ): boolean {
     if (!this.isOpen()) return false;
     const now = Date.now();
     const conflict = Symbol('automation-finalize-conflict');
+    const expectedOutcome = claimToken
+      ? (claimToken.startsWith('claimed:') ? claimToken : `claimed:${claimToken}`)
+      : null;
     const finalize = this.db.transaction(() => {
       const occurrence = this.db
         .prepare(
@@ -552,14 +545,21 @@ export class PokeDatabase {
         .run(submissionId, now, id, scheduledAt);
       if (occurrence.changes === 0) return false;
 
-      const automation = this.db
-        .prepare(
-          `UPDATE automations
+      const query = expectedOutcome
+        ? `UPDATE automations
            SET next_run_at = ?, enabled = ?, last_outcome = 'dispatched',
                last_submission_id = ?, updated_at = ?
-           WHERE id = ? AND last_outcome = 'claimed'`
-        )
-        .run(updates.next_run_at, updates.enabled, submissionId, now, id);
+           WHERE id = ? AND last_outcome = ?`
+        : `UPDATE automations
+           SET next_run_at = ?, enabled = ?, last_outcome = 'dispatched',
+               last_submission_id = ?, updated_at = ?
+           WHERE id = ? AND (last_outcome = 'claimed' OR last_outcome LIKE 'claimed:%')`;
+
+      const params = expectedOutcome
+        ? [updates.next_run_at, updates.enabled, submissionId, now, id, expectedOutcome]
+        : [updates.next_run_at, updates.enabled, submissionId, now, id];
+
+      const automation = this.db.prepare(query).run(...params);
       if (automation.changes === 0) throw conflict;
       return true;
     });

@@ -129,6 +129,51 @@ export function parseSkillFile(filePath: string): SkillMetadata | null {
   }
 }
 
+export const MAX_SKILL_FILE_SIZE = 512 * 1024; // 512 KB
+
+export function isSecretLikePath(relPath: string): boolean {
+  const normalized = relPath.split(/[/\\]/).join('/');
+  const base = path.basename(normalized);
+  const lowerBase = base.toLowerCase();
+
+  // Hidden files/directories (e.g. .env, .git, .secrets)
+  if (base.startsWith('.') || normalized.split('/').some((seg) => seg.startsWith('.'))) {
+    return true;
+  }
+
+  // Common secret/key extensions
+  if (
+    lowerBase.endsWith('.pem') ||
+    lowerBase.endsWith('.key') ||
+    lowerBase.endsWith('.p12') ||
+    lowerBase.endsWith('.pfx') ||
+    lowerBase.endsWith('.pkcs12') ||
+    lowerBase.endsWith('.kdbx') ||
+    lowerBase.endsWith('.keystore')
+  ) {
+    return true;
+  }
+
+  // Exact names or substrings for secrets/credentials
+  if (
+    lowerBase === 'id_rsa' ||
+    lowerBase === 'id_ed25519' ||
+    lowerBase === 'id_ecdsa' ||
+    lowerBase === 'id_dsa' ||
+    lowerBase === '.netrc' ||
+    lowerBase === '.npmrc' ||
+    lowerBase.includes('secret') ||
+    lowerBase.includes('credential') ||
+    lowerBase.includes('password') ||
+    lowerBase.includes('token') ||
+    lowerBase.includes('api_key')
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
 export class SkillRegistry {
   private skillsDir: string;
   private skillsCache = new Map<string, SkillMetadata>();
@@ -271,13 +316,47 @@ export class SkillRegistry {
         if (entry.isSymbolicLink()) continue;
         const fullPath = path.join(directory, entry.name);
         if (entry.isDirectory()) {
+          if (entry.name.startsWith('.')) continue;
           visit(fullPath);
           continue;
         }
         if (!entry.isFile() || fullPath === skill.path) continue;
         const relative = path.relative(root, fullPath);
         if (!relative || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) continue;
-        files[relative.split(path.sep).join('/')] = fs.readFileSync(fullPath);
+
+        const normalized = relative.split(path.sep).join('/');
+
+        // 1. Only include explicitly declared/referenced files in skill instructions
+        if (!skill.body.includes(normalized)) {
+          continue;
+        }
+
+        // 2. Reject secret-like files
+        if (isSecretLikePath(normalized)) {
+          getLogger().warn(
+            { skill: skill.name, file: normalized },
+            'Skipping secret-like file in skill package'
+          );
+          continue;
+        }
+
+        // 3. Enforce maximum file size limit
+        try {
+          const stat = fs.statSync(fullPath);
+          if (stat.size > MAX_SKILL_FILE_SIZE) {
+            getLogger().warn(
+              { skill: skill.name, file: normalized, size: stat.size },
+              'Skipping oversized file in skill package'
+            );
+            continue;
+          }
+          files[normalized] = fs.readFileSync(fullPath);
+        } catch (err: any) {
+          getLogger().warn(
+            { skill: skill.name, file: normalized, err: err?.message },
+            'Failed to read skill supporting file'
+          );
+        }
       }
     };
     visit(root);

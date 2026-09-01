@@ -282,6 +282,7 @@ export class WhatsAppSender {
         logger.info('Synthesizing and sending voice note');
         const { audioPath, mimeType } = await this.deepgram.synthesizeToAudioFile(params.text);
         const audioBuffer = fs.readFileSync(audioPath);
+        const quoteOptions = quotePending ? this.getQuoteOptions(params.reply_to) : undefined;
         messageId = await this.sendPart(
           partKey,
           'whatsapp_send_part',
@@ -294,7 +295,7 @@ export class WhatsAppSender {
               mimetype: mimeType,
               ptt: true,
             },
-            quotePending ? this.getQuoteOptions(params.reply_to) : undefined
+            quoteOptions
           )
         );
         quotePending = false;
@@ -310,6 +311,7 @@ export class WhatsAppSender {
       for (let i = 0; i < chunks.length; i++) {
         const chunk = chunks[i];
         const replyTo = quotePending ? params.reply_to : undefined;
+        const quoteOptions = this.getQuoteOptions(replyTo);
         const chunkPartPayload = {
           mode: 'message',
           chunk,
@@ -325,7 +327,7 @@ export class WhatsAppSender {
           () => sock.sendMessage(
             targetJid,
             { text: chunk },
-            this.getQuoteOptions(replyTo)
+            quoteOptions
           )
         );
         quotePending = false;
@@ -337,6 +339,7 @@ export class WhatsAppSender {
     if (params.attachments && params.attachments.length > 0) {
       for (const att of params.attachments) {
         const replyTo = quotePending ? params.reply_to : undefined;
+        const quoteOptions = this.getQuoteOptions(replyTo);
         const attPartPayload = {
           attachment: {
             path: att.path,
@@ -379,21 +382,21 @@ export class WhatsAppSender {
                   image: buffer,
                   caption: filename !== path.basename(att.path) ? filename : undefined,
                 },
-                this.getQuoteOptions(replyTo)
+                quoteOptions
               );
             }
             if (mime.startsWith('video/')) {
               return sock.sendMessage(
                 targetJid,
                 { video: buffer, caption: filename },
-                this.getQuoteOptions(replyTo)
+                quoteOptions
               );
             }
             if (mime.startsWith('audio/')) {
               return sock.sendMessage(
                 targetJid,
                 { audio: buffer, mimetype: mime },
-                this.getQuoteOptions(replyTo)
+                quoteOptions
               );
             }
             return sock.sendMessage(
@@ -403,7 +406,7 @@ export class WhatsAppSender {
                 mimetype: mime,
                 fileName: filename,
               },
-              this.getQuoteOptions(replyTo)
+              quoteOptions
             );
           }
         );

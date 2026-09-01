@@ -277,6 +277,45 @@ describe('WhatsApp Gateway & Sender', () => {
     }));
   });
 
+  it('preserves quoted message ID and preview when transcribing a quoted voice note', async () => {
+    const dispatch = vi.fn();
+    const deepgramMock = {
+      transcribe: vi.fn().mockResolvedValue('Please summarize this.'),
+    };
+    const gateway = new WhatsAppGateway(
+      config,
+      db,
+      dispatch,
+      async () => {},
+      tempDir,
+      {
+        downloadMedia: vi.fn().mockResolvedValue(Buffer.from('audio')),
+        deepgram: deepgramMock as any,
+      }
+    );
+
+    await gateway.handleIncomingMessage({
+      key: { remoteJid: '923001234567@s.whatsapp.net', id: 'quoted-voice-transcribed' },
+      message: {
+        audioMessage: {
+          ptt: true,
+          mimetype: 'audio/ogg',
+          contextInfo: {
+            stanzaId: 'original-msg-123',
+            quotedMessage: {
+              conversation: 'Here is the original text to summarize.',
+            },
+          },
+        },
+      },
+    });
+
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({
+      isVoice: true,
+      text: expect.stringContaining('[Replying to message ID: original-msg-123 "Here is the original text to summarize."]\n\n[voice] Please summarize this.'),
+    }));
+  });
+
   it('targets Deepgram Flux /v2/speak API for WhatsApp-compatible TTS synthesis', async () => {
     const dg = new DeepgramHandler('test-api-key', tempDir);
 

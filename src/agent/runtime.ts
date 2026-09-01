@@ -544,13 +544,8 @@ export class PokeRuntime {
       .finally(() => this.watchedSubmissionSettlements.delete(submissionId));
   }
 
-  private findOwnerSubmissionId(idempotencyKey: string): string | null {
-    // Flue documents this as its frozen keyed-submission wire format. Probe
-    // the durable row before adopting it so a reserved-but-never-admitted
-    // local delivery remains eligible for its normal gateway redelivery.
-    const preimage = `flue-submission-key\n${PokeMainAgent.name}\n${MAIN_AGENT_INSTANCE_ID}\n${idempotencyKey}`;
-    const submissionId = `sub_ik_${crypto.createHash('sha256').update(preimage).digest('hex').slice(0, 32)}`;
-    return this.db.hasFlueSubmission(submissionId) ? submissionId : null;
+  private findOwnerSubmissionId(sourceKey: string): string | null {
+    return this.db.getSubmissionDeliveryBySourceKey(sourceKey)?.submission_id || null;
   }
 
   private async handleSubmissionSettlement(event: {

@@ -85,11 +85,23 @@ export class ConfigManager {
   }
 
   saveConfig(config: PokeConfig): void {
-    this.withConfigLock(() => this.writeConfig(config));
+    this.withConfigLock((lockId) => this.writeConfig(config, lockId));
   }
 
-  private writeConfig(config: PokeConfig): void {
+  private writeConfig(config: PokeConfig, lockId?: string): void {
     ensurePokeDirectories(this.paths);
+    if (lockId) {
+      const lockFile = `${this.paths.configFile}.lock`;
+      try {
+        const owner = fs.readFileSync(lockFile, 'utf8');
+        if (owner !== lockId) {
+          throw new Error('Config lock lease expired or was taken over.');
+        }
+      } catch (err: any) {
+        if (err.message === 'Config lock lease expired or was taken over.') throw err;
+        throw new Error(`Config lock is missing: ${err.message}`);
+      }
+    }
     const normalized: PokeConfig = {
       ...config,
       timezone: DEFAULT_TIMEZONE,
@@ -112,25 +124,27 @@ export class ConfigManager {
   }
 
   private updateConfig(mutator: (config: PokeConfig) => void): void {
-    this.withConfigLock(() => {
+    this.withConfigLock((lockId) => {
       // Always start from disk while holding the lock. A live daemon and a
       // CLI process therefore patch only their own fields instead of writing
       // a stale whole-document cache over each other.
       const config = this.readConfig();
       mutator(config);
-      this.writeConfig(config);
+      this.writeConfig(config, lockId);
     });
   }
 
-  private withConfigLock<T>(operation: () => T): T {
+  private withConfigLock<T>(operation: (lockId: string) => T): T {
     ensurePokeDirectories(this.paths);
     const lockFile = `${this.paths.configFile}.lock`;
     const deadline = Date.now() + 5_000;
     let descriptor: number | undefined;
+    const lockId = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
     while (descriptor === undefined) {
       try {
         descriptor = fs.openSync(lockFile, 'wx', 0o600);
+        fs.writeFileSync(descriptor, lockId, 'utf8');
       } catch (error: any) {
         if (error?.code !== 'EEXIST') throw error;
         try {
@@ -151,13 +165,18 @@ export class ConfigManager {
     }
 
     try {
-      return operation();
+      return operation(lockId);
     } finally {
       try {
         fs.closeSync(descriptor);
       } finally {
         try {
-          fs.unlinkSync(lockFile);
+          if (fs.existsSync(lockFile)) {
+            const currentOwner = fs.readFileSync(lockFile, 'utf8');
+            if (currentOwner === lockId) {
+              fs.unlinkSync(lockFile);
+            }
+          }
         } catch (error: any) {
           if (error?.code !== 'ENOENT') throw error;
         }

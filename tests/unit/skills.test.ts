@@ -88,12 +88,36 @@ description: Research with a required checklist
 Read references/checklist.md before researching.`
     );
     fs.writeFileSync(path.join(skillDir, 'references', 'checklist.md'), 'Verify primary sources first.');
+    fs.writeFileSync(path.join(skillDir, 'references', 'undeclared.txt'), 'Not declared in SKILL.md');
 
     const skill = registry.getFlueSkills().find((candidate) => candidate.name === 'researcher');
     expect(skill?.instructions).toContain('references/checklist.md');
     expect(new TextDecoder().decode(skill?.files?.['references/checklist.md'] as Uint8Array)).toBe(
       'Verify primary sources first.'
     );
+    expect(skill?.files?.['references/undeclared.txt']).toBeUndefined();
+  });
+
+  it('rejects secret-like and oversized supporting files in skill packages', () => {
+    const skillDir = path.join(tempDir, 'security-skill');
+    fs.mkdirSync(path.join(skillDir, 'secrets'), { recursive: true });
+    fs.mkdirSync(path.join(skillDir, 'docs'), { recursive: true });
+    fs.writeFileSync(
+      path.join(skillDir, 'SKILL.md'),
+      `---
+name: security-skill
+description: Security skill with supporting files
+---
+Check secrets/.env and docs/huge.bin and docs/valid.txt.`
+    );
+    fs.writeFileSync(path.join(skillDir, 'secrets', '.env'), 'SECRET_KEY=12345');
+    fs.writeFileSync(path.join(skillDir, 'docs', 'huge.bin'), Buffer.alloc(600 * 1024)); // > 512KB
+    fs.writeFileSync(path.join(skillDir, 'docs', 'valid.txt'), 'Allowed content');
+
+    const skill = registry.getFlueSkills().find((candidate) => candidate.name === 'security-skill');
+    expect(skill?.files?.['secrets/.env']).toBeUndefined();
+    expect(skill?.files?.['docs/huge.bin']).toBeUndefined();
+    expect(new TextDecoder().decode(skill?.files?.['docs/valid.txt'] as Uint8Array)).toBe('Allowed content');
   });
 
   it('updates edited skills immediately', () => {

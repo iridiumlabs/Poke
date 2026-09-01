@@ -57,6 +57,9 @@ export function PokeWorkerAgent() {
   useTool(tools.composioSearchTool);
   useTool(tools.composioExecuteTool);
   for (const skill of sharedWorkerContexts.skills.getFlueSkills()) {
+    if (skill.name === 'automations') {
+      continue;
+    }
     useSkill(skill);
   }
 

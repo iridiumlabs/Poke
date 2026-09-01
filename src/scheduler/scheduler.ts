@@ -124,7 +124,12 @@ export class AutomationScheduler {
     logger.info('Triggering scheduled automation');
 
     const scheduledAt = auto.next_run_at;
-    if (scheduledAt === null || scheduledAt === undefined || !this.db.claimDueAutomation(auto.id, scheduledAt, triggerTimeMs)) {
+    if (scheduledAt === null || scheduledAt === undefined) {
+      return;
+    }
+
+    const claimToken = `claim_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    if (!this.db.claimDueAutomation(auto.id, scheduledAt, triggerTimeMs, claimToken)) {
       return;
     }
 
@@ -171,7 +176,8 @@ export class AutomationScheduler {
         auto.id,
         scheduledAt,
         receipt.submissionId,
-        { next_run_at: nextRun, enabled }
+        { next_run_at: nextRun, enabled },
+        claimToken
       );
       if (!admitted) {
         throw new Error('Automation occurrence was not available to record its Flue admission.');
@@ -182,10 +188,13 @@ export class AutomationScheduler {
       // An error returning from dispatch is an unknown admission outcome.
       // Keep this occurrence's original timestamp, and therefore its stable
       // Flue key, for the durable retry after the cooldown.
-      this.db.updateAutomation(auto.id, {
-        next_run_at: scheduledAt,
-        last_outcome: `dispatch_error: ${err.message}`,
-      });
+      const current = this.db.getAutomation(auto.id);
+      if (current && current.last_outcome === `claimed:${claimToken}`) {
+        this.db.updateAutomation(auto.id, {
+          next_run_at: scheduledAt,
+          last_outcome: `dispatch_error: ${err.message}`,
+        });
+      }
     }
   }
 
@@ -198,13 +207,13 @@ export class AutomationScheduler {
     enabled?: boolean;
     idempotencyKey?: string;
   }): AutomationRecord {
-    const nextRun = computeNextRun(params.schedule_type, params.schedule_value, Date.now());
     const id = params.idempotencyKey
       ? `auto-${crypto.createHash('sha256').update(params.idempotencyKey).digest('hex').slice(0, 24)}`
       : `auto-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const existing = this.db.getAutomation(id);
     if (existing) return existing;
 
+    const nextRun = computeNextRun(params.schedule_type, params.schedule_value, Date.now());
     return this.db.createAutomation({
       id,
       name: params.name,

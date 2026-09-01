@@ -776,7 +776,7 @@ retry after 20 seconds
 
 If the provider supplies a sensible `Retry-After`, honor it instead of the fixed delay. Add small jitter to prevent synchronized retries, but keep behavior close to the schedule above.
 
-Agent model streams are executed by Flue. In the installed runtime, transient model failures receive the initial attempt plus up to three framework retries with jittered exponential delays based on 2, 4, and 8 seconds. Flue does not expose that retry policy for configuration. Poke sets five attempts separately for durable submission recovery after a process interruption.
+Agent model streams are executed by Flue. Flue manages submission execution under a configurable submission retry policy on the agent definition (`durability.maxAttempts`), which defaults to 10 attempts (and a 1-hour timeout). Poke configures five attempts separately for durable submission recovery after a process interruption.
 
 Do not retry:
 
