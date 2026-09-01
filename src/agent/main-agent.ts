@@ -10,11 +10,26 @@ import { local } from '@flue/runtime/node';
 import { MAIN_AGENT_SYSTEM_PROMPT } from './prompts.js';
 import { createPokeTools, ToolContexts } from './tools.js';
 import { createPokeSandboxEnvironment } from './sandbox-env.js';
-import { resolveFlueModelSpecifier } from '../providers/provider-registry.js';
-import { CompactionManager, RECENT_TOKENS_RETENTION } from '../context/compaction-manager.js';
+import { resolveFlueModelSpecifier, normalizeCatalogModelId } from '../providers/provider-registry.js';
+import { BUNDLED_KNOWN_MODELS, CommandCodeCatalog } from '../providers/commandcode.js';
+import {
+  CompactionManager,
+  RECENT_TOKENS_RETENTION,
+  ACTIVE_COMPACTION_TOKEN_THRESHOLD,
+} from '../context/compaction-manager.js';
 
 let sharedContexts: ToolContexts | null = null;
 let sharedCompactionManager: CompactionManager | null = null;
+
+function getModelContextWindow(modelId?: string, provider?: string): number {
+  if (!modelId) return 1000000;
+  const normalized = normalizeCatalogModelId(modelId, provider as any);
+  const bundled = BUNDLED_KNOWN_MODELS[normalized];
+  if (bundled?.contextWindow) return bundled.contextWindow;
+  const meta = CommandCodeCatalog.extractPackageMetadata().get(normalized);
+  if (meta?.contextWindow) return meta.contextWindow;
+  return 1000000;
+}
 
 export function setMainAgentContexts(
   contexts: ToolContexts,
@@ -35,11 +50,18 @@ export function PokeMainAgent() {
   const modelSpecifier = resolveFlueModelSpecifier(mainModel);
   const thinkingLevel = mainModel?.reasoningEffort as any;
 
+  const contextWindow = getModelContextWindow(mainModel?.model, mainModel?.provider);
+  const reserveTokens =
+    contextWindow > ACTIVE_COMPACTION_TOKEN_THRESHOLD
+      ? contextWindow - ACTIVE_COMPACTION_TOKEN_THRESHOLD
+      : Math.min(20000, Math.floor(contextWindow / 4));
+
   // 1. Declare model
   useModel(modelSpecifier, {
     thinkingLevel,
     compaction: {
       keepRecentTokens: RECENT_TOKENS_RETENTION,
+      reserveTokens,
     },
   });
 

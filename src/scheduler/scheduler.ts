@@ -1,11 +1,11 @@
 import { PokeDatabase, AutomationRecord } from '../db/database.js';
 import { computeNextRun } from './timezone.js';
 import { getLogger } from '../logger/logger.js';
-import { createAutomationTriggerSignal } from '../agent/signals.js';
+import { createAutomationTriggerSignal, SignalPayload } from '../agent/signals.js';
 
 const AUTOMATION_DISPATCH_RETRY_MS = 30_000;
 
-export type DispatchAutomationSignalFn = (signalBody: string) => Promise<void>;
+export type DispatchAutomationSignalFn = (signal: SignalPayload) => Promise<void>;
 
 export class AutomationScheduler {
   private timer: NodeJS.Timeout | null = null;
@@ -118,9 +118,9 @@ export class AutomationScheduler {
       return;
     }
 
-    let signalXml: string;
+    let signal: SignalPayload;
     try {
-      signalXml = createAutomationTriggerSignal({
+      signal = createAutomationTriggerSignal({
         id: auto.id,
         name: auto.name,
         scheduledAt: new Date(scheduledAt).toISOString(),
@@ -156,7 +156,7 @@ export class AutomationScheduler {
       if (!this.onDispatchSignal) {
         throw new Error('Automation dispatcher is unavailable.');
       }
-      await this.onDispatchSignal(signalXml);
+      await this.onDispatchSignal(signal);
 
       this.db.updateAutomation(auto.id, {
         next_run_at: nextRun,

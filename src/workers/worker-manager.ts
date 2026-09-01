@@ -6,11 +6,11 @@ import { ComposioToolHandler } from '../tools/composio.js';
 import { SkillRegistry } from '../skills/registry.js';
 import { WorkerRunner } from './worker-runner.js';
 import { getLogger } from '../logger/logger.js';
-import { createWorkerCompletionSignal } from '../agent/signals.js';
+import { createWorkerCompletionSignal, SignalPayload } from '../agent/signals.js';
 
 export const MAX_CONCURRENT_WORKERS = 4;
 
-export type DispatchSignalFn = (signalBody: string) => Promise<void>;
+export type DispatchSignalFn = (signal: SignalPayload) => Promise<void>;
 
 export class WorkerManager {
   private activeRunners = new Map<string, WorkerRunner>();

@@ -18,6 +18,7 @@ import { resolvePokePaths, ensurePokeDirectories } from '../config/paths.js';
 import { registerAllProviders, ProviderRegistry } from '../providers/provider-registry.js';
 import { FileCredentialStore } from '../providers/credential-store.js';
 import { migrateLegacyProviderCredentials } from '../providers/credentials-migration.js';
+import { SignalPayload } from './signals.js';
 
 export const MAIN_AGENT_INSTANCE_ID = 'owner';
 
@@ -142,13 +143,13 @@ export class PokeRuntime {
       this.agentHandle = init(PokeMainAgent, { id: MAIN_AGENT_INSTANCE_ID });
 
       // Connect worker completion dispatcher to main agent
-      this.workerManager.setCompletionDispatcher(async (signalXml) => {
-        await this.dispatchSignal('worker.completion', signalXml);
+      this.workerManager.setCompletionDispatcher(async (signal) => {
+        await this.dispatchSignal(signal);
       });
 
       // Connect automation dispatcher to main agent
-      this.scheduler.setDispatcher(async (signalXml) => {
-        await this.dispatchSignal('automation.trigger', signalXml);
+      this.scheduler.setDispatcher(async (signal) => {
+        await this.dispatchSignal(signal);
       });
 
       // Start scheduler
@@ -238,8 +239,9 @@ export class PokeRuntime {
         if (err.message?.includes('aborted') || err.outcome === 'aborted') {
           return;
         }
-        logger.error({ err: err.message }, 'Inference execution failed');
-        await this.sender.sendDirectError(err.message || 'Inference failed');
+        const errorMessage = (err.cause as Error)?.message || err.message || 'Inference failed';
+        logger.error({ err: errorMessage }, 'Inference execution failed');
+        await this.sender.sendDirectError(errorMessage);
       });
 
       return receipt;
@@ -250,21 +252,26 @@ export class PokeRuntime {
     }
   }
 
-  async dispatchSignal(type: string, signalBody: string): Promise<DispatchReceipt> {
+  async dispatchSignal(signal: SignalPayload): Promise<DispatchReceipt> {
     if (!this.agentHandle) {
       throw new Error('Poke runtime is not started.');
     }
 
     const logger = getLogger();
-    logger.info({ type, signalLength: signalBody.length }, 'Dispatching signal to main agent');
+    logger.info(
+      { type: signal.type, tagName: signal.tagName, signalLength: signal.body.length },
+      'Dispatching signal to main agent'
+    );
 
-    this.compactionManager.recordActivity(Math.ceil(signalBody.length / 4));
+    this.compactionManager.recordActivity(Math.ceil(signal.body.length / 4));
 
     return await this.agentHandle.dispatch({
       message: {
         kind: 'signal' as any,
-        type,
-        body: signalBody,
+        type: signal.type,
+        tagName: signal.tagName,
+        attributes: signal.attributes,
+        body: signal.body,
       } as any,
     });
   }

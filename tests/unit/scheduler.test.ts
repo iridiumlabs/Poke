@@ -5,6 +5,7 @@ import path from 'path';
 import { AutomationScheduler } from '../../src/scheduler/scheduler.js';
 import { computeNextRun, parseDurationMs, POKE_TIMEZONE } from '../../src/scheduler/timezone.js';
 import { PokeDatabase } from '../../src/db/database.js';
+import { SignalPayload } from '../../src/agent/signals.js';
 
 describe('AutomationScheduler & Timezone (Asia/Karachi)', () => {
   let tempDir: string;
@@ -51,6 +52,11 @@ describe('AutomationScheduler & Timezone (Asia/Karachi)', () => {
     const localStr = '2026-09-05 15:00:00';
     const parsedKarachi = computeNextRun('once', localStr, baseTime);
     expect(parsedKarachi).toBe(Date.parse('2026-09-05T15:00:00+05:00'));
+
+    // Once with date-only format (YYYY-MM-DD)
+    const dateOnlyStr = '2026-09-05';
+    const parsedDateOnly = computeNextRun('once', dateOnlyStr, baseTime);
+    expect(parsedDateOnly).toBe(Date.parse('2026-09-05T00:00:00+05:00'));
 
     // Past time throws
     expect(() => computeNextRun('once', '2026-08-01 10:00:00', baseTime)).toThrow(
@@ -121,7 +127,7 @@ describe('AutomationScheduler & Timezone (Asia/Karachi)', () => {
     expect(updatedCron?.next_run_at).toBeGreaterThan(now);
   });
 
-  it('atomically claims an overdue automation and escapes its untrusted signal fields', async () => {
+  it('atomically claims an overdue automation and formats its signal payload', async () => {
     const scheduledAt = Date.now() - 1_000;
     db.createAutomation({
       id: 'auto-"<&',
@@ -132,7 +138,7 @@ describe('AutomationScheduler & Timezone (Asia/Karachi)', () => {
       next_run_at: scheduledAt,
     });
 
-    const dispatched: string[] = [];
+    const dispatched: SignalPayload[] = [];
     scheduler.setDispatcher(async (signal) => {
       dispatched.push(signal);
       await new Promise((resolve) => setTimeout(resolve, 10));
@@ -142,9 +148,11 @@ describe('AutomationScheduler & Timezone (Asia/Karachi)', () => {
     await Promise.all([scheduler.tick(), scheduler.tick()]);
 
     expect(dispatched).toHaveLength(1);
-    expect(dispatched[0]).toContain('id="auto-&quot;&lt;&amp;"');
-    expect(dispatched[0]).toContain('name="Daily &quot;summary&quot; &amp; review"');
-    expect(dispatched[0]).toContain('Read &lt;untrusted&gt; &amp; report it.');
+    expect(dispatched[0].type).toBe('automation.trigger');
+    expect(dispatched[0].tagName).toBe('automation_trigger');
+    expect(dispatched[0].attributes.id).toBe('auto-"<&');
+    expect(dispatched[0].attributes.name).toBe('Daily "summary" & review');
+    expect(dispatched[0].body).toBe('Read <untrusted> & report it.');
     expect(db.getAutomation('auto-"<&')?.last_outcome).toBe('dispatched');
     expect(db.getAutomation('auto-"<&')?.enabled).toBe(0);
   });

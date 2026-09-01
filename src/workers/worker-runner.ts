@@ -5,7 +5,6 @@ import { SupermemoryToolHandler } from '../tools/supermemory.js';
 import { ComposioToolHandler } from '../tools/composio.js';
 import { SkillRegistry } from '../skills/registry.js';
 import { getLogger } from '../logger/logger.js';
-import { withProviderRetry } from '../providers/retry.js';
 import { init, AgentInstanceHandle } from '@flue/runtime';
 import { PokeWorkerAgent } from '../agent/worker-agent.js';
 
@@ -62,15 +61,10 @@ export class WorkerRunner {
         message: this.job.instruction,
         initialData: { cwd: this.job.cwd || undefined },
       });
-      const resultText = await withProviderRetry(
-        async () => {
-          const reply = await this.agentHandle!.read(receipt, {
-            signal: this.abortController?.signal,
-          });
-          return reply.text || 'Worker task completed.';
-        },
-        { signal: this.abortController.signal }
-      );
+      const reply = await this.agentHandle!.read(receipt, {
+        signal: this.abortController?.signal,
+      });
+      const resultText = reply.text || 'Worker task completed.';
 
       if (this.abortController.signal.aborted) {
         return { status: 'aborted' };
@@ -81,13 +75,14 @@ export class WorkerRunner {
         result: resultText,
       };
     } catch (err: any) {
-      if (this.abortController?.signal.aborted || err.message === 'Worker aborted') {
+      if (this.abortController?.signal.aborted || err.message === 'Worker aborted' || err.outcome === 'aborted') {
         return { status: 'aborted' };
       }
-      logger.error({ err: err.message }, 'Worker execution failed');
+      const errorMessage = (err.cause as Error)?.message || err.message || 'Worker execution failed';
+      logger.error({ err: errorMessage }, 'Worker execution failed');
       return {
         status: 'failed',
-        error: err.message,
+        error: errorMessage,
       };
     }
   }

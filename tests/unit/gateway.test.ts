@@ -329,6 +329,80 @@ describe('WhatsApp Gateway & Sender', () => {
     expect(dispatched).toBe(true);
   });
 
+  it('unwraps inbound ephemeral and view-once messages properly', async () => {
+    let dispatchedText = '';
+    const gateway = new WhatsAppGateway(
+      config,
+      db,
+      async (msg) => {
+        dispatchedText = msg.text;
+      },
+      async () => {},
+      tempDir
+    );
+
+    // Ephemeral message containing text
+    await gateway.handleIncomingMessage({
+      key: { remoteJid: '923001234567@s.whatsapp.net', id: 'm-ephemeral-1' },
+      message: {
+        ephemeralMessage: {
+          message: {
+            conversation: 'Secret message from ephemeral chat',
+          },
+        },
+      } as any,
+    });
+
+    expect(dispatchedText).toBe('Secret message from ephemeral chat');
+
+    // View-once message containing text
+    await gateway.handleIncomingMessage({
+      key: { remoteJid: '923001234567@s.whatsapp.net', id: 'm-viewonce-1' },
+      message: {
+        viewOnceMessage: {
+          message: {
+            extendedTextMessage: {
+              text: 'View once text content',
+            },
+          },
+        },
+      } as any,
+    });
+
+    expect(dispatchedText).toBe('View once text content');
+  });
+
+  it('extracts quoted/replied-to message context into inbound text', async () => {
+    let dispatchedText = '';
+    const gateway = new WhatsAppGateway(
+      config,
+      db,
+      async (msg) => {
+        dispatchedText = msg.text;
+      },
+      async () => {},
+      tempDir
+    );
+
+    await gateway.handleIncomingMessage({
+      key: { remoteJid: '923001234567@s.whatsapp.net', id: 'm-reply-1' },
+      message: {
+        extendedTextMessage: {
+          text: 'What does this mean?',
+          contextInfo: {
+            stanzaId: 'original-msg-999',
+            quotedMessage: {
+              conversation: 'Server CPU load at 98%',
+            },
+          },
+        },
+      } as any,
+    });
+
+    expect(dispatchedText).toContain('[Replying to message ID: original-msg-999 "Server CPU load at 98%"]');
+    expect(dispatchedText).toContain('What does this mean?');
+  });
+
   it('deduplicates redelivered inbound messages using idempotency', async () => {
     let dispatchCount = 0;
     const gateway = new WhatsAppGateway(
@@ -603,6 +677,37 @@ describe('WhatsApp Gateway & Sender', () => {
     expect(sentMessages[0].audio).toBeDefined();
     expect(sentMessages[1].image).toBeDefined();
     expect(res.mode).toBe('voice');
+  });
+
+  it('sends attachments without sending an empty text message when text is empty', async () => {
+    const sentMessages: any[] = [];
+    const mockSocket = {
+      sendMessage: vi.fn().mockImplementation(async (_jid: string, content: any) => {
+        sentMessages.push(content);
+        return { key: { id: `sent-msg-${sentMessages.length}` } };
+      }),
+    };
+
+    const dummyAttachmentPath = path.join(tempDir, 'photo.jpg');
+    fs.writeFileSync(dummyAttachmentPath, 'fake-photo-bytes');
+
+    const sender = new WhatsAppSender(
+      () => mockSocket,
+      '923001234567@s.whatsapp.net',
+      db,
+      new DeepgramHandler(undefined, tempDir)
+    );
+
+    const res = await sender.send({
+      mode: 'message',
+      text: '',
+      attachments: [{ path: dummyAttachmentPath, filename: 'photo.jpg', mimeType: 'image/jpeg' }],
+    });
+
+    expect(mockSocket.sendMessage).toHaveBeenCalledTimes(1);
+    expect(sentMessages[0].image).toBeDefined();
+    expect(sentMessages[0].text).toBeUndefined();
+    expect(res.mode).toBe('message');
   });
 
   it('rejects reuse of a part idempotency key with altered content', async () => {

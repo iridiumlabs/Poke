@@ -253,7 +253,10 @@ export class WhatsAppSender {
       partIndex++;
     } else {
       // mode === "message"
-      const chunks = splitLongTextMessage(params.text);
+      const chunks =
+        params.text.trim().length > 0 || !params.attachments?.length
+          ? splitLongTextMessage(params.text)
+          : [];
 
       for (let i = 0; i < chunks.length; i++) {
         const chunk = chunks[i];
