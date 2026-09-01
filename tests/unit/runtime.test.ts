@@ -64,6 +64,17 @@ describe('PokeRuntime: Submission Delivery & Replay Recovery', () => {
       abort: vi.fn().mockResolvedValue(undefined),
     };
     (runtime as any).agentHandle = mockAgentHandle;
+
+    (db as any).db.exec(`
+      CREATE TABLE IF NOT EXISTS flue_agent_submissions (
+        submission_id TEXT NOT NULL UNIQUE,
+        session_key TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        status TEXT NOT NULL,
+        accepted_at INTEGER NOT NULL
+      )
+    `);
   });
 
   afterEach(() => {
@@ -221,5 +232,75 @@ describe('PokeRuntime: Submission Delivery & Replay Recovery', () => {
 
     // Unadmitted row was pruned from DB so it does not stay orphaned pending forever
     expect(db.getSubmissionDeliveryBySourceKey(unadmittedSourceKey)).toBeNull();
+  });
+
+  it('recovers admitted work when replay also encounters transport error without erasing reservation or sending false error', async () => {
+    const directErrorSpy = vi.spyOn(sender, 'sendDirectError').mockResolvedValue();
+    const sourceKey = 'whatsapp:msg-double-fail';
+    const preimage = `flue-submission-key\n${PokeMainAgent.name}\n${MAIN_AGENT_INSTANCE_ID}\n${sourceKey}`;
+    const admittedSubmissionId = `sub_ik_${crypto.createHash('sha256').update(preimage).digest('hex').slice(0, 32)}`;
+
+    // Initial dispatch durably admits in Flue table before losing transport
+    mockAgentHandle.dispatch
+      .mockImplementationOnce(async () => {
+        (db as any).db
+          .prepare(
+            `INSERT INTO flue_agent_submissions (submission_id, session_key, kind, payload, status, accepted_at)
+             VALUES (?, 'owner', 'direct', '{}', 'queued', ?)`
+          )
+          .run(admittedSubmissionId, Date.now());
+        throw new Error('Connection reset after admission');
+      })
+      .mockRejectedValueOnce(new Error('Replay connection reset'));
+
+    const receipt = await runtime.dispatchUserMessage('Hello agent', [], 'msg-double-fail');
+
+    expect(receipt).toEqual({ submissionId: admittedSubmissionId });
+    expect(mockAgentHandle.dispatch).toHaveBeenCalledTimes(2);
+    expect(directErrorSpy).not.toHaveBeenCalled();
+
+    // Delivery record was attached in DB and settled
+    const delivery = db.getSubmissionDeliveryBySourceKey(sourceKey);
+    expect(delivery).toMatchObject({
+      source_key: sourceKey,
+      submission_id: admittedSubmissionId,
+      status: 'completed',
+    });
+  });
+
+  it('does not attempt replay dispatch when dispatch was never reached due to reservation failure', async () => {
+    const directErrorSpy = vi.spyOn(sender, 'sendDirectError').mockResolvedValue();
+    const reserveSpy = vi.spyOn(db, 'reserveSubmissionDelivery').mockImplementation(() => {
+      throw new Error('SQLite disk full');
+    });
+
+    await expect(
+      runtime.dispatchUserMessage('Hello agent', [], 'msg-reserve-fail')
+    ).rejects.toThrow('SQLite disk full');
+
+    expect(mockAgentHandle.dispatch).not.toHaveBeenCalled();
+    expect(directErrorSpy).toHaveBeenCalledWith('Inference failed: SQLite disk full');
+    reserveSpy.mockRestore();
+  });
+
+  it('preserves unattached pending reservations and propagates error when startup Flue lookup fails', () => {
+    const pendingKey = 'whatsapp:lookup-error';
+    db.reserveSubmissionDelivery({
+      sourceKey: pendingKey,
+      source: 'whatsapp',
+      whatsappMessageId: 'lookup-error',
+    });
+
+    const hasFlueSpy = vi.spyOn(db, 'hasFlueSubmission').mockImplementation(() => {
+      throw new Error('SQLite busy / locked');
+    });
+
+    expect(() => (runtime as any).recoverSubmissionDeliveries()).toThrow('SQLite busy / locked');
+
+    // Unattached reservation must NOT be deleted on lookup error
+    const delivery = db.getSubmissionDeliveryBySourceKey(pendingKey);
+    expect(delivery).not.toBeNull();
+    expect(delivery?.status).toBe('pending');
+    hasFlueSpy.mockRestore();
   });
 });

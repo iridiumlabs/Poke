@@ -224,6 +224,7 @@ export class PokeRuntime {
 
     const sourceKey = whatsappMessageId ? `whatsapp:${whatsappMessageId}` : undefined;
     let messagePayload: any;
+    let dispatchAttempted = false;
     try {
       await this.ensurePreflightCompaction();
       this.compactionManager.recordActivity();
@@ -260,6 +261,7 @@ export class PokeRuntime {
           whatsappMessageId,
         });
       }
+      dispatchAttempted = true;
       const receipt = await this.agentHandle.dispatch({
         message: messagePayload as any,
         ...(sourceKey ? { idempotencyKey: sourceKey } : {}),
@@ -275,7 +277,7 @@ export class PokeRuntime {
       // A transport or downstream error can arrive after Flue durably accepted
       // the keyed submission. Replaying the dispatch with the same key converges
       // on the accepted submission and returns its receipt without running a second turn.
-      if (sourceKey && this.agentHandle && messagePayload) {
+      if (dispatchAttempted && sourceKey && this.agentHandle && messagePayload) {
         try {
           const replayReceipt = await this.agentHandle.dispatch({
             message: messagePayload as any,
@@ -292,7 +294,30 @@ export class PokeRuntime {
         }
       }
       if (sourceKey) {
-        this.db.removeUnattachedSubmissionDelivery(sourceKey);
+        if (dispatchAttempted) {
+          let isAdmitted = false;
+          let lookupSucceeded = false;
+          try {
+            const derivedSubmissionId = this.deriveOwnerSubmissionId(sourceKey);
+            isAdmitted = this.db.hasFlueSubmission(derivedSubmissionId);
+            lookupSucceeded = true;
+            if (isAdmitted) {
+              this.db.attachSubmissionDelivery(sourceKey, derivedSubmissionId);
+              this.watchSubmissionSettlement(derivedSubmissionId);
+              return { submissionId: derivedSubmissionId } as DispatchReceipt;
+            }
+          } catch (lookupErr: any) {
+            logger.warn(
+              { err: lookupErr?.message || String(lookupErr) },
+              'Failed to verify Flue submission admission status'
+            );
+          }
+          if (lookupSucceeded && !isAdmitted) {
+            this.db.removeUnattachedSubmissionDelivery(sourceKey);
+          }
+        } else {
+          this.db.removeUnattachedSubmissionDelivery(sourceKey);
+        }
       }
       await this.sender.sendDirectError(`Inference failed: ${err.message}`);
       throw err;
@@ -330,7 +355,9 @@ export class PokeRuntime {
       body: signal.body,
     };
 
+    let dispatchAttempted = false;
     try {
+      dispatchAttempted = true;
       const receipt = await this.agentHandle.dispatch({
         message: signalMessage as any,
         ...(signal.idempotencyKey ? { idempotencyKey: signal.idempotencyKey } : {}),
@@ -342,7 +369,7 @@ export class PokeRuntime {
       return receipt;
     } catch (err: any) {
       logger.error({ err: err?.message || String(err) }, 'Failed to dispatch signal to agent');
-      if (source && signal.idempotencyKey && this.agentHandle) {
+      if (dispatchAttempted && source && signal.idempotencyKey && this.agentHandle) {
         try {
           const replayReceipt = await this.agentHandle.dispatch({
             message: signalMessage as any,
@@ -359,7 +386,30 @@ export class PokeRuntime {
         }
       }
       if (source && signal.idempotencyKey) {
-        this.db.removeUnattachedSubmissionDelivery(signal.idempotencyKey);
+        if (dispatchAttempted) {
+          let isAdmitted = false;
+          let lookupSucceeded = false;
+          try {
+            const derivedSubmissionId = this.deriveOwnerSubmissionId(signal.idempotencyKey);
+            isAdmitted = this.db.hasFlueSubmission(derivedSubmissionId);
+            lookupSucceeded = true;
+            if (isAdmitted) {
+              this.db.attachSubmissionDelivery(signal.idempotencyKey, derivedSubmissionId);
+              this.watchSubmissionSettlement(derivedSubmissionId);
+              return { submissionId: derivedSubmissionId } as DispatchReceipt;
+            }
+          } catch (lookupErr: any) {
+            logger.warn(
+              { err: lookupErr?.message || String(lookupErr) },
+              'Failed to verify signal submission admission status'
+            );
+          }
+          if (lookupSucceeded && !isAdmitted) {
+            this.db.removeUnattachedSubmissionDelivery(signal.idempotencyKey);
+          }
+        } else {
+          this.db.removeUnattachedSubmissionDelivery(signal.idempotencyKey);
+        }
       }
       throw err;
     }

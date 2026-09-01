@@ -683,14 +683,10 @@ export class PokeDatabase {
 
   hasFlueSubmission(submissionId: string): boolean {
     if (!this.isOpen()) return false;
-    try {
-      const row = this.db
-        .prepare('SELECT 1 FROM flue_agent_submissions WHERE submission_id = ?')
-        .get(submissionId);
-      return Boolean(row);
-    } catch {
-      return false;
-    }
+    const row = this.db
+      .prepare('SELECT 1 FROM flue_agent_submissions WHERE submission_id = ?')
+      .get(submissionId);
+    return Boolean(row);
   }
 
   removeUnattachedSubmissionDelivery(sourceKey: string): void {

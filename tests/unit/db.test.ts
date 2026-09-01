@@ -213,6 +213,20 @@ describe('PokeDatabase', () => {
     db.removeUnattachedSubmissionDelivery('whatsapp:attached-1');
     expect(db.getSubmissionDeliveryBySourceKey('whatsapp:attached-1')).not.toBeNull();
 
+    // Propagates lookup error when Flue table is missing
+    expect(() => db.hasFlueSubmission('sub_ik_nonexistent')).toThrow();
+
+    (db as any).db.exec(`
+      CREATE TABLE IF NOT EXISTS flue_agent_submissions (
+        submission_id TEXT NOT NULL UNIQUE
+      )
+    `);
+
     expect(db.hasFlueSubmission('sub_ik_nonexistent')).toBe(false);
+
+    (db as any).db
+      .prepare('INSERT INTO flue_agent_submissions (submission_id) VALUES (?)')
+      .run('sub_ik_existing');
+    expect(db.hasFlueSubmission('sub_ik_existing')).toBe(true);
   });
 });
