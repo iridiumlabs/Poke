@@ -148,14 +148,24 @@ export class PokeDatabase {
     if (!this.isOpen()) return null;
     const streamPath = `agents/${agentName}/${instanceId}`;
     try {
-      const batches = this.db
+      // Batch data rows can reach Flue's 12MB batch ceiling. Load sequence
+      // numbers first and materialize each batch's data only as needed,
+      // stopping at the newest compaction record.
+      const batchSeqs = this.db
         .prepare(
-          `SELECT seq, data FROM flue_conversation_stream_batches
+          `SELECT seq FROM flue_conversation_stream_batches
            WHERE path = ? ORDER BY seq DESC`
         )
-        .all(streamPath) as Array<{ seq: number; data: string }>;
+        .all(streamPath) as Array<{ seq: number }>;
 
-      for (const batch of batches) {
+      for (const { seq } of batchSeqs) {
+        const batch = this.db
+          .prepare(
+            `SELECT data FROM flue_conversation_stream_batches
+             WHERE path = ? AND seq = ?`
+          )
+          .get(streamPath, seq) as { data: string } | undefined;
+        if (!batch) continue;
         let data = batch.data;
         if (data.startsWith('{')) {
           const chunks = this.db
@@ -163,7 +173,7 @@ export class PokeDatabase {
               `SELECT data FROM flue_conversation_stream_batch_chunks
                WHERE path = ? AND seq = ? ORDER BY chunk_index ASC`
             )
-            .all(streamPath, batch.seq) as Array<{ data: string }>;
+            .all(streamPath, seq) as Array<{ data: string }>;
           if (chunks.length === 0) continue;
           data = chunks.map((chunk) => chunk.data).join('');
         }

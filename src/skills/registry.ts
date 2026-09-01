@@ -86,8 +86,15 @@ description: Create and manage scheduled tasks and reminders. Use when the user 
 export function parseSkillFile(filePath: string): SkillMetadata | null {
   try {
     if (!fs.existsSync(filePath)) return null;
-    const content = fs.readFileSync(filePath, 'utf8');
     const stat = fs.statSync(filePath);
+    if (stat.size > MAX_SKILL_FILE_SIZE) {
+      getLogger().warn(
+        { filePath, size: stat.size },
+        'Skipping oversized skill file'
+      );
+      return null;
+    }
+    const content = fs.readFileSync(filePath, 'utf8');
 
     // Parse YAML frontmatter if present
     let name = path.basename(path.dirname(filePath));
@@ -130,6 +137,21 @@ export function parseSkillFile(filePath: string): SkillMetadata | null {
 }
 
 export const MAX_SKILL_FILE_SIZE = 512 * 1024; // 512 KB
+export const MAX_SKILL_PACKAGE_BYTES = 8 * 1024 * 1024; // 8 MB aggregate per skill
+export const MAX_SKILL_PACKAGE_DEPTH = 8;
+// Dependency folders and build output never belong in a skill package (see
+// skill-manager contract). Their bulk is excluded before any stat or read.
+export const BULK_EXCLUDED_DIRS = new Set([
+  'node_modules',
+  'dist',
+  'build',
+  'out',
+  'target',
+  'vendor',
+  '__pycache__',
+  '.venv',
+  'venv',
+]);
 
 export function isSecretLikePath(relPath: string): boolean {
   const normalized = relPath.split(/[/\\]/).join('/');
@@ -311,13 +333,15 @@ export class SkillRegistry {
     if (path.resolve(root) === path.resolve(this.skillsDir)) return {};
 
     const files: Record<string, Uint8Array> = {};
-    const visit = (directory: string): void => {
+    let totalBytes = 0;
+    const visit = (directory: string, depth: number): void => {
+      if (depth > MAX_SKILL_PACKAGE_DEPTH) return;
       for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
         if (entry.isSymbolicLink()) continue;
         const fullPath = path.join(directory, entry.name);
         if (entry.isDirectory()) {
-          if (entry.name.startsWith('.')) continue;
-          visit(fullPath);
+          if (entry.name.startsWith('.') || BULK_EXCLUDED_DIRS.has(entry.name)) continue;
+          visit(fullPath, depth + 1);
           continue;
         }
         if (!entry.isFile() || fullPath === skill.path) continue;
@@ -340,7 +364,7 @@ export class SkillRegistry {
           continue;
         }
 
-        // 3. Enforce maximum file size limit
+        // 3. Enforce per-file and aggregate size limits
         try {
           const stat = fs.statSync(fullPath);
           if (stat.size > MAX_SKILL_FILE_SIZE) {
@@ -350,7 +374,15 @@ export class SkillRegistry {
             );
             continue;
           }
+          if (totalBytes + stat.size > MAX_SKILL_PACKAGE_BYTES) {
+            getLogger().warn(
+              { skill: skill.name, file: normalized, totalBytes: totalBytes + stat.size },
+              'Skipping file that exceeds the skill package byte budget'
+            );
+            continue;
+          }
           files[normalized] = fs.readFileSync(fullPath);
+          totalBytes += stat.size;
         } catch (err: any) {
           getLogger().warn(
             { skill: skill.name, file: normalized, err: err?.message },
@@ -359,7 +391,7 @@ export class SkillRegistry {
         }
       }
     };
-    visit(root);
+    visit(root, 0);
     return files;
   }
 }
