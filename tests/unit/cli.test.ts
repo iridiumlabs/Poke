@@ -413,4 +413,26 @@ describe('CLI & Diagnostics', () => {
       reason: 'WhatsApp session paired.',
     });
   });
+
+  it('renders a terminal QR code when QR pairing method is used', async () => {
+    const ui = new ScriptedUi(['qr']);
+    const daemon = {
+      isRunning: vi.fn().mockResolvedValue(false),
+      stop: vi.fn(),
+      start: vi.fn(),
+    };
+    const pairingService = {
+      pair: vi.fn().mockImplementation(async ({ onQr }: { onQr: (qr: string) => void }) => {
+        onQr('test-qr-code-payload');
+        return { pairedAccount: '923001111111' };
+      }),
+    };
+
+    await runInteractiveWhatsAppPairing(config, tempDir, ui, {
+      service: pairingService as any,
+      daemon,
+    });
+
+    expect(ui.notes.some((note) => note.length > 0 && note.includes('\u2588'))).toBe(true);
+  });
 });

@@ -1,4 +1,4 @@
-import { generate as renderQr } from 'qrcode-terminal';
+import qrcode from 'qrcode-terminal';
 import { ConfigManager } from '../config/config.js';
 import { resolvePokePaths } from '../config/paths.js';
 import {
@@ -39,7 +39,7 @@ function defaultDaemonMaintenance(customHome?: string): DaemonMaintenance {
 
 function terminalQr(value: string): string {
   let rendered = '';
-  renderQr(value, { small: true }, (output) => {
+  qrcode.generate(value, { small: true }, (output) => {
     rendered = output;
   });
   return rendered;
