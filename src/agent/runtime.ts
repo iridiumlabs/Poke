@@ -577,8 +577,6 @@ export class PokeRuntime {
       if (lookupSucceeded && !isAdmitted) {
         this.db.removeUnattachedSubmissionDelivery(sourceKey);
       }
-    } else {
-      this.db.removeUnattachedSubmissionDelivery(sourceKey);
     }
 
     return null;

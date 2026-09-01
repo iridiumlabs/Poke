@@ -309,4 +309,32 @@ describe('PokeRuntime: Submission Delivery & Replay Recovery', () => {
     expect(delivery?.status).toBe('pending');
     hasFlueSpy.mockRestore();
   });
+
+  it('preserves existing unattached reservation when dispatch is not reached due to preflight failure', async () => {
+    const directErrorSpy = vi.spyOn(sender, 'sendDirectError').mockResolvedValue();
+    const sourceKey = 'whatsapp:preflight-fail';
+    db.reserveSubmissionDelivery({
+      sourceKey,
+      source: 'whatsapp',
+      whatsappMessageId: 'preflight-fail',
+    });
+
+    const preflightSpy = vi
+      .spyOn(runtime as any, 'ensurePreflightCompaction')
+      .mockRejectedValue(new Error('Preflight compaction failed'));
+
+    await expect(
+      runtime.dispatchUserMessage('Hello agent', [], 'preflight-fail')
+    ).rejects.toThrow('Preflight compaction failed');
+
+    expect(mockAgentHandle.dispatch).not.toHaveBeenCalled();
+    expect(directErrorSpy).toHaveBeenCalledWith('Inference failed: Preflight compaction failed');
+
+    // Existing reservation must remain intact when dispatch was never attempted
+    const delivery = db.getSubmissionDeliveryBySourceKey(sourceKey);
+    expect(delivery).not.toBeNull();
+    expect(delivery?.status).toBe('pending');
+    preflightSpy.mockRestore();
+  });
 });
+
