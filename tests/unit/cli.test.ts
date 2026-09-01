@@ -212,6 +212,29 @@ describe('CLI & Diagnostics', () => {
     }
   });
 
+  it('poke status ignores out-of-range and non-finite timestamps without throwing', async () => {
+    const { runStatus } = await import('../../src/cli/status.js');
+    db.setState('last_activity_time', '1e25');
+    db.getRawDb().prepare("INSERT INTO automations (id, name, instruction, schedule_type, schedule_value, enabled, next_run_at, created_at, updated_at) VALUES ('a1', 'test-auto', 'inst', 'interval', '10m', 1, 1e25, 1000, 1000)").run();
+    db.getRawDb().prepare("INSERT INTO operational_errors (id, source, message, created_at) VALUES ('e1', 'test-src', 'some error', 1e25)").run();
+
+    const consoleLogs: string[] = [];
+    const logSpy = vi.spyOn(console, 'log').mockImplementation((...args: any[]) => {
+      consoleLogs.push(args.join(' '));
+    });
+
+    try {
+      await runStatus(tempDir);
+      const statusOutput = consoleLogs.join('\n');
+      expect(statusOutput).toContain('POKE STATUS');
+      expect(statusOutput).not.toContain('Last Activity:');
+      expect(statusOutput).toContain('None scheduled');
+      expect(statusOutput).not.toContain('Last Operational Error');
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
   it('ConfigManager loadConfig throws when config.json is malformed instead of overwriting with defaults', () => {
     const configFile = path.join(tempDir, 'config.json');
     fs.writeFileSync(configFile, '{"ownerPhoneNumber": "923001234567", invalid-json}');

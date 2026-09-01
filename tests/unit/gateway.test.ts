@@ -636,4 +636,43 @@ describe('WhatsApp Gateway & Sender', () => {
     );
     expect(mockSocket.sendMessage).not.toHaveBeenCalled();
   });
+
+  it('rejects retrying a failed multipart send when the top-level payload was modified', async () => {
+    let callCount = 0;
+    const mockSocket = {
+      sendMessage: vi.fn().mockImplementation(async () => {
+        callCount++;
+        if (callCount === 2) {
+          throw new Error('Network failure on part 1');
+        }
+        return { key: { id: `sent-part-${callCount}` } };
+      }),
+    };
+
+    const sender = new WhatsAppSender(
+      () => mockSocket,
+      '923001234567@s.whatsapp.net',
+      db,
+      new DeepgramHandler(undefined, tempDir)
+    );
+
+    const idempotencyKey = 'retry-top-level-mismatch-test';
+    const initialText = `First chunk: ${'a'.repeat(3000)}\n\nSecond chunk: ${'b'.repeat(3000)}`;
+
+    // First attempt fails at chunk 2
+    await expect(
+      sender.send({ mode: 'message', text: initialText }, idempotencyKey)
+    ).rejects.toThrow('Network failure on part 1');
+
+    expect(callCount).toBe(2);
+
+    // Second attempt with DIFFERENT text under same idempotency key must reject
+    const modifiedText = `First chunk: ${'a'.repeat(3000)}\n\nDifferent chunk: ${'c'.repeat(3000)}`;
+    await expect(
+      sender.send({ mode: 'message', text: modifiedText }, idempotencyKey)
+    ).rejects.toThrow('different content');
+
+    // No additional message should be sent
+    expect(callCount).toBe(2);
+  });
 });

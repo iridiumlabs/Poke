@@ -205,6 +205,24 @@ describe('resolveFlueModelSpecifier', () => {
     const { resolveFlueModelSpecifier } = await import('../../src/providers/provider-registry.js');
     expect(() => resolveFlueModelSpecifier()).toThrow(/No model is configured/);
   });
+
+  it('attaches Flue dynamicModelTemplate to Command Code credential provider', async () => {
+    const { createCommandCodeCredentialProvider, withPokeCredentialResolver, createPokeModels } = await import('../../src/providers/models.js');
+    const dynamicKey = Symbol.for('flue.dynamicModelTemplate');
+    const provider = createCommandCodeCredentialProvider();
+    expect((provider as any)[dynamicKey]).toEqual({
+      api: 'openai-completions',
+      baseUrl: 'https://api.commandcode.ai/provider/v1',
+    });
+
+    const credentials = new FileCredentialStore('/tmp/test-creds.json');
+    const models = createPokeModels(credentials);
+    const resolved = withPokeCredentialResolver(provider, models);
+    expect((resolved as any)[dynamicKey]).toEqual({
+      api: 'openai-completions',
+      baseUrl: 'https://api.commandcode.ai/provider/v1',
+    });
+  });
 });
 
 describe('ComposioToolHandler', () => {

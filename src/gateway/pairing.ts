@@ -122,10 +122,7 @@ export class WhatsAppPairingService {
       const socket = connection.socket;
       activeSocket = socket;
       socket.ev.on('creds.update', () => {
-        const savePromise = Promise.resolve(connection.saveCreds()).catch((error: unknown) => {
-          getLogger().warn({ err: error instanceof Error ? error.message : String(error) }, 'Failed to persist pairing credentials');
-        });
-        pendingSaveCreds = pendingSaveCreds.then(() => savePromise);
+        pendingSaveCreds = pendingSaveCreds.then(() => connection.saveCreds());
       });
       return socket;
     };

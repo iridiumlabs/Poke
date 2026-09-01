@@ -182,6 +182,10 @@ export class WhatsAppSender {
     const topPayloadHash = computePayloadHash(params);
 
     if (idempotencyKey) {
+      const existingDelivery = this.db.getOutgoingDelivery(idempotencyKey);
+      if (existingDelivery && existingDelivery.payload_hash !== topPayloadHash) {
+        throw new Error('This WhatsApp send key is already associated with different content.');
+      }
       const existing = this.db.checkIdempotency(idempotencyKey);
       if (existing && existing.payload_hash !== topPayloadHash) {
         throw new Error('This WhatsApp send key is already associated with different content.');
@@ -190,6 +194,7 @@ export class WhatsAppSender {
         logger.info({ idempotencyKey }, 'Returning cached WhatsApp send response due to idempotency');
         return JSON.parse(existing.response_data) as SendResult;
       }
+      this.db.reserveOutgoingDelivery(idempotencyKey, 'whatsapp_send', topPayloadHash);
     }
 
     const sock = this.getSocket();
@@ -348,7 +353,7 @@ export class WhatsAppSender {
     };
 
     if (idempotencyKey) {
-      this.db.recordIdempotency(
+      this.db.completeOutgoingDelivery(
         idempotencyKey,
         'whatsapp_send',
         topPayloadHash,

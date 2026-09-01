@@ -21,6 +21,14 @@ interface StatusDatabaseSnapshot {
   lastError?: { source: string; message: string; createdAt: number };
 }
 
+function parseFiniteTimestamp(value: unknown): number | undefined {
+  if (value === null || value === undefined || value === '') return undefined;
+  const num = Number(value);
+  if (!Number.isFinite(num)) return undefined;
+  const time = new Date(num).getTime();
+  return Number.isFinite(time) ? num : undefined;
+}
+
 async function readStatusDatabase(sqliteFile: string): Promise<StatusDatabaseSnapshot | null> {
   return await inspectReadOnlyDatabase(sqliteFile, (database) => {
     const state = (key: string) => {
@@ -53,21 +61,24 @@ async function readStatusDatabase(sqliteFile: string): Promise<StatusDatabaseSna
     } catch {
       // Table missing or corrupt
     }
+
+    const lastActivityTime = parseFiniteTimestamp(state('last_activity_time'));
+    const nextRunAt = parseFiniteTimestamp(next?.next_run_at);
+    const lastErrorCreatedAt = parseFiniteTimestamp(lastError?.created_at);
+
     return {
       approximateTokens: Number(state('approximate_tokens') || 0),
-      ...(Number.isFinite(Number(state('last_activity_time')))
-        ? { lastActivityTime: Number(state('last_activity_time')) }
-        : {}),
+      ...(lastActivityTime !== undefined ? { lastActivityTime } : {}),
       agentBusy: state('main_agent_busy') === 'true',
       runningWorkers: count("SELECT COUNT(*) AS count FROM worker_jobs WHERE status = 'running'"),
       queuedWorkers: count("SELECT COUNT(*) AS count FROM worker_jobs WHERE status = 'queued'"),
       enabledAutomations: count('SELECT COUNT(*) AS count FROM automations WHERE enabled = 1'),
       totalAutomations: count('SELECT COUNT(*) AS count FROM automations'),
-      ...(next?.name && typeof next.next_run_at === 'number'
-        ? { nextAutomation: { name: next.name, nextRunAt: next.next_run_at } }
+      ...(next?.name && nextRunAt !== undefined
+        ? { nextAutomation: { name: next.name, nextRunAt } }
         : {}),
-      ...(lastError?.source && lastError.message && typeof lastError.created_at === 'number'
-        ? { lastError: { source: lastError.source, message: lastError.message, createdAt: lastError.created_at } }
+      ...(lastError?.source && lastError.message && lastErrorCreatedAt !== undefined
+        ? { lastError: { source: lastError.source, message: lastError.message, createdAt: lastErrorCreatedAt } }
         : {}),
     };
   });

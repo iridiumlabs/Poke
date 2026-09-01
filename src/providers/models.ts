@@ -20,7 +20,7 @@ export const COMMAND_CODE_PROVIDER_ID = 'commandcode';
 const REASONING_EFFORTS = new Set<ReasoningEffort>(['low', 'medium', 'high', 'xhigh', 'max']);
 
 export function createCommandCodeCredentialProvider(): Provider<'openai-completions'> {
-  return createProvider({
+  const provider = createProvider({
     id: COMMAND_CODE_PROVIDER_ID,
     name: 'Command Code',
     baseUrl: 'https://api.commandcode.ai/provider/v1',
@@ -39,6 +39,13 @@ export function createCommandCodeCredentialProvider(): Provider<'openai-completi
     models: [],
     api: openAICompletionsApi(),
   }) as unknown as Provider<'openai-completions'>;
+
+  (provider as any)[Symbol.for('flue.dynamicModelTemplate')] = {
+    api: 'openai-completions',
+    baseUrl: 'https://api.commandcode.ai/provider/v1',
+  };
+
+  return provider;
 }
 
 /** The one app-owned pi-ai collection. OAuth refreshes use this locked store. */

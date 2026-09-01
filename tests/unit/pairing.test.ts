@@ -201,4 +201,35 @@ describe('WhatsAppPairingService', () => {
     expect(saveCompleted).toBe(true);
     expect(fs.readFileSync(path.join(paths.whatsappDir, 'creds.json'), 'utf8')).toBe('persisted-creds');
   });
+
+  it('aborts staged swap and propagates error when credential saving fails', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'poke-pairing-'));
+    directories.push(home);
+    const paths = resolvePokePaths(home);
+    fs.mkdirSync(paths.whatsappDir, { recursive: true });
+    fs.writeFileSync(path.join(paths.whatsappDir, 'old-creds.json'), 'old');
+    const socket = new FakeSocket();
+
+    const service = new WhatsAppPairingService(paths, {
+      async create() {
+        return {
+          socket,
+          saveCreds: async () => {
+            throw new Error('Disk full: ENOSPC');
+          },
+        };
+      },
+    });
+
+    const pairPromise = service.pair({ method: { type: 'qr' } });
+
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    socket.ev.emit('creds.update', {});
+    socket.ev.emit('connection.update', { connection: 'open' });
+
+    await expect(pairPromise).rejects.toThrow('Disk full: ENOSPC');
+    expect(fs.readFileSync(path.join(paths.whatsappDir, 'old-creds.json'), 'utf8')).toBe('old');
+    expect(fs.readdirSync(home)).toEqual(['whatsapp']);
+  });
 });
