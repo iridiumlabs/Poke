@@ -157,6 +157,49 @@ describe('WhatsApp Gateway & Sender', () => {
     expect(res2.messageId).toBe(res1.messageId);
   });
 
+  it('redacts credentials from direct operational WhatsApp errors', async () => {
+    const mockSocket = {
+      sendMessage: vi.fn().mockResolvedValue({ key: { id: 'sent-error' } }),
+    };
+    const sender = new WhatsAppSender(
+      () => mockSocket,
+      '923001234567@s.whatsapp.net',
+      db,
+      new DeepgramHandler(undefined, tempDir)
+    );
+    const secret = 'super-secret-token-value';
+
+    await sender.sendDirectError(`Authorization: Bearer ${secret}`);
+
+    expect(mockSocket.sendMessage).toHaveBeenCalledWith(
+      '923001234567@s.whatsapp.net',
+      { text: expect.not.stringContaining(secret) }
+    );
+    expect(mockSocket.sendMessage.mock.calls[0][1].text).toContain('Bearer [REDACTED]');
+  });
+
+  it('does not replay a delivery whose transport outcome is unknown', async () => {
+    const mockSocket = {
+      sendMessage: vi.fn().mockRejectedValue(new Error('Connection dropped while sending')),
+    };
+    const sender = new WhatsAppSender(
+      () => mockSocket,
+      '923001234567@s.whatsapp.net',
+      db,
+      new DeepgramHandler(undefined, tempDir)
+    );
+
+    await expect(sender.send({ mode: 'message', text: 'Never duplicate this' }, 'ambiguous-send')).rejects.toThrow(
+      'Connection dropped while sending'
+    );
+    expect(db.getOutgoingDelivery('ambiguous-send:part:0')).toMatchObject({ status: 'pending' });
+
+    await expect(sender.send({ mode: 'message', text: 'Never duplicate this' }, 'ambiguous-send')).rejects.toThrow(
+      'outcome is unknown'
+    );
+    expect(mockSocket.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
   it('formats inbound media attachments with standardized metadata block per POKE.md §5.2', async () => {
     const { formatInboundMessageText } = await import('../../src/gateway/whatsapp.js');
 
@@ -179,7 +222,59 @@ describe('WhatsApp Gateway & Sender', () => {
     expect(result).toContain('message_id: ABC123');
   });
 
-  it('targets Deepgram Aura-2 /v1/speak API for TTS synthesis', async () => {
+  it('marks normalized voice transcripts for the main agent', async () => {
+    const { formatVoiceTranscript } = await import('../../src/gateway/whatsapp.js');
+
+    expect(formatVoiceTranscript('  Please summarize this.  ')).toBe('[voice] Please summarize this.');
+  });
+
+  it('reports an audio download failure without dispatching an empty message', async () => {
+    const dispatch = vi.fn();
+    const gateway = new WhatsAppGateway(
+      config,
+      db,
+      dispatch,
+      async () => {},
+      tempDir,
+      { downloadMedia: vi.fn().mockRejectedValue(new Error('download failed')) }
+    );
+    const report = vi.spyOn(gateway.getSender(), 'sendDirectError').mockResolvedValue();
+
+    await gateway.handleIncomingMessage({
+      key: { remoteJid: '923001234567@s.whatsapp.net', id: 'audio-download-failed' },
+      message: { audioMessage: { ptt: true, mimetype: 'audio/ogg' } },
+    });
+
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(report).toHaveBeenCalledWith('Poke could not download the audio message. Please send it again.');
+  });
+
+  it('prefixes a successfully transcribed voice note before dispatching it', async () => {
+    const dispatch = vi.fn();
+    const gateway = new WhatsAppGateway(
+      config,
+      db,
+      dispatch,
+      async () => {},
+      tempDir,
+      { downloadMedia: vi.fn().mockResolvedValue(Buffer.from('audio')) }
+    );
+    (gateway as any).deepgram = {
+      transcribe: vi.fn().mockResolvedValue('Please summarize this.'),
+    };
+
+    await gateway.handleIncomingMessage({
+      key: { remoteJid: '923001234567@s.whatsapp.net', id: 'voice-transcribed' },
+      message: { audioMessage: { ptt: true, mimetype: 'audio/ogg' } },
+    });
+
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({
+      isVoice: true,
+      text: expect.stringContaining('[voice] Please summarize this.'),
+    }));
+  });
+
+  it('targets Deepgram Flux /v2/speak API for WhatsApp-compatible TTS synthesis', async () => {
     const dg = new DeepgramHandler('test-api-key', tempDir);
 
     let requestedUrl = '';
@@ -194,10 +289,11 @@ describe('WhatsApp Gateway & Sender', () => {
     });
 
     try {
-      const res = await dg.synthesizeToAudioFile('Hello from Deepgram Aura-2');
-      expect(requestedUrl).toContain('https://api.deepgram.com/v1/speak');
-      expect(requestedUrl).toContain('model=aura-2-thalia-en');
+      const res = await dg.synthesizeToAudioFile('Hello from Deepgram Flux');
+      expect(requestedUrl).toContain('https://api.deepgram.com/v2/speak');
+      expect(requestedUrl).toContain('model=flux-alexis-en');
       expect(requestedUrl).toContain('encoding=opus');
+      expect(requestedUrl).toContain('container=ogg');
       expect(res.mimeType).toContain('audio/ogg');
       expect(fs.existsSync(res.audioPath)).toBe(true);
     } finally {
@@ -382,7 +478,7 @@ describe('WhatsApp Gateway & Sender', () => {
     expect((gateway as any).isConnecting).toBe(false);
   });
 
-  it('persists progress before sending next WhatsApp part and does not resend completed parts on retry', async () => {
+  it('persists completed parts and refuses to replay an ambiguous later part', async () => {
     let callCount = 0;
     const mockSocket = {
       sendMessage: vi.fn().mockImplementation(async (_jid: string, content: any) => {
@@ -417,12 +513,13 @@ describe('WhatsApp Gateway & Sender', () => {
     // Top-level key is not recorded yet
     expect(db.checkIdempotency(idempotencyKey)).toBeNull();
 
-    // Second attempt (retry with same idempotency key) should skip part 0 and only send part 1
-    const res = await sender.send({ mode: 'message', text: longText }, idempotencyKey);
-    expect(mockSocket.sendMessage).toHaveBeenCalledTimes(3); // Called once more for part 1 only!
-    expect(db.checkIdempotency(`${idempotencyKey}:part:1`)).not.toBeNull();
-    expect(db.checkIdempotency(idempotencyKey)).not.toBeNull();
-    expect(res.messageId).toBe('sent-part-3');
+    expect(db.getOutgoingDelivery(`${idempotencyKey}:part:1`)).toMatchObject({ status: 'pending' });
+
+    await expect(sender.send({ mode: 'message', text: longText }, idempotencyKey)).rejects.toThrow(
+      'outcome is unknown'
+    );
+    expect(mockSocket.sendMessage).toHaveBeenCalledTimes(2);
+    expect(db.checkIdempotency(idempotencyKey)).toBeNull();
   });
 
   it('handles rejection from reconnect timer start() without unhandled rejection and reschedules reconnect', async () => {
@@ -505,7 +602,7 @@ describe('WhatsApp Gateway & Sender', () => {
     expect(res.mode).toBe('voice');
   });
 
-  it('treats part idempotency payload hash mismatch as a cache miss on retry with altered content', async () => {
+  it('rejects reuse of a part idempotency key with altered content', async () => {
     let callCount = 0;
     const mockSocket = {
       sendMessage: vi.fn().mockImplementation(async () => {
@@ -531,11 +628,9 @@ describe('WhatsApp Gateway & Sender', () => {
       JSON.stringify({ messageId: 'old-cached-id' })
     );
 
-    // Send with new content using same part key
-    const res = await sender.send({ mode: 'message', text: 'Brand new text content' }, idempotencyKey);
-    // Because hash mismatched, it should NOT reuse the old part, but invoke sendMessage
-    expect(mockSocket.sendMessage).toHaveBeenCalledTimes(1);
-    expect(res.messageId).toBe('sent-part-1');
+    await expect(sender.send({ mode: 'message', text: 'Brand new text content' }, idempotencyKey)).rejects.toThrow(
+      'different content'
+    );
+    expect(mockSocket.sendMessage).not.toHaveBeenCalled();
   });
 });
-

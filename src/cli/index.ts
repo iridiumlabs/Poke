@@ -10,8 +10,6 @@ import {
   runStart,
   runStop,
   runRestart,
-  installSystemdService,
-  uninstallSystemdService,
 } from './lifecycle.js';
 
 export function createCli(): Command {
@@ -75,24 +73,6 @@ export function createCli(): Command {
     .option('-f, --foreground', 'Run in foreground after restart')
     .action(async (options) => {
       await runRestart(options);
-    });
-
-  const serviceCmd = program
-    .command('service')
-    .description('Manage systemd user service on Ubuntu VPS');
-
-  serviceCmd
-    .command('install')
-    .description('Install and enable poke.service as a systemd user service')
-    .action(() => {
-      installSystemdService();
-    });
-
-  serviceCmd
-    .command('uninstall')
-    .description('Stop, disable, and remove poke.service')
-    .action(() => {
-      uninstallSystemdService();
     });
 
   program

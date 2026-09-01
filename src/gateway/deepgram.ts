@@ -45,8 +45,7 @@ export class DeepgramHandler {
       });
 
       if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        const err = new Error(`Deepgram STT returned ${res.status}: ${text}`);
+        const err = new Error(`Deepgram STT returned ${res.status}.`);
         (err as any).status = res.status;
         (err as any).headers = res.headers;
         throw err;
@@ -66,15 +65,15 @@ export class DeepgramHandler {
     }
 
     const logger = getLogger();
-    logger.info('Synthesizing speech via Deepgram Aura-2 TTS');
+    logger.info('Synthesizing speech via Deepgram Flux TTS');
 
     const paths = resolvePokePaths(this.customHome);
     const filename = `tts-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.ogg`;
     const outputPath = path.join(paths.outboxDir, filename);
 
     return await withProviderRetry(async () => {
-      const url = new URL('https://api.deepgram.com/v1/speak');
-      url.searchParams.set('model', 'aura-2-thalia-en');
+      const url = new URL('https://api.deepgram.com/v2/speak');
+      url.searchParams.set('model', 'flux-alexis-en');
       url.searchParams.set('encoding', 'opus');
       url.searchParams.set('container', 'ogg');
 
@@ -89,8 +88,7 @@ export class DeepgramHandler {
       });
 
       if (!res.ok) {
-        const errText = await res.text().catch(() => '');
-        const err = new Error(`Deepgram TTS returned ${res.status}: ${errText}`);
+        const err = new Error(`Deepgram TTS returned ${res.status}.`);
         (err as any).status = res.status;
         (err as any).headers = res.headers;
         throw err;

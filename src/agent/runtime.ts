@@ -16,6 +16,8 @@ import { CompactionManager } from '../context/compaction-manager.js';
 import { getLogger } from '../logger/logger.js';
 import { resolvePokePaths, ensurePokeDirectories } from '../config/paths.js';
 import { registerAllProviders, ProviderRegistry } from '../providers/provider-registry.js';
+import { FileCredentialStore } from '../providers/credential-store.js';
+import { migrateLegacyProviderCredentials } from '../providers/credentials-migration.js';
 
 export const MAIN_AGENT_INSTANCE_ID = 'owner';
 
@@ -51,16 +53,26 @@ export class PokeRuntime {
       const paths = resolvePokePaths(this.customHome);
       ensurePokeDirectories(paths);
 
-      // Register all AI model providers (Command Code, Fireworks, Codex)
-      registerAllProviders();
+      const credentialStore = new FileCredentialStore(paths.credentialsFile);
+      await migrateLegacyProviderCredentials(this.configManager, credentialStore);
+      const providerRegistry = new ProviderRegistry(credentialStore);
+
+      // Register adapters whose request-time auth resolves from Poke's store.
+      registerAllProviders(providerRegistry.models);
 
       const creds = this.configManager.getCredentials();
       const mainModel = this.configManager.getMainModel();
-      if (mainModel) {
-        const validation = await ProviderRegistry.validateSelection(mainModel, creds);
-        if (!validation.valid) {
-          throw new Error(`Invalid main model configuration: ${validation.error}`);
-        }
+      const workerModel = this.configManager.getWorkerModel();
+      if (!mainModel || !workerModel) {
+        throw new Error('Both main and worker models must be configured. Run `poke model` and `poke model worker`.');
+      }
+      const mainValidation = await providerRegistry.validateSelection(mainModel);
+      if (!mainValidation.valid) {
+        throw new Error(`Invalid main model configuration: ${mainValidation.error}`);
+      }
+      const workerValidation = await providerRegistry.validateSelection(workerModel);
+      if (!workerValidation.valid) {
+        throw new Error(`Invalid worker model configuration: ${workerValidation.error}`);
       }
 
       const toolContexts = {
@@ -81,13 +93,10 @@ export class PokeRuntime {
       // Seed default skills
       this.skills.seedDefaultSkills();
 
-      // Prepare runtime environment forwarding system env + configured credentials
+      // Provider credentials remain behind request-time auth resolvers. Service
+      // integrations receive only the keys they directly own.
       const runtimeEnv: Record<string, string | undefined> = {
         ...process.env,
-        COMMANDCODE_API_KEY: creds.commandCodeApiKey || process.env.COMMANDCODE_API_KEY,
-        FIREWORKS_API_KEY: creds.fireworksApiKey || process.env.FIREWORKS_API_KEY,
-        OPENAI_API_KEY: creds.codexAuth?.accessToken || process.env.OPENAI_API_KEY,
-        OPENAI_CODEX_ACCESS_TOKEN: creds.codexAuth?.accessToken || process.env.OPENAI_CODEX_ACCESS_TOKEN,
         EXA_API_KEY: creds.exaApiKey || process.env.EXA_API_KEY,
         DEEPGRAM_API_KEY: creds.deepgramApiKey || process.env.DEEPGRAM_API_KEY,
         SUPERMEMORY_API_KEY: creds.supermemoryApiKey || process.env.SUPERMEMORY_API_KEY,
@@ -158,13 +167,24 @@ export class PokeRuntime {
     }
   }
 
-  async dispatchUserMessage(body: string, attachments: any[] = []): Promise<DispatchReceipt> {
+  async dispatchUserMessage(
+    body: string,
+    attachments: any[] = [],
+    whatsappMessageId?: string
+  ): Promise<DispatchReceipt> {
     if (!this.agentHandle) {
       throw new Error('Poke runtime is not started.');
     }
 
     const logger = getLogger();
-    logger.info({ bodyPreview: body.slice(0, 80) }, 'Dispatching user message to main agent');
+    logger.info(
+      {
+        ...(whatsappMessageId ? { whatsappMessageId } : {}),
+        inputLength: body.length,
+        attachmentCount: attachments.length,
+      },
+      'Dispatching user message to main agent'
+    );
 
     // Token accounting
     this.compactionManager.recordActivity(Math.ceil(body.length / 4));
@@ -222,7 +242,7 @@ export class PokeRuntime {
     }
 
     const logger = getLogger();
-    logger.info({ type, signalPreview: signalBody.slice(0, 80) }, 'Dispatching signal to main agent');
+    logger.info({ type, signalLength: signalBody.length }, 'Dispatching signal to main agent');
 
     this.compactionManager.recordActivity(Math.ceil(signalBody.length / 4));
 

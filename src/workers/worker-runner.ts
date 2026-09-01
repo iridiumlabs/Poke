@@ -51,9 +51,9 @@ export class WorkerRunner {
         return { status: 'aborted' };
       }
 
-      const workerModel = this.configManager.getWorkerModel() || this.configManager.getMainModel();
+      const workerModel = this.configManager.getWorkerModel();
       if (!workerModel) {
-        throw new Error('No worker or main model configured. Run `poke model worker` or `poke model`.');
+        throw new Error('No worker model configured. Run `poke model worker`.');
       }
 
       // A durable receipt may be read again safely, but dispatching it again can repeat tool calls.

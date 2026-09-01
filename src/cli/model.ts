@@ -1,121 +1,108 @@
-import readline from 'readline';
 import { ConfigManager } from '../config/config.js';
-import { ProviderRegistry } from '../providers/provider-registry.js';
-import { ProviderType, ReasoningEffort } from '../config/types.js';
+import type { ModelInfo, ModelSelection, ProviderType, ReasoningEffort } from '../config/types.js';
+import { FileCredentialStore } from '../providers/credential-store.js';
+import { migrateLegacyProviderCredentials } from '../providers/credentials-migration.js';
+import { ProviderRegistry, type ProviderCatalog } from '../providers/provider-registry.js';
+import { redactSecrets } from '../logger/logger.js';
+import { CliCancelledError, createCliUi, type CliUi } from './ui.js';
 
-function promptQuestion(rl: readline.Interface, query: string): Promise<string> {
-  return new Promise((resolve) => {
-    rl.question(query, (answer) => {
-      resolve(answer.trim());
-    });
-  });
+const PROVIDER_CHOICES: ReadonlyArray<{ value: ProviderType; name: string; description: string }> = [
+  { value: 'commandcode', name: 'Command Code', description: 'Provider API' },
+  { value: 'fireworks', name: 'Fireworks AI', description: 'Live account catalog' },
+  { value: 'codex', name: 'Codex', description: 'ChatGPT/Codex OAuth' },
+];
+
+function describeSelection(selection?: ModelSelection): string {
+  if (!selection) return 'Not configured';
+  return `${selection.provider} / ${selection.model} (reasoning: ${selection.reasoningEffort || 'default'})`;
+}
+
+function modelChoices(models: readonly ModelInfo[]) {
+  return models.map((model) => ({
+    value: model.id,
+    name: model.name || model.id,
+    description:
+      model.capabilities.reasoningEfforts.length > 0
+        ? `Reasoning: ${model.capabilities.reasoningEfforts.join(', ')}`
+        : 'Provider default reasoning',
+  }));
 }
 
 export async function runModelSelection(
   target: 'main' | 'worker' = 'main',
   customHome?: string,
-  inputRl?: readline.Interface
+  ui: CliUi = createCliUi(),
+  catalog?: ProviderCatalog
 ): Promise<void> {
-  const rl =
-    inputRl ||
-    readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
+  const config = new ConfigManager(customHome);
+  const credentials = new FileCredentialStore(config.getPaths().credentialsFile);
+  await migrateLegacyProviderCredentials(config, credentials);
+  const registry = catalog || new ProviderRegistry(credentials);
+  const current = target === 'worker' ? config.getWorkerModel() : config.getMainModel();
 
-  const configManager = new ConfigManager(customHome);
-  const currentSelection =
-    target === 'worker' ? configManager.getWorkerModel() : configManager.getMainModel();
-
-  console.log(`\n--- Configure ${target.toUpperCase()} Model ---`);
-  if (currentSelection) {
-    console.log(
-      `Current: ${currentSelection.provider} / ${currentSelection.model} (reasoning: ${currentSelection.reasoningEffort || 'default'})\n`
-    );
-  } else {
-    console.log('Current: None configured\n');
-  }
+  ui.note(`Configure ${target} model`);
+  ui.note(`Current: ${describeSelection(current)}`);
 
   try {
-    // 1. Choose Provider
-    console.log('Select Provider:');
-    console.log('1. Command Code');
-    console.log('2. Fireworks AI');
-    console.log('3. Codex');
-
-    const provChoice = await promptQuestion(rl, 'Choice [1-3]: ');
-    let provider: ProviderType = 'commandcode';
-    if (provChoice === '2' || provChoice.toLowerCase().includes('fireworks')) {
-      provider = 'fireworks';
-    } else if (provChoice === '3' || provChoice.toLowerCase().includes('codex')) {
-      provider = 'codex';
-    }
-
-    // 2. Fetch Live Models
-    console.log(`\nFetching live models from ${provider}...`);
-    const creds = configManager.getCredentials();
-    const models = await ProviderRegistry.fetchModels(provider, creds);
-
-    if (models.length === 0) {
-      console.log('No models returned from provider.');
-      return;
-    }
-
-    console.log('\nAvailable Models:');
-    models.forEach((m, idx) => {
-      const reasoningNote =
-        m.capabilities.reasoningEfforts.length > 0
-          ? `[reasoning: ${m.capabilities.reasoningEfforts.join('/')}]`
-          : '';
-      console.log(`${idx + 1}. ${m.id} ${reasoningNote}`);
-    });
-
-    const modelIdxInput = await promptQuestion(rl, `\nSelect model [1-${models.length}]: `);
-    const modelIdx = parseInt(modelIdxInput, 10) - 1;
-    if (isNaN(modelIdx) || modelIdx < 0 || modelIdx >= models.length) {
-      console.log('Invalid model selection.');
-      return;
-    }
-
-    const selectedModel = models[modelIdx];
-
-    // 3. Reasoning Effort (only shown if model has selectable levels)
-    let selectedEffort: ReasoningEffort | undefined;
-    const availableEfforts = selectedModel.capabilities.reasoningEfforts;
-
-    if (availableEfforts.length > 0) {
-      console.log(`\nSelect Reasoning Effort for ${selectedModel.id}:`);
-      console.log('0. Default (none)');
-      availableEfforts.forEach((eff, idx) => {
-        console.log(`${idx + 1}. ${eff}`);
-      });
-
-      const effortInput = await promptQuestion(rl, `Choice [0-${availableEfforts.length}]: `);
-      const effortIdx = parseInt(effortInput, 10);
-      if (effortIdx > 0 && effortIdx <= availableEfforts.length) {
-        selectedEffort = availableEfforts[effortIdx - 1];
+    while (true) {
+      const provider = await ui.select('Choose a provider', PROVIDER_CHOICES, current?.provider);
+      let models: ModelInfo[];
+      try {
+        models = await ui.spinner(`Fetching ${provider} models…`, () => registry.fetchModels(provider));
+      } catch (error: unknown) {
+        ui.error(error instanceof Error ? redactSecrets(error.message) : 'Unable to fetch models.');
+        if (await ui.confirm('Choose a different provider?', true)) continue;
+        return;
       }
-    }
 
-    // 4. Save Validated Selection
-    const selection = {
-      provider,
-      model: selectedModel.id,
-      reasoningEffort: selectedEffort,
-    };
+      if (models.length === 0) {
+        ui.error(`${provider} returned no available models.`);
+        if (await ui.confirm('Choose a different provider?', true)) continue;
+        return;
+      }
 
-    if (target === 'worker') {
-      configManager.setWorkerModel(selection);
-      console.log(`\n✓ Worker model set to: ${provider}/${selectedModel.id} (reasoning: ${selectedEffort || 'default'})\n`);
-    } else {
-      configManager.setMainModel(selection);
-      console.log(`\n✓ Main agent model set to: ${provider}/${selectedModel.id} (reasoning: ${selectedEffort || 'default'})\n`);
+      const modelId = await ui.select('Choose a model', modelChoices(models));
+      const model = models.find((candidate) => candidate.id === modelId);
+      if (!model) {
+        ui.error('That model is no longer available.');
+        continue;
+      }
+
+      let reasoningEffort: ReasoningEffort | undefined;
+      if (model.capabilities.reasoningEfforts.length > 0) {
+        const selected = await ui.select(
+          'Choose reasoning effort',
+          [
+            { value: 'default', name: 'Provider default' },
+            ...model.capabilities.reasoningEfforts.map((value) => ({ value, name: value })),
+          ],
+          current?.provider === provider && current.model === model.id
+            ? current.reasoningEffort || 'default'
+            : 'default'
+        );
+        reasoningEffort = selected === 'default' ? undefined : selected;
+      }
+
+      const selection: ModelSelection = { provider, model: model.id, reasoningEffort };
+      const validation = await ui.spinner('Validating selection…', () => registry.validateSelection(selection));
+      if (!validation.valid) {
+        ui.error(redactSecrets(validation.error || 'The selected model is no longer valid.'));
+        continue;
+      }
+
+      if (target === 'main') {
+        config.setMainModel(selection);
+      } else {
+        config.setWorkerModel(selection);
+      }
+      ui.success(`${target === 'main' ? 'Main' : 'Worker'} model set to ${describeSelection(selection)}.`);
+      return;
     }
-  } catch (err: any) {
-    console.error(`\n✗ Error configuring model: ${err.message}\n`);
-  } finally {
-    if (!inputRl) {
-      rl.close();
+  } catch (error: unknown) {
+    if (error instanceof CliCancelledError) {
+      ui.warning('Model selection cancelled. The previous selection was kept.');
+      return;
     }
+    throw error;
   }
 }

@@ -1,79 +1,112 @@
-import readline from 'readline';
-import { ConfigManager, normalizePhoneNumber } from '../config/config.js';
-import { promptQuestion, promptSecret } from './prompt.js';
+import { ConfigManager } from '../config/config.js';
+import type { ServiceCredentials } from '../config/types.js';
+import { normalizeE164PhoneNumber } from '../gateway/pairing.js';
+import { redactSecrets } from '../logger/logger.js';
+import {
+  REQUIRED_SERVICES,
+  validateServiceCredential,
+  type ServiceCredentialKey,
+} from '../services/health.js';
+import { runInteractiveWhatsAppPairing, type PairingCliDependencies } from './pairing.js';
+import { CliCancelledError, createCliUi, type CliUi } from './ui.js';
 
-export async function runSetup(customHome?: string, inputRl?: readline.Interface): Promise<void> {
-  const rl =
-    inputRl ||
-    readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
+interface SetupService {
+  name: string;
+  key: ServiceCredentialKey;
+}
 
-  const configManager = new ConfigManager(customHome);
+const SETUP_SERVICES: readonly SetupService[] = REQUIRED_SERVICES;
 
-  console.log('\n--- Poke Setup ---\n');
-  console.log('Timezone: Asia/Karachi (fixed default)\n');
+export interface SetupDependencies {
+  pairing?: PairingCliDependencies;
+  validateService?: (service: ServiceCredentialKey, apiKey: string) => Promise<void>;
+}
+
+async function configureService(
+  config: ConfigManager,
+  ui: CliUi,
+  service: SetupService,
+  validate: (service: ServiceCredentialKey, apiKey: string) => Promise<void>
+): Promise<void> {
+  const existing = config.getCredentials()[service.key];
+  if (existing && (await ui.confirm(`Keep the existing ${service.name} API key?`, true))) {
+    ui.success(`${service.name} remains configured.`);
+    return;
+  }
+
+  while (true) {
+    const apiKey = (await ui.secret({ message: `${service.name} API key`, required: true })).trim();
+    if (!apiKey) {
+      ui.error(`${service.name} is required for Poke setup.`);
+      continue;
+    }
+
+    try {
+      await ui.spinner(`Validating ${service.name}…`, () => validate(service.key, apiKey));
+      config.updateCredentials({ [service.key]: apiKey } as Partial<ServiceCredentials>);
+      ui.success(`${service.name} configured.`);
+      return;
+    } catch (error: unknown) {
+      ui.error(
+        `${service.name} validation failed: ${error instanceof Error ? redactSecrets(error.message) : 'Unknown error.'}`
+      );
+    }
+  }
+}
+
+export async function runSetup(
+  customHome?: string,
+  ui: CliUi = createCliUi(),
+  dependencies: SetupDependencies = {}
+): Promise<void> {
+  const config = new ConfigManager(customHome);
+  ui.note('Poke setup');
+  ui.note('Timezone: Asia/Karachi');
 
   try {
-    // 1. Owner Phone Number
-    let ownerPhone = configManager.getOwnerPhoneNumber() || '';
-    const phonePrompt = ownerPhone ? `Owner phone number [${ownerPhone}]: ` : 'Owner phone number (e.g. +923001234567): ';
-    const inputPhone = await promptQuestion(rl, phonePrompt);
-    if (inputPhone) {
-      ownerPhone = normalizePhoneNumber(inputPhone);
-      configManager.setOwnerPhoneNumber(ownerPhone);
-      console.log(`✓ Owner phone saved as: ${ownerPhone}`);
+    // Setup is deliberately WhatsApp-first. Existing completed state is
+    // resumable without making the owner pair again.
+    if (!config.getWhatsAppAccount()) {
+      const paired = await runInteractiveWhatsAppPairing(config, customHome, ui, dependencies.pairing);
+      if (!paired) return;
+    } else {
+      ui.note(`WhatsApp already paired as ${config.getWhatsAppAccount()}.`);
+      if (await ui.confirm('Pair a different WhatsApp account?', false)) {
+        const paired = await runInteractiveWhatsAppPairing(config, customHome, ui, dependencies.pairing);
+        if (!paired) return;
+      }
     }
 
-    // 2. Service Keys
-    console.log('\nConfigure External Services:\n');
-    const existingCreds = configManager.getCredentials();
-
-    // Composio
-    const compPrompt = existingCreds.composioApiKey
-      ? 'Composio API key [already set, press enter to keep]: '
-      : 'Composio API key (optional, press enter to skip): ';
-    const composioKey = await promptSecret(rl, compPrompt, true);
-    if (composioKey) {
-      configManager.updateCredentials({ composioApiKey: composioKey });
-      console.log('✓ Composio API key updated');
+    while (true) {
+      const ownerRaw = await ui.text({
+        message: 'Personal owner number in E.164 format',
+        default: config.getOwnerPhoneNumber() ? `+${config.getOwnerPhoneNumber()}` : undefined,
+        required: true,
+      });
+      try {
+        const owner = normalizeE164PhoneNumber(ownerRaw);
+        if (owner === config.getWhatsAppAccount()) {
+          throw new Error('The owner number must be different from Poke’s paired WhatsApp account.');
+        }
+        config.setOwnerPhoneNumber(owner);
+        ui.success(`Owner number saved as ${owner}.`);
+        break;
+      } catch (error: unknown) {
+        ui.error(error instanceof Error ? error.message : 'Enter a valid owner number.');
+      }
     }
 
-    // Supermemory
-    const superPrompt = existingCreds.supermemoryApiKey
-      ? 'Supermemory API key [already set, press enter to keep]: '
-      : 'Supermemory API key (optional, press enter to skip): ';
-    const superKey = await promptSecret(rl, superPrompt, true);
-    if (superKey) {
-      configManager.updateCredentials({ supermemoryApiKey: superKey });
-      console.log('✓ Supermemory API key updated');
+    const validate = dependencies.validateService || validateServiceCredential;
+    for (const service of SETUP_SERVICES) {
+      await configureService(config, ui, service, validate);
     }
 
-    // Exa
-    const exaPrompt = existingCreds.exaApiKey
-      ? 'Exa API key [already set, press enter to keep]: '
-      : 'Exa API key (for web search/fetch): ';
-    const exaKey = await promptSecret(rl, exaPrompt, true);
-    if (exaKey) {
-      configManager.updateCredentials({ exaApiKey: exaKey });
-      console.log('✓ Exa API key updated');
+    ui.success('Setup complete. Next run `poke login`, `poke model`, and `poke model worker`.');
+  } catch (error: unknown) {
+    if (error instanceof CliCancelledError) {
+      ui.warning('Setup cancelled. Completed steps were kept.');
+      return;
     }
-
-    // Deepgram
-    const dgPrompt = existingCreds.deepgramApiKey
-      ? 'Deepgram API key [already set, press enter to keep]: '
-      : 'Deepgram API key (for voice notes STT & TTS): ';
-    const dgKey = await promptSecret(rl, dgPrompt, true);
-    if (dgKey) {
-      configManager.updateCredentials({ deepgramApiKey: dgKey });
-      console.log('✓ Deepgram API key updated');
-    }
-
-    console.log('\n✓ Setup complete. Run `poke login` to authenticate an AI model provider.\n');
-  } finally {
-    if (!inputRl) {
-      rl.close();
-    }
+    throw error;
   }
 }

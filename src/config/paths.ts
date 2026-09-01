@@ -19,6 +19,8 @@ export function getSkillsHome(): string {
 export interface PokePaths {
   root: string;
   configFile: string;
+  credentialsFile: string;
+  runtimeStatusFile: string;
   sqliteFile: string;
   whatsappDir: string;
   inboxDir: string;
@@ -37,6 +39,8 @@ export function resolvePokePaths(customHome?: string): PokePaths {
   return {
     root,
     configFile: path.join(root, 'config.json'),
+    credentialsFile: path.join(root, 'credentials.json'),
+    runtimeStatusFile: path.join(root, 'runtime-status.json'),
     sqliteFile: path.join(root, 'state.sqlite'),
     whatsappDir: path.join(root, 'whatsapp'),
     inboxDir: path.join(root, 'inbox'),

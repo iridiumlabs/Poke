@@ -10,6 +10,8 @@ import { AutomationScheduler } from '../scheduler/scheduler.js';
 import { SkillRegistry } from '../skills/registry.js';
 import { ConfigManager } from '../config/config.js';
 
+const CONDITIONAL_CAPABILITIES = new Set(['automations']);
+
 export interface ToolContexts {
   sender: WhatsAppSender;
   exa: ExaToolHandler;
@@ -212,6 +214,9 @@ export function createPokeTools(ctx: ToolContexts) {
       capability: v.string(),
     }),
     run: async ({ data }) => {
+      if (!CONDITIONAL_CAPABILITIES.has(data.capability)) {
+        throw new Error(`Unknown conditional capability "${data.capability}".`);
+      }
       ctx.configManager.addActiveCapability(data.capability);
       return JSON.stringify({
         success: true,

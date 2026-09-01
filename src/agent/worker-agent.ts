@@ -8,6 +8,7 @@ import {
 import { local } from "@flue/runtime/node";
 import { createPokeTools, ToolContexts } from "./tools.js";
 import { resolveFlueModelSpecifier } from "../providers/provider-registry.js";
+import { createPokeSandboxEnvironment } from './sandbox-env.js';
 
 export const WORKER_AGENT_SYSTEM_PROMPT = `You are a background worker agent for Poke running on a private Ubuntu host.
 
@@ -32,7 +33,7 @@ export function PokeWorkerAgent() {
   }
 
   const config = sharedWorkerContexts.configManager.loadConfig();
-  const workerModel = config.workerModel || config.mainModel;
+  const workerModel = config.workerModel;
 
   const modelSpecifier = resolveFlueModelSpecifier(workerModel);
   const thinkingLevel = workerModel?.reasoningEffort as any;
@@ -44,10 +45,11 @@ export function PokeWorkerAgent() {
 
   const initialData = useInitialData<{ cwd?: string }>();
 
-  // 2. Attach local host sandbox with Flue's shell-essential environment allowlist and job cwd
+  // 2. Attach local host sandbox and job cwd without exposing Poke credentials.
   useSandbox(
     local({
       cwd: initialData?.cwd,
+      env: createPokeSandboxEnvironment(),
     })
   );
 

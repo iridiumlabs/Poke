@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import { resolvePokePaths, ensurePokeDirectories, PokePaths } from '../config/paths.js';
+import { redactSecrets } from '../logger/logger.js';
 import { runMigrations } from './migrations.js';
 
 export interface WorkerJobRecord {
@@ -44,6 +45,16 @@ export interface OperationalErrorRecord {
   message: string;
   details?: string | null;
   created_at: number;
+}
+
+export interface OutgoingDeliveryRecord {
+  key: string;
+  action_type: string;
+  payload_hash: string;
+  status: 'pending' | 'sent';
+  response_data?: string | null;
+  created_at: number;
+  updated_at: number;
 }
 
 export class PokeDatabase {
@@ -429,13 +440,100 @@ export class PokeDatabase {
       .run(key, actionType, payloadHash, responseData || null, Date.now());
   }
 
+  // --- Durable outgoing delivery ---
+  getOutgoingDelivery(key: string): OutgoingDeliveryRecord | null {
+    if (!this.isOpen()) return null;
+    const row = this.db
+      .prepare('SELECT * FROM outgoing_deliveries WHERE key = ?')
+      .get(key) as OutgoingDeliveryRecord | undefined;
+    return row || null;
+  }
+
+  reserveOutgoingDelivery(
+    key: string,
+    actionType: string,
+    payloadHash: string
+  ): { created: boolean; record: OutgoingDeliveryRecord } {
+    const now = Date.now();
+    const intended: OutgoingDeliveryRecord = {
+      key,
+      action_type: actionType,
+      payload_hash: payloadHash,
+      status: 'pending',
+      response_data: null,
+      created_at: now,
+      updated_at: now,
+    };
+
+    if (!this.isOpen()) return { created: true, record: intended };
+
+    const result = this.db
+      .prepare(
+        `INSERT INTO outgoing_deliveries
+          (key, action_type, payload_hash, status, response_data, created_at, updated_at)
+         VALUES (@key, @action_type, @payload_hash, @status, @response_data, @created_at, @updated_at)
+         ON CONFLICT(key) DO NOTHING`
+      )
+      .run(intended);
+    if (result.changes > 0) return { created: true, record: intended };
+
+    const existing = this.getOutgoingDelivery(key);
+    if (!existing) {
+      throw new Error(`Unable to reserve outgoing delivery ${key}.`);
+    }
+    return { created: false, record: existing };
+  }
+
+  completeOutgoingDelivery(
+    key: string,
+    actionType: string,
+    payloadHash: string,
+    responseData: string
+  ): void {
+    if (!this.isOpen()) return;
+    const now = Date.now();
+    const complete = this.db.transaction(() => {
+      const update = this.db
+        .prepare(
+          `UPDATE outgoing_deliveries
+           SET status = 'sent', response_data = ?, updated_at = ?
+           WHERE key = ?
+             AND action_type = ?
+             AND payload_hash = ?
+             AND status = 'pending'`
+        )
+        .run(responseData, now, key, actionType, payloadHash);
+
+      if (update.changes === 0) {
+        const existing = this.getOutgoingDelivery(key);
+        if (
+          !existing ||
+          existing.action_type !== actionType ||
+          existing.payload_hash !== payloadHash ||
+          existing.status !== 'sent'
+        ) {
+          throw new Error(`Outgoing delivery ${key} cannot be completed safely.`);
+        }
+      }
+
+      this.db
+        .prepare(
+          `INSERT INTO idempotency (key, action_type, payload_hash, response_data, created_at)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(key) DO UPDATE SET response_data = excluded.response_data`
+        )
+        .run(key, actionType, payloadHash, responseData, now);
+    });
+    complete();
+  }
+
   // --- Operational Errors ---
   recordOperationalError(source: string, message: string, details?: string): OperationalErrorRecord {
     const record: OperationalErrorRecord = {
       id: `err-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
       source,
-      message,
-      details: details || null,
+      message: redactSecrets(message),
+      details: details ? redactSecrets(details) : null,
       created_at: Date.now(),
     };
 

@@ -132,12 +132,18 @@ export class SkillRegistry {
   private skillsDir: string;
   private skillsCache = new Map<string, SkillMetadata>();
   private watcher: fs.FSWatcher | null = null;
+  private readonly readOnly: boolean;
 
-  constructor(customSkillsDir?: string) {
+  constructor(customSkillsDir?: string, options: { readOnly?: boolean } = {}) {
     this.skillsDir = customSkillsDir || getSkillsHome();
-    this.ensureSkillsDir();
+    this.readOnly = options.readOnly === true;
+    if (!this.readOnly) {
+      this.ensureSkillsDir();
+    }
     this.rescan();
-    this.startWatcher();
+    if (!this.readOnly) {
+      this.startWatcher();
+    }
   }
 
   ensureSkillsDir(): void {
@@ -165,7 +171,9 @@ export class SkillRegistry {
   }
 
   rescan(): Map<string, SkillMetadata> {
-    this.ensureSkillsDir();
+    if (!this.readOnly) {
+      this.ensureSkillsDir();
+    }
     const newCache = new Map<string, SkillMetadata>();
 
     try {
@@ -188,7 +196,9 @@ export class SkillRegistry {
         }
       }
     } catch (err: any) {
-      getLogger().warn({ err: err.message }, 'Failed to rescan skills directory');
+      if (!this.readOnly) {
+        getLogger().warn({ err: err.message }, 'Failed to rescan skills directory');
+      }
     }
 
     this.skillsCache = newCache;

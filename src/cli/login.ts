@@ -1,74 +1,108 @@
-import readline from 'readline';
+import type { AuthInteraction, CredentialStore, Models } from '@earendil-works/pi-ai';
 import { ConfigManager } from '../config/config.js';
-import { ProviderType } from '../config/types.js';
+import { redactSecrets } from '../logger/logger.js';
 import { CommandCodeCatalog } from '../providers/commandcode.js';
+import { FileCredentialStore } from '../providers/credential-store.js';
+import { migrateLegacyProviderCredentials } from '../providers/credentials-migration.js';
 import { FireworksCatalog } from '../providers/fireworks.js';
-import { CodexCatalog } from '../providers/codex.js';
-import { promptQuestion, promptSecret } from './prompt.js';
+import { CODEX_PROVIDER_ID, createPokeModels } from '../providers/models.js';
+import { CliCancelledError, CliCommandFailedError, createCliUi, type CliUi } from './ui.js';
 
-export async function runLogin(customHome?: string, inputRl?: readline.Interface): Promise<void> {
-  const rl =
-    inputRl ||
-    readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-    });
+export interface LoginDependencies {
+  credentials?: CredentialStore;
+  models?: Models;
+  validateCommandCode?: (apiKey: string) => Promise<unknown[]>;
+  validateFireworks?: (apiKey: string) => Promise<unknown[]>;
+}
 
-  const configManager = new ConfigManager(customHome);
+type LoginProvider = 'commandcode' | 'fireworks' | 'codex';
 
-  console.log('\n--- Poke Login: Select Model Provider ---\n');
-  console.log('1. Command Code (Provider API Key)');
-  console.log('2. Fireworks AI (API Key)');
-  console.log('3. Codex (ChatGPT/Codex OAuth / Access Token)');
+function safeErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : 'Authentication failed.';
+  return redactSecrets(message);
+}
+
+function createCodexDeviceCodeInteraction(ui: CliUi): AuthInteraction {
+  return {
+    async prompt(prompt) {
+      // Codex's pi-ai flow offers browser and device-code paths. Poke is a VPS
+      // CLI, so it always picks the headless, refreshable device-code flow.
+      if (prompt.type === 'select') return 'device_code';
+      if (prompt.type === 'secret') {
+        return await ui.secret({
+          message: prompt.message,
+          required: true,
+        });
+      }
+      return await ui.text({
+        message: prompt.message,
+        required: true,
+      });
+    },
+    notify(event) {
+      if (event.type === 'device_code') {
+        ui.note(`Open ${event.verificationUri} and enter code ${event.userCode}.`);
+      } else if (event.type === 'auth_url') {
+        ui.note(`${event.instructions || 'Open this URL:'} ${event.url}`);
+      } else if (event.type === 'progress' || event.type === 'info') {
+        ui.note(event.message);
+      }
+    },
+  };
+}
+
+export async function runLogin(
+  customHome?: string,
+  ui: CliUi = createCliUi(),
+  dependencies: LoginDependencies = {}
+): Promise<void> {
+  const config = new ConfigManager(customHome);
+  const credentials = dependencies.credentials || new FileCredentialStore(config.getPaths().credentialsFile);
+  await migrateLegacyProviderCredentials(config, credentials);
+  const models = dependencies.models || createPokeModels(credentials);
+  const validateCommandCode = dependencies.validateCommandCode || CommandCodeCatalog.fetchLiveModels;
+  const validateFireworks = dependencies.validateFireworks || FireworksCatalog.fetchLiveModels;
+
+  ui.note('Poke login');
 
   try {
-    const choice = await promptQuestion(rl, '\nSelect provider [1-3]: ');
+    const provider = await ui.select<LoginProvider>('Choose a model provider', [
+      { value: 'commandcode', name: 'Command Code', description: 'Provider API key' },
+      { value: 'fireworks', name: 'Fireworks AI', description: 'API key' },
+      { value: 'codex', name: 'Codex', description: 'ChatGPT/Codex device-code login' },
+    ]);
 
-    if (choice === '1' || choice.toLowerCase().includes('command')) {
-      const key = await promptSecret(rl, 'Enter Command Code Provider API key: ', true);
-      if (key) {
-        console.log('Validating Command Code credentials...');
-        try {
-          const models = await CommandCodeCatalog.fetchLiveModels(key);
-          configManager.updateCredentials({ commandCodeApiKey: key });
-          console.log(`✓ Command Code authenticated. Found ${models.length} available models.`);
-        } catch (err: any) {
-          console.error(`✗ Validation failed: ${err.message}`);
-          configManager.updateCredentials({ commandCodeApiKey: key });
-          console.log('Key saved. Check your network or key if errors persist.');
-        }
-      }
-    } else if (choice === '2' || choice.toLowerCase().includes('fireworks')) {
-      const key = await promptSecret(rl, 'Enter Fireworks AI API key: ', true);
-      if (key) {
-        console.log('Validating Fireworks credentials...');
-        try {
-          const models = await FireworksCatalog.fetchLiveModels(key);
-          configManager.updateCredentials({ fireworksApiKey: key });
-          console.log(`✓ Fireworks AI authenticated. Found ${models.length} available models.`);
-        } catch (err: any) {
-          console.error(`✗ Validation failed: ${err.message}`);
-          configManager.updateCredentials({ fireworksApiKey: key });
-          console.log('Key saved.');
-        }
-      }
-    } else if (choice === '3' || choice.toLowerCase().includes('codex')) {
-      const token = await promptSecret(rl, 'Enter Codex Access Token: ', true);
-      if (token) {
-        configManager.updateCredentials({
-          codexAuth: {
-            accessToken: token,
-            expiresAt: Date.now() + 30 * 24 * 3600 * 1000,
-          },
-        });
-        console.log('✓ Codex authentication credentials saved.');
-      }
-    } else {
-      console.log('Invalid selection.');
+    if (provider === 'codex') {
+      await ui.spinner('Waiting for Codex device-code login…', async () => {
+        await models.login(CODEX_PROVIDER_ID, 'oauth', createCodexDeviceCodeInteraction(ui));
+      });
+      ui.success('Codex authenticated with a refreshable credential.');
+      return;
     }
-  } finally {
-    if (!inputRl) {
-      rl.close();
+
+    const label = provider === 'commandcode' ? 'Command Code' : 'Fireworks AI';
+    const apiKey = await ui.secret({
+      message: `${label} API key`,
+      required: true,
+    });
+
+    const catalog = await ui.spinner(`Validating ${label} credentials…`, async () => {
+      return provider === 'commandcode'
+        ? await validateCommandCode(apiKey)
+        : await validateFireworks(apiKey);
+    });
+
+    // Validation completes before the atomic replacement, so a typo or a
+    // network/auth failure never discards the prior working credential.
+    await credentials.modify(provider, async () => ({ type: 'api_key', key: apiKey }));
+    ui.success(`${label} authenticated. Found ${catalog.length} available models.`);
+  } catch (error: unknown) {
+    if (error instanceof CliCancelledError) {
+      ui.warning('Login cancelled. Existing credentials were kept.');
+      return;
     }
+    const message = `Login failed: ${safeErrorMessage(error)}`;
+    ui.error(message);
+    throw new CliCommandFailedError(message);
   }
 }

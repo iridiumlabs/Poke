@@ -5,8 +5,17 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { resolvePokeInstallationPaths } from '../../src/config/installation.js';
 import { isLivePokeDaemon } from '../../src/daemon/pid-file.js';
+import { isSupportedNodeVersion, SUPPORTED_NODE_VERSION_RANGE } from '../../src/config/node-version.js';
 
 describe('daemon lifecycle helpers', () => {
+  it('accepts the supported Node 24 line and rejects older or future majors', () => {
+    expect(SUPPORTED_NODE_VERSION_RANGE).toBe('>=24.20.0 <25');
+    expect(isSupportedNodeVersion('24.20.0')).toBe(true);
+    expect(isSupportedNodeVersion('24.99.0')).toBe(true);
+    expect(isSupportedNodeVersion('24.19.9')).toBe(false);
+    expect(isSupportedNodeVersion('25.0.0')).toBe(false);
+  });
+
   it('resolves the CLI entrypoint and package root independently of process.cwd()', () => {
     const paths = resolvePokeInstallationPaths();
 
