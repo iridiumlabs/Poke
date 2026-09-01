@@ -223,7 +223,11 @@ describe('WhatsAppPairingService', () => {
 
     const pairPromise = service.pair({ method: { type: 'qr' } });
 
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    // Wait until pair() has registered its listeners on the socket instead of
+    // guessing with a fixed timeout.
+    await vi.waitFor(() => {
+      expect(socket.ev.listenerCount('connection.update')).toBeGreaterThan(0);
+    });
 
     socket.ev.emit('creds.update', {});
     socket.ev.emit('connection.update', { connection: 'open' });

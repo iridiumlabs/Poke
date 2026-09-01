@@ -65,9 +65,10 @@ async function readStatusDatabase(sqliteFile: string): Promise<StatusDatabaseSna
     const lastActivityTime = parseFiniteTimestamp(state('last_activity_time'));
     const nextRunAt = parseFiniteTimestamp(next?.next_run_at);
     const lastErrorCreatedAt = parseFiniteTimestamp(lastError?.created_at);
+    const approximateTokensValue = Number(state('approximate_tokens') || 0);
 
     return {
-      approximateTokens: Number(state('approximate_tokens') || 0),
+      approximateTokens: Number.isFinite(approximateTokensValue) ? approximateTokensValue : 0,
       ...(lastActivityTime !== undefined ? { lastActivityTime } : {}),
       agentBusy: state('main_agent_busy') === 'true',
       runningWorkers: count("SELECT COUNT(*) AS count FROM worker_jobs WHERE status = 'running'"),
