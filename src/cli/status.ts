@@ -21,18 +21,38 @@ interface StatusDatabaseSnapshot {
   lastError?: { source: string; message: string; createdAt: number };
 }
 
-function readStatusDatabase(sqliteFile: string): StatusDatabaseSnapshot | null {
-  return inspectReadOnlyDatabase(sqliteFile, (database) => {
-    const state = (key: string) =>
-      (database.prepare('SELECT value FROM state_kv WHERE key = ?').get(key) as { value?: string } | undefined)?.value;
-    const count = (query: string) =>
-      Number((database.prepare(query).get() as { count?: number } | undefined)?.count || 0);
-    const next = database
-      .prepare('SELECT name, next_run_at FROM automations WHERE enabled = 1 AND next_run_at IS NOT NULL ORDER BY next_run_at ASC LIMIT 1')
-      .get() as { name?: string; next_run_at?: number } | undefined;
-    const lastError = database
-      .prepare('SELECT source, message, created_at FROM operational_errors ORDER BY created_at DESC LIMIT 1')
-      .get() as { source?: string; message?: string; created_at?: number } | undefined;
+async function readStatusDatabase(sqliteFile: string): Promise<StatusDatabaseSnapshot | null> {
+  return await inspectReadOnlyDatabase(sqliteFile, (database) => {
+    const state = (key: string) => {
+      try {
+        return (database.prepare('SELECT value FROM state_kv WHERE key = ?').get(key) as { value?: string } | undefined)?.value;
+      } catch {
+        return undefined;
+      }
+    };
+    const count = (query: string) => {
+      try {
+        return Number((database.prepare(query).get() as { count?: number } | undefined)?.count || 0);
+      } catch {
+        return 0;
+      }
+    };
+    let next: { name?: string; next_run_at?: number } | undefined;
+    try {
+      next = database
+        .prepare('SELECT name, next_run_at FROM automations WHERE enabled = 1 AND next_run_at IS NOT NULL ORDER BY next_run_at ASC LIMIT 1')
+        .get() as { name?: string; next_run_at?: number } | undefined;
+    } catch {
+      // Table missing or corrupt
+    }
+    let lastError: { source?: string; message?: string; created_at?: number } | undefined;
+    try {
+      lastError = database
+        .prepare('SELECT source, message, created_at FROM operational_errors ORDER BY created_at DESC LIMIT 1')
+        .get() as { source?: string; message?: string; created_at?: number } | undefined;
+    } catch {
+      // Table missing or corrupt
+    }
     return {
       approximateTokens: Number(state('approximate_tokens') || 0),
       ...(Number.isFinite(Number(state('last_activity_time')))
@@ -68,7 +88,7 @@ export async function runStatus(customHome?: string): Promise<void> {
     pidRecord && isLivePokeDaemon(pidRecord, resolvePokeInstallationPaths().pokeBinPath)
   );
   const gateway = readGatewayRuntimeStatus(paths.runtimeStatusFile);
-  const database = readStatusDatabase(paths.sqliteFile);
+  const database = await readStatusDatabase(paths.sqliteFile);
 
   const mainModel = config.getMainModel();
   const workerModel = config.getWorkerModel();

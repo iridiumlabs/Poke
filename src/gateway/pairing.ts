@@ -49,6 +49,7 @@ export interface PairingRequest {
 }
 
 export interface PairingResult {
+  paired: boolean;
   pairedAccount?: string;
 }
 
@@ -108,23 +109,31 @@ export class WhatsAppPairingService {
     const stagingDirectory = `${this.paths.whatsappDir}.staging-${randomUUID()}`;
     await fs.mkdir(stagingDirectory, { recursive: true, mode: 0o700 });
 
-    let socket: PairingSocket | undefined;
+    let activeSocket: PairingSocket | undefined;
     let committed = false;
     const cancelWaiter = new AbortController();
     const signal = request.signal
       ? AbortSignal.any([request.signal, cancelWaiter.signal])
       : cancelWaiter.signal;
-    try {
+
+    const createSocket = async (): Promise<PairingSocket> => {
       const connection = await this.factory.create(stagingDirectory);
-      socket = connection.socket;
+      const socket = connection.socket;
+      activeSocket = socket;
       socket.ev.on('creds.update', () => {
         void Promise.resolve(connection.saveCreds()).catch((error: unknown) => {
           getLogger().warn({ err: error instanceof Error ? error.message : String(error) }, 'Failed to persist pairing credentials');
         });
       });
+      return socket;
+    };
+
+    try {
+      const initialSocket = await createSocket();
 
       const open = this.waitForOpen(
-        socket,
+        initialSocket,
+        createSocket,
         { ...request, signal },
         request.timeoutMs || DEFAULT_PAIRING_TIMEOUT_MS
       );
@@ -134,18 +143,20 @@ export class WhatsAppPairingService {
 
       if (phoneNumber) {
         request.onStatus?.('Requesting a WhatsApp pairing code…');
-        const code = await socket.requestPairingCode(phoneNumber);
+        const code = await initialSocket.requestPairingCode(phoneNumber);
         request.onPairingCode?.(formatPairingCode(code));
       } else {
         request.onStatus?.('Scan the WhatsApp QR code to pair this account.');
       }
 
       const pairedAccount = await open;
-      await Promise.resolve(socket.end());
-      socket = undefined;
+      if (activeSocket) {
+        await Promise.resolve(activeSocket.end());
+        activeSocket = undefined;
+      }
       await this.commitStagedSession(stagingDirectory);
       committed = true;
-      return { pairedAccount };
+      return { paired: true, pairedAccount };
     } catch (error) {
       // `waitForOpen` owns its timeout and listener. Abort it on every error
       // path that occurs before a connection opens, including a failed phone
@@ -153,9 +164,9 @@ export class WhatsAppPairingService {
       cancelWaiter.abort();
       throw error;
     } finally {
-      if (socket) {
+      if (activeSocket) {
         try {
-          await Promise.resolve(socket.end());
+          await Promise.resolve(activeSocket.end());
         } catch {
           // The staged directory remains disposable even if socket close fails.
         }
@@ -171,31 +182,60 @@ export class WhatsAppPairingService {
   }
 
   private async waitForOpen(
-    socket: PairingSocket,
+    initialSocket: PairingSocket,
+    recreateSocket: () => Promise<PairingSocket>,
     request: PairingRequest,
     timeoutMs: number
   ): Promise<string | undefined> {
     return await new Promise<string | undefined>((resolve, reject) => {
       let settled = false;
+      let currentSocket = initialSocket;
+
       const finish = (outcome: () => void) => {
         if (settled) return;
         settled = true;
         clearTimeout(timeout);
         request.signal?.removeEventListener('abort', onAbort);
-        socket.ev.off?.('connection.update', onUpdate);
+        currentSocket.ev.off?.('connection.update', onUpdate);
         outcome();
       };
+
       const onAbort = () => finish(() => reject(new PairingCancelledError()));
+
+      const attach = (socket: PairingSocket) => {
+        currentSocket = socket;
+        socket.ev.on('connection.update', onUpdate);
+      };
+
       const onUpdate = (update: PairingConnectionUpdate) => {
         if (update.qr) request.onQr?.(update.qr);
         if (update.connection === 'open') {
-          const rawId = socket.user?.id || '';
+          const rawId = currentSocket.user?.id || '';
           const pairedAccount = rawId ? normalizePhoneNumber(rawId.replace(/@.*$/, '').split(':')[0]) : undefined;
           finish(() => resolve(pairedAccount || undefined));
         } else if (update.connection === 'close') {
+          const statusCode = (update.lastDisconnect?.error as { output?: { statusCode?: unknown } } | undefined)?.output?.statusCode;
+          if (statusCode === DisconnectReason.restartRequired || statusCode === 515) {
+            currentSocket.ev.off?.('connection.update', onUpdate);
+            void Promise.resolve(currentSocket.end()).catch(() => {});
+            void recreateSocket().then(
+              (newSock) => {
+                if (settled) {
+                  void Promise.resolve(newSock.end()).catch(() => {});
+                  return;
+                }
+                attach(newSock);
+              },
+              (err: unknown) => {
+                finish(() => reject(err instanceof Error ? err : new Error(String(err))));
+              }
+            );
+            return;
+          }
           finish(() => reject(new Error(describeDisconnect(update.lastDisconnect?.error))));
         }
       };
+
       const timeout = setTimeout(() => {
         finish(() => reject(new Error('WhatsApp pairing timed out. The previous session was kept.')));
       }, timeoutMs);
@@ -205,7 +245,7 @@ export class WhatsAppPairingService {
         return;
       }
       request.signal?.addEventListener('abort', onAbort, { once: true });
-      socket.ev.on('connection.update', onUpdate);
+      attach(initialSocket);
     });
   }
 

@@ -156,7 +156,11 @@ export class WhatsAppSender {
 
     const reservation = this.db.reserveOutgoingDelivery(key, actionType, payloadHash);
     if (!reservation.created) {
-      return this.getCompletedPartMessageId(key, actionType, payloadHash) || fallbackMessageId;
+      const completedPart = this.getCompletedPartMessageId(key, actionType, payloadHash);
+      if (!completedPart) {
+        throw new Error('WhatsApp delivery outcome is unknown. Refusing to replay the message automatically.');
+      }
+      return completedPart;
     }
 
     // The pending record intentionally remains when the transport rejects or

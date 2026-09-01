@@ -75,10 +75,9 @@ describe('FileCredentialStore', () => {
     expect(result).toEqual({ migrated: ['fireworks', 'commandcode'], codexReloginRequired: true });
     expect(await store.read('fireworks')).toEqual({ type: 'api_key', key: 'fw-old-key' });
     expect(await store.read('commandcode')).toEqual({ type: 'api_key', key: 'cc-old-key' });
-    expect(config.getCredentials()).not.toMatchObject({
-      fireworksApiKey: expect.anything(),
-      commandCodeApiKey: expect.anything(),
-      codexAuth: expect.anything(),
-    });
+    const creds = config.getCredentials();
+    expect(creds.fireworksApiKey).toBeUndefined();
+    expect(creds.commandCodeApiKey).toBeUndefined();
+    expect(creds.codexAuth).toBeUndefined();
   });
 });

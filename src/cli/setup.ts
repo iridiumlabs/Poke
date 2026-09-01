@@ -68,12 +68,12 @@ export async function runSetup(
     // resumable without making the owner pair again.
     if (!config.getWhatsAppAccount()) {
       const paired = await runInteractiveWhatsAppPairing(config, customHome, ui, dependencies.pairing);
-      if (!paired) return;
+      if (!paired?.paired) return;
     } else {
       ui.note(`WhatsApp already paired as ${config.getWhatsAppAccount()}.`);
       if (await ui.confirm('Pair a different WhatsApp account?', false)) {
         const paired = await runInteractiveWhatsAppPairing(config, customHome, ui, dependencies.pairing);
-        if (!paired) return;
+        if (!paired?.paired) return;
       }
     }
 

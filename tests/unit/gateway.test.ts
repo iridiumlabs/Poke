@@ -251,17 +251,20 @@ describe('WhatsApp Gateway & Sender', () => {
 
   it('prefixes a successfully transcribed voice note before dispatching it', async () => {
     const dispatch = vi.fn();
+    const deepgramMock = {
+      transcribe: vi.fn().mockResolvedValue('Please summarize this.'),
+    };
     const gateway = new WhatsAppGateway(
       config,
       db,
       dispatch,
       async () => {},
       tempDir,
-      { downloadMedia: vi.fn().mockResolvedValue(Buffer.from('audio')) }
+      {
+        downloadMedia: vi.fn().mockResolvedValue(Buffer.from('audio')),
+        deepgram: deepgramMock as any,
+      }
     );
-    (gateway as any).deepgram = {
-      transcribe: vi.fn().mockResolvedValue('Please summarize this.'),
-    };
 
     await gateway.handleIncomingMessage({
       key: { remoteJid: '923001234567@s.whatsapp.net', id: 'voice-transcribed' },

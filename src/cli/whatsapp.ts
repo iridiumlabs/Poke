@@ -52,7 +52,7 @@ export async function runWhatsAppMenu(
     ]);
 
     if (action === 'reauthenticate') {
-      await runInteractiveWhatsAppPairing(config, customHome, ui, pairing);
+      await runInteractiveWhatsAppPairing(config, customHome, ui, { ...pairing, daemon });
       return;
     }
 
@@ -73,7 +73,11 @@ export async function runWhatsAppMenu(
         updatedAt: Date.now(),
         reason: 'WhatsApp session cleared.',
       });
-      ui.success('WhatsApp session cleared. Conversations, jobs, automations, and credentials were preserved.');
+      ui.success(
+        `WhatsApp session cleared. Conversations, jobs, automations, and credentials were preserved.${
+          wasRunning ? ' The daemon remains stopped; run `poke start` after re-pairing.' : ''
+        }`
+      );
       return;
     }
 

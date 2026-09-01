@@ -45,12 +45,17 @@ function terminalQr(value: string): string {
   return rendered;
 }
 
+export interface InteractivePairingResult {
+  paired: boolean;
+  pairedAccount?: string;
+}
+
 export async function runInteractiveWhatsAppPairing(
   config: ConfigManager,
   customHome: string | undefined,
   ui: CliUi,
   dependencies: PairingCliDependencies = {}
-): Promise<string | undefined> {
+): Promise<InteractivePairingResult | undefined> {
   const service = dependencies.service || new WhatsAppPairingService(resolvePokePaths(customHome));
   const daemon = dependencies.daemon || defaultDaemonMaintenance(customHome);
   const renderer = dependencies.renderQr || terminalQr;
@@ -83,7 +88,9 @@ export async function runInteractiveWhatsAppPairing(
           onQr: (qr) => ui.note(renderer(qr)),
         })
       );
-      config.setWhatsAppAccount(result.pairedAccount);
+      if (result.pairedAccount) {
+        config.setWhatsAppAccount(result.pairedAccount);
+      }
       writeGatewayRuntimeStatus(resolvePokePaths(customHome).runtimeStatusFile, {
         state: 'disconnected',
         updatedAt: Date.now(),
@@ -95,7 +102,7 @@ export async function runInteractiveWhatsAppPairing(
           ? `WhatsApp paired as ${result.pairedAccount}.`
           : 'WhatsApp paired successfully.'
       );
-      return result.pairedAccount;
+      return { paired: true, pairedAccount: result.pairedAccount };
     } finally {
       // A failed/cancelled pairing keeps the old staged session untouched, so
       // a daemon that was running before maintenance can safely resume it.

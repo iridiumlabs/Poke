@@ -73,6 +73,7 @@ export type StopHandlerFn = () => Promise<void>;
 
 export interface WhatsAppGatewayDependencies {
   downloadMedia?: (message: WAMessage) => Promise<Buffer>;
+  deepgram?: DeepgramHandler;
 }
 
 export class WhatsAppGateway {
@@ -98,10 +99,18 @@ export class WhatsAppGateway {
     dependencies: WhatsAppGatewayDependencies = {}
   ) {
     this.downloadMedia = dependencies.downloadMedia || (async (message) =>
-      (await downloadMediaMessage(message, 'buffer', {})) as Buffer
+      (await downloadMediaMessage(
+        message,
+        'buffer',
+        {},
+        {
+          logger: getLogger().child({ module: 'baileys-media' }) as any,
+          reuploadRequest: (msg: WAMessage) => this.sock?.updateMediaMessage(msg),
+        }
+      )) as Buffer
     );
     const creds = this.configManager.getCredentials();
-    this.deepgram = new DeepgramHandler(creds.deepgramApiKey, customHome);
+    this.deepgram = dependencies.deepgram || new DeepgramHandler(creds.deepgramApiKey, customHome);
     const ownerPhone = this.configManager.getOwnerPhoneNumber() || '';
     const ownerJid = ownerPhone ? `${ownerPhone}@s.whatsapp.net` : '';
     this.sender = new WhatsAppSender(

@@ -1,10 +1,12 @@
 #!/usr/bin/env node
-import { createCli } from '../src/cli/index.js';
 import { assertSupportedNodeVersion } from '../src/config/node-version.js';
-import { CliCommandFailedError } from '../src/cli/ui.js';
 
 try {
   assertSupportedNodeVersion();
+  const [{ createCli }, { CliCommandFailedError }] = await Promise.all([
+    import('../src/cli/index.js'),
+    import('../src/cli/ui.js'),
+  ]);
   const program = createCli();
   void program.parseAsync(process.argv).catch((err: unknown) => {
     if (!(err instanceof CliCommandFailedError)) {

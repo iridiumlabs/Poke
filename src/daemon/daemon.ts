@@ -135,6 +135,7 @@ export class PokeDaemon {
     this.isRunning = true;
 
     try {
+      this.compactionManager.setMainAgentBusy(false);
       await this.runtime.start();
       await this.gateway.start();
       this.gateway.heartbeat();

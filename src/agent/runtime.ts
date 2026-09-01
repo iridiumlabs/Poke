@@ -68,11 +68,25 @@ export class PokeRuntime {
       }
       const mainValidation = await providerRegistry.validateSelection(mainModel);
       if (!mainValidation.valid) {
-        throw new Error(`Invalid main model configuration: ${mainValidation.error}`);
+        if (mainValidation.transient) {
+          getLogger().warn(
+            { err: mainValidation.error },
+            'Main model validation encountered a transient issue during startup; continuing'
+          );
+        } else {
+          throw new Error(`Invalid main model configuration: ${mainValidation.error}`);
+        }
       }
       const workerValidation = await providerRegistry.validateSelection(workerModel);
       if (!workerValidation.valid) {
-        throw new Error(`Invalid worker model configuration: ${workerValidation.error}`);
+        if (workerValidation.transient) {
+          getLogger().warn(
+            { err: workerValidation.error },
+            'Worker model validation encountered a transient issue during startup; continuing'
+          );
+        } else {
+          throw new Error(`Invalid worker model configuration: ${workerValidation.error}`);
+        }
       }
 
       const toolContexts = {

@@ -127,4 +127,43 @@ describe('WhatsAppPairingService', () => {
     expect(socket.end).toHaveBeenCalledTimes(1);
     expect(fs.readdirSync(home)).toEqual([]);
   });
+
+  it('reconnects when receiving DisconnectReason.restartRequired (515) and succeeds on second socket', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'poke-pairing-'));
+    directories.push(home);
+    const paths = resolvePokePaths(home);
+    const socket1 = new FakeSocket();
+    const socket2 = new FakeSocket();
+    let callCount = 0;
+
+    const service = new WhatsAppPairingService(paths, {
+      async create(stagingDirectory) {
+        callCount++;
+        if (callCount === 1) {
+          fs.writeFileSync(path.join(stagingDirectory, 'creds.json'), 'new-staged');
+          setTimeout(() =>
+            socket1.ev.emit('connection.update', {
+              connection: 'close',
+              lastDisconnect: { error: { output: { statusCode: 515 } } },
+            }), 0
+          );
+          return { socket: socket1, saveCreds: vi.fn() };
+        } else {
+          setTimeout(() => socket2.ev.emit('connection.update', { connection: 'open' }), 0);
+          return { socket: socket2, saveCreds: vi.fn() };
+        }
+      },
+    });
+
+    const result = await service.pair({
+      method: { type: 'qr' },
+    });
+
+    expect(callCount).toBe(2);
+    expect(result.paired).toBe(true);
+    expect(result.pairedAccount).toBe('923001111111');
+    expect(socket1.end).toHaveBeenCalled();
+    expect(socket2.end).toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(paths.whatsappDir, 'creds.json'), 'utf8')).toBe('new-staged');
+  });
 });

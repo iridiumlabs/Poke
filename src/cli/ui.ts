@@ -101,18 +101,19 @@ export class InquirerCliUi implements CliUi {
 
   async text(options: TextPromptOptions): Promise<string> {
     this.assertInteractive();
-    return await this.withCancellation(() =>
+    const result = await this.withCancellation(() =>
       input({
         ...options,
         theme: this.theme,
         validate: this.validation(options),
       } as any)
     );
+    return result.trim();
   }
 
   async secret(options: TextPromptOptions): Promise<string> {
     this.assertInteractive();
-    return await this.withCancellation(() =>
+    const result = await this.withCancellation(() =>
       password({
         message: options.message,
         mask: '*',
@@ -120,6 +121,7 @@ export class InquirerCliUi implements CliUi {
         validate: this.validation(options),
       } as any)
     );
+    return result.trim();
   }
 
   async confirm(message: string, defaultValue = false): Promise<boolean> {

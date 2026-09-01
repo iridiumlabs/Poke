@@ -4,21 +4,31 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 
 /** Runs an inspection against an ephemeral SQLite copy without touching WAL files. */
-export function inspectReadOnlyDatabase<T>(sqliteFile: string, inspect: (db: Database.Database) => T): T | null {
+export async function inspectReadOnlyDatabase<T>(
+  sqliteFile: string,
+  inspect: (db: Database.Database) => T
+): Promise<T | null> {
   if (!fs.existsSync(sqliteFile)) return null;
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'poke-readonly-'));
   const copy = path.join(directory, 'state.sqlite');
+  let source: Database.Database | undefined;
   let database: Database.Database | undefined;
   try {
-    fs.copyFileSync(sqliteFile, copy);
-    for (const suffix of ['-wal', '-shm']) {
-      const source = `${sqliteFile}${suffix}`;
-      if (fs.existsSync(source)) fs.copyFileSync(source, `${copy}${suffix}`);
-    }
+    source = new Database(sqliteFile, { readonly: true, fileMustExist: true });
+    await source.backup(copy);
+    source.close();
+    source = undefined;
     database = new Database(copy, { readonly: true, fileMustExist: true });
     return inspect(database);
+  } catch {
+    return null;
   } finally {
-    database?.close();
+    try {
+      source?.close();
+    } catch {}
+    try {
+      database?.close();
+    } catch {}
     fs.rmSync(directory, { recursive: true, force: true });
   }
 }

@@ -51,13 +51,18 @@ export function registerAllProviders(models: Models): void {
   setProvider(withPokeCredentialResolver(openaiCodexProvider(), models));
 }
 
+import { isTransientError } from './retry.js';
+
+export interface ModelValidationResult {
+  valid: boolean;
+  error?: string;
+  transient?: boolean;
+  modelInfo?: ModelInfo;
+}
+
 export interface ProviderCatalog {
   fetchModels(provider: ProviderType): Promise<ModelInfo[]>;
-  validateSelection(selection: ModelSelection): Promise<{
-    valid: boolean;
-    error?: string;
-    modelInfo?: ModelInfo;
-  }>;
+  validateSelection(selection: ModelSelection): Promise<ModelValidationResult>;
 }
 
 export class ProviderRegistry implements ProviderCatalog {
@@ -87,14 +92,12 @@ export class ProviderRegistry implements ProviderCatalog {
       }
       case 'codex':
         return await getAuthenticatedModels(this.models, CODEX_PROVIDER_ID);
+      default:
+        throw new Error(`Unsupported model provider: ${String(provider)}`);
     }
   }
 
-  async validateSelection(selection: ModelSelection): Promise<{
-    valid: boolean;
-    error?: string;
-    modelInfo?: ModelInfo;
-  }> {
+  async validateSelection(selection: ModelSelection): Promise<ModelValidationResult> {
     try {
       const models = await this.fetchModels(selection.provider);
       const modelId = normalizeCatalogModelId(selection.model, selection.provider);
@@ -118,6 +121,7 @@ export class ProviderRegistry implements ProviderCatalog {
     } catch (error: unknown) {
       return {
         valid: false,
+        transient: isTransientError(error),
         error: error instanceof Error
           ? redactSecrets(error.message)
           : 'Unable to validate the selected model.',

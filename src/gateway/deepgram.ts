@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { getLogger } from '../logger/logger.js';
+import { getLogger, redactSecrets } from '../logger/logger.js';
 import { withProviderRetry } from '../providers/retry.js';
 import { providerRequestSignal } from '../providers/fetch.js';
 import { resolvePokePaths } from '../config/paths.js';
@@ -45,7 +45,11 @@ export class DeepgramHandler {
       });
 
       if (!res.ok) {
-        const err = new Error(`Deepgram STT returned ${res.status}.`);
+        const detail = await res.text().catch(() => '');
+        const message = detail
+          ? `Deepgram STT returned ${res.status}: ${redactSecrets(detail)}`
+          : `Deepgram STT returned ${res.status}.`;
+        const err = new Error(message);
         (err as any).status = res.status;
         (err as any).headers = res.headers;
         throw err;
@@ -88,7 +92,11 @@ export class DeepgramHandler {
       });
 
       if (!res.ok) {
-        const err = new Error(`Deepgram TTS returned ${res.status}.`);
+        const detail = await res.text().catch(() => '');
+        const message = detail
+          ? `Deepgram TTS returned ${res.status}: ${redactSecrets(detail)}`
+          : `Deepgram TTS returned ${res.status}.`;
+        const err = new Error(message);
         (err as any).status = res.status;
         (err as any).headers = res.headers;
         throw err;

@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { Credential, CredentialInfo, CredentialStore } from '@earendil-works/pi-ai';
+import { getLogger } from '../logger/logger.js';
 
 const LOCK_WAIT_MS = 25;
 const LOCK_TIMEOUT_MS = 60_000;
@@ -156,14 +157,17 @@ export class FileCredentialStore implements CredentialStore {
   private async releaseLock(lock: FileLock): Promise<void> {
     try {
       await lock.handle.close();
-    } finally {
-      try {
-        const owner = await fs.readFile(this.lockFile, 'utf8');
-        if (owner === lock.id) {
-          await fs.unlink(this.lockFile);
-        }
-      } catch (error: unknown) {
-        if (!isCode(error, 'ENOENT')) throw error;
+    } catch {
+      // Ignore handle close failure
+    }
+    try {
+      const owner = await fs.readFile(this.lockFile, 'utf8');
+      if (owner === lock.id) {
+        await fs.unlink(this.lockFile);
+      }
+    } catch (error: unknown) {
+      if (!isCode(error, 'ENOENT')) {
+        getLogger().warn({ err: error instanceof Error ? error.message : String(error) }, 'Failed to remove lock file');
       }
     }
   }
