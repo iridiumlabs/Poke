@@ -9,6 +9,7 @@ import {
 } from '../services/health.js';
 import { runInteractiveWhatsAppPairing, type PairingCliDependencies } from './pairing.js';
 import { CliCancelledError, createCliUi, type CliUi } from './ui.js';
+import { isDaemonRunning, runRestart } from './lifecycle.js';
 
 interface SetupService {
   name: string;
@@ -101,6 +102,10 @@ export async function runSetup(
       await configureService(config, ui, service, validate);
     }
 
+    if (isDaemonRunning(customHome)) {
+      ui.note('Restarting the running daemon so the updated service configuration is applied.');
+      await runRestart({}, customHome);
+    }
     ui.success('Setup complete. Next run `poke login`, `poke model`, and `poke model worker`.');
   } catch (error: unknown) {
     if (error instanceof CliCancelledError) {

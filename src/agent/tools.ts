@@ -12,6 +12,14 @@ import { ConfigManager } from '../config/config.js';
 
 const CONDITIONAL_CAPABILITIES = new Set(['automations']);
 
+async function durableStep<T>(
+  step: { do(name: string, run: () => T | Promise<T>): Promise<T> } | undefined,
+  name: string,
+  run: () => T | Promise<T>
+): Promise<T> {
+  return step ? await step.do(name, run) : await run();
+}
+
 export interface ToolContexts {
   sender: WhatsAppSender;
   exa: ExaToolHandler;
@@ -27,7 +35,7 @@ export function createPokeTools(ctx: ToolContexts) {
   // 1. send
   const sendTool = defineTool({
     name: 'send',
-    description: 'Send a message or voice note to the user on WhatsApp. Only content sent through this tool reaches the user.',
+    description: 'Send a message or voice note to the user on WhatsApp. Only content sent through this tool reaches the user. To quote the current inbound message, pass its [WhatsApp message ID: …] marker as reply_to.',
     input: v.object({
       mode: v.picklist(['message', 'voice']),
       text: v.string(),
@@ -42,11 +50,12 @@ export function createPokeTools(ctx: ToolContexts) {
       ),
       reply_to: v.optional(v.string()),
     }),
-    run: async ({ data, toolCallId }: any) => {
+    durable: true,
+    run: async ({ data, toolCallId, step }: any) => {
       const idempotencyKey = toolCallId
         ? `send-${toolCallId}`
         : `send-${crypto.randomUUID()}`;
-      const res = await ctx.sender.send(
+      const res = await durableStep(step, 'send-message', () => ctx.sender.send(
         {
           mode: data.mode,
           text: data.text,
@@ -54,7 +63,7 @@ export function createPokeTools(ctx: ToolContexts) {
           reply_to: data.reply_to,
         },
         idempotencyKey
-      );
+      ));
       return JSON.stringify({ success: true, messageId: res.messageId, mode: res.mode });
     },
   });
@@ -99,8 +108,18 @@ export function createPokeTools(ctx: ToolContexts) {
       content: v.string(),
       metadata: v.optional(v.record(v.string(), v.string())),
     }),
-    run: async ({ data }) => {
-      const res = await ctx.supermemory.save(data);
+    durable: true,
+    run: async ({ data, toolCallId, step, signal }: any) => {
+      const idempotencyKey = `memory-${toolCallId || crypto.randomUUID()}`;
+      const res = await durableStep(step, 'save-memory', () => ctx.supermemory.save({
+        ...data,
+        metadata: {
+          ...data.metadata,
+          poke_tool_call_id: idempotencyKey,
+        },
+        idempotencyKey,
+        signal,
+      }));
       return JSON.stringify(res);
     },
   });
@@ -126,8 +145,8 @@ export function createPokeTools(ctx: ToolContexts) {
     input: v.object({
       query: v.string(),
     }),
-    run: async ({ data }) => {
-      const res = await ctx.composio.search(data);
+    run: async ({ data, signal }) => {
+      const res = await ctx.composio.search(data, signal);
       return JSON.stringify(res, null, 2);
     },
   });
@@ -140,9 +159,14 @@ export function createPokeTools(ctx: ToolContexts) {
     input: v.object({
       action: v.string(),
       params: v.optional(v.record(v.string(), v.any())),
+      connected_account_id: v.optional(v.string()),
     }),
-    run: async ({ data }) => {
-      const res = await ctx.composio.execute(data);
+    durable: true,
+    run: async ({ data, toolCallId, step, signal }: any) => {
+      const res = await durableStep(step, 'execute-connected-action', () => ctx.composio.execute({
+        ...data,
+        idempotencyKey: `composio-${toolCallId || crypto.randomUUID()}`,
+      }, signal));
       return JSON.stringify(res, null, 2);
     },
   });
@@ -159,16 +183,18 @@ export function createPokeTools(ctx: ToolContexts) {
       cwd: v.optional(v.string()),
       id: v.optional(v.string()),
     }),
-    run: async ({ data }) => {
+    durable: true,
+    run: async ({ data, toolCallId, step }: any) => {
       if (data.action === 'start') {
         if (!data.name || !data.instruction) {
           throw new Error('Action "start" requires "name" and "instruction".');
         }
-        const job = await ctx.workerManager.startJob({
+        const job = await durableStep(step, 'start-worker-job', () => ctx.workerManager.startJob({
           name: data.name,
           instruction: data.instruction,
           cwd: data.cwd,
-        });
+          ...(toolCallId ? { idempotencyKey: `job-${toolCallId}` } : {}),
+        }));
         return JSON.stringify({
           status: 'queued',
           jobId: job.id,
@@ -198,7 +224,7 @@ export function createPokeTools(ctx: ToolContexts) {
 
       if (data.action === 'cancel') {
         if (!data.id) throw new Error('Action "cancel" requires "id".');
-        const success = ctx.workerManager.cancelJob(data.id);
+        const success = await durableStep(step, 'cancel-worker-job', () => ctx.workerManager.cancelJob(data.id));
         return JSON.stringify({ success, message: success ? `Job "${data.id}" cancelled.` : `Job "${data.id}" could not be cancelled.` });
       }
 
@@ -213,11 +239,12 @@ export function createPokeTools(ctx: ToolContexts) {
     input: v.object({
       capability: v.string(),
     }),
-    run: async ({ data }) => {
+    durable: true,
+    run: async ({ data, step }: any) => {
       if (!CONDITIONAL_CAPABILITIES.has(data.capability)) {
         throw new Error(`Unknown conditional capability "${data.capability}".`);
       }
-      ctx.configManager.addActiveCapability(data.capability);
+      await durableStep(step, 'mount-capability', () => ctx.configManager.addActiveCapability(data.capability));
       return JSON.stringify({
         success: true,
         message: `Capability "${data.capability}" mounted. Associated tools are now active.`,
@@ -225,26 +252,7 @@ export function createPokeTools(ctx: ToolContexts) {
     },
   });
 
-  // 10. activate_skill
-  const activateSkillTool = defineTool({
-    name: 'activate_skill',
-    description: 'Activate a discovered skill and retrieve its full markdown instructions.',
-    input: v.object({
-      name: v.string(),
-    }),
-    run: async ({ data }) => {
-      const skill = ctx.skills.getSkill(data.name);
-      if (!skill) {
-        throw new Error(`Skill "${data.name}" is not installed. List available skills in the catalog.`);
-      }
-      return JSON.stringify({
-        name: skill.name,
-        instructions: skill.body,
-      });
-    },
-  });
-
-  // 11. automation (Conditional tool)
+  // 10. automation (Conditional tool)
   const automationTool = defineTool({
     name: 'automation',
     description: 'Create, update, delete, list, enable, or disable durable scheduled automations (in Asia/Karachi timezone).',
@@ -257,18 +265,20 @@ export function createPokeTools(ctx: ToolContexts) {
       schedule_value: v.optional(v.string()),
       enabled: v.optional(v.boolean()),
     }),
-    run: async ({ data }) => {
+    durable: true,
+    run: async ({ data, toolCallId, step }: any) => {
       if (data.action === 'create') {
         if (!data.name || !data.instruction || !data.schedule_type || !data.schedule_value) {
           throw new Error('Action "create" requires "name", "instruction", "schedule_type", and "schedule_value".');
         }
-        const created = ctx.scheduler.createAutomation({
+        const created = await durableStep(step, 'create-automation', () => ctx.scheduler.createAutomation({
           name: data.name,
           instruction: data.instruction,
           schedule_type: data.schedule_type,
           schedule_value: data.schedule_value,
           enabled: data.enabled,
-        });
+          ...(toolCallId ? { idempotencyKey: `automation-${toolCallId}` } : {}),
+        }));
         return JSON.stringify({
           success: true,
           automation: created,
@@ -293,31 +303,31 @@ export function createPokeTools(ctx: ToolContexts) {
 
       if (data.action === 'update') {
         if (!data.id) throw new Error('Action "update" requires "id".');
-        const updated = ctx.scheduler.updateAutomation(data.id, {
+        const updated = await durableStep(step, 'update-automation', () => ctx.scheduler.updateAutomation(data.id, {
           name: data.name,
           instruction: data.instruction,
           schedule_type: data.schedule_type,
           schedule_value: data.schedule_value,
           enabled: data.enabled,
-        });
+        }));
         return JSON.stringify({ success: true, automation: updated });
       }
 
       if (data.action === 'delete') {
         if (!data.id) throw new Error('Action "delete" requires "id".');
-        const success = ctx.scheduler.deleteAutomation(data.id);
+        const success = await durableStep(step, 'delete-automation', () => ctx.scheduler.deleteAutomation(data.id));
         return JSON.stringify({ success, message: success ? `Automation "${data.id}" deleted.` : `Automation "${data.id}" not found.` });
       }
 
       if (data.action === 'enable') {
         if (!data.id) throw new Error('Action "enable" requires "id".');
-        const enabled = ctx.scheduler.enableAutomation(data.id);
+        const enabled = await durableStep(step, 'enable-automation', () => ctx.scheduler.enableAutomation(data.id));
         return JSON.stringify({ success: true, automation: enabled });
       }
 
       if (data.action === 'disable') {
         if (!data.id) throw new Error('Action "disable" requires "id".');
-        const disabled = ctx.scheduler.disableAutomation(data.id);
+        const disabled = await durableStep(step, 'disable-automation', () => ctx.scheduler.disableAutomation(data.id));
         return JSON.stringify({ success: true, automation: disabled });
       }
 
@@ -337,7 +347,6 @@ export function createPokeTools(ctx: ToolContexts) {
     composioExecuteTool,
     jobsTool,
     loadToolsTool,
-    activateSkillTool,
     automationTool,
   };
 }

@@ -5,6 +5,8 @@ import {
   useTool,
   useAgentStart,
   useAgentFinish,
+  useDelivery,
+  useSkill,
 } from '@flue/runtime';
 import { local } from '@flue/runtime/node';
 import { MAIN_AGENT_SYSTEM_PROMPT } from './prompts.js';
@@ -22,13 +24,17 @@ let sharedContexts: ToolContexts | null = null;
 let sharedCompactionManager: CompactionManager | null = null;
 
 function getModelContextWindow(modelId?: string, provider?: string): number {
-  if (!modelId) return 1000000;
+  // Runtime validation supplies the exact live metadata to Flue. This local
+  // reserve calculation only needs a safe fallback when that catalog is
+  // unavailable; assuming a 1M window can otherwise over-reserve a 128K
+  // model before Poke's own 272K policy gets a chance to run.
+  if (!modelId) return 128000;
   const normalized = normalizeCatalogModelId(modelId, provider as any);
   const bundled = BUNDLED_KNOWN_MODELS[normalized];
   if (bundled?.contextWindow) return bundled.contextWindow;
   const meta = CommandCodeCatalog.extractPackageMetadata().get(normalized);
   if (meta?.contextWindow) return meta.contextWindow;
-  return 1000000;
+  return 128000;
 }
 
 export function setMainAgentContexts(
@@ -46,6 +52,9 @@ export function PokeMainAgent() {
 
   const config = sharedContexts.configManager.loadConfig();
   const mainModel = config.mainModel;
+  const delivery = useDelivery();
+  const isInternalCompaction =
+    delivery.kind === 'signal' && delivery.type === 'poke.context_compact';
 
   const modelSpecifier = resolveFlueModelSpecifier(mainModel);
   const thinkingLevel = mainModel?.reasoningEffort as any;
@@ -79,7 +88,9 @@ export function PokeMainAgent() {
   useTool(tools.composioExecuteTool);
   useTool(tools.jobsTool);
   useTool(tools.loadToolsTool);
-  useTool(tools.activateSkillTool);
+  for (const skill of sharedContexts.skills.getFlueSkills()) {
+    useSkill(skill);
+  }
 
   // Conditionally mount automation tool if capability is active
   const activeCaps = sharedContexts.configManager.getActiveCapabilities();
@@ -88,25 +99,30 @@ export function PokeMainAgent() {
   }
 
   // 4. Lifecycle hooks
-  useAgentStart(async () => {
+  useAgentStart(async ({ harness }) => {
+    if (isInternalCompaction) {
+      await harness.compact();
+    }
     if (sharedCompactionManager) {
-      sharedCompactionManager.setMainAgentBusy(true);
       sharedCompactionManager.recordActivity();
     }
   });
 
   useAgentFinish(async () => {
     if (sharedCompactionManager) {
-      sharedCompactionManager.setMainAgentBusy(false);
       sharedCompactionManager.recordActivity();
     }
   });
 
-  // 5. Instruction & Live skills catalog
-  const skillsCatalog = sharedContexts.skills.getCatalogPrompt();
-  if (skillsCatalog) {
-    useInstruction(`\n${skillsCatalog}`);
+  if (isInternalCompaction) {
+    useInstruction(
+      'This is an internal context-maintenance signal. Do not call tools or send a user-facing response.'
+    );
   }
 
   return MAIN_AGENT_SYSTEM_PROMPT;
 }
+
+// Flue applies this durable budget when recovering work after a process
+// interruption. Model-stream retries are framework-owned (see POKE.md).
+PokeMainAgent.durability = { maxAttempts: 5, timeoutMs: 3_600_000 };

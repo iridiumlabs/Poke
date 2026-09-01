@@ -2,10 +2,13 @@ import { PokeDatabase, AutomationRecord } from '../db/database.js';
 import { computeNextRun } from './timezone.js';
 import { getLogger } from '../logger/logger.js';
 import { createAutomationTriggerSignal, SignalPayload } from '../agent/signals.js';
+import crypto from 'node:crypto';
 
 const AUTOMATION_DISPATCH_RETRY_MS = 30_000;
 
-export type DispatchAutomationSignalFn = (signal: SignalPayload) => Promise<void>;
+export type DispatchAutomationSignalFn = (
+  signal: SignalPayload
+) => Promise<{ submissionId: string }>;
 
 export class AutomationScheduler {
   private timer: NodeJS.Timeout | null = null;
@@ -59,6 +62,13 @@ export class AutomationScheduler {
         continue;
       }
 
+      if (auto.last_outcome?.startsWith('dispatch_error:')) {
+        // Dispatch errors retain the occurrence timestamp so a retry reuses
+        // the same Flue idempotency key, including after a restart.
+        logger.info({ autoId: auto.id }, 'Retaining an automation occurrence with a pending dispatch retry');
+        continue;
+      }
+
       if (auto.next_run_at && auto.next_run_at < now) {
         if (auto.schedule_type === 'once') {
           // Keep next_run_at so it runs once at next tick
@@ -93,7 +103,7 @@ export class AutomationScheduler {
 
     try {
       const now = Date.now();
-      const dueAutomations = this.db.getDueAutomations(now);
+      const dueAutomations = this.db.getDueAutomations(now, AUTOMATION_DISPATCH_RETRY_MS);
 
       for (const auto of dueAutomations) {
         try {
@@ -156,18 +166,24 @@ export class AutomationScheduler {
       if (!this.onDispatchSignal) {
         throw new Error('Automation dispatcher is unavailable.');
       }
-      await this.onDispatchSignal(signal);
-
-      this.db.updateAutomation(auto.id, {
-        next_run_at: nextRun,
-        enabled,
-        last_outcome: 'dispatched',
-      });
+      const receipt = await this.onDispatchSignal(signal);
+      const admitted = this.db.finalizeAutomationDispatch(
+        auto.id,
+        scheduledAt,
+        receipt.submissionId,
+        { next_run_at: nextRun, enabled }
+      );
+      if (!admitted) {
+        throw new Error('Automation occurrence was not available to record its Flue admission.');
+      }
       logger.info('Automation trigger dispatched to main agent');
     } catch (err: any) {
       logger.error({ err: err.message }, 'Failed to dispatch automation signal');
+      // An error returning from dispatch is an unknown admission outcome.
+      // Keep this occurrence's original timestamp, and therefore its stable
+      // Flue key, for the durable retry after the cooldown.
       this.db.updateAutomation(auto.id, {
-        next_run_at: Date.now() + AUTOMATION_DISPATCH_RETRY_MS,
+        next_run_at: scheduledAt,
         last_outcome: `dispatch_error: ${err.message}`,
       });
     }
@@ -180,9 +196,14 @@ export class AutomationScheduler {
     schedule_type: 'once' | 'cron' | 'interval';
     schedule_value: string;
     enabled?: boolean;
+    idempotencyKey?: string;
   }): AutomationRecord {
     const nextRun = computeNextRun(params.schedule_type, params.schedule_value, Date.now());
-    const id = `auto-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const id = params.idempotencyKey
+      ? `auto-${crypto.createHash('sha256').update(params.idempotencyKey).digest('hex').slice(0, 24)}`
+      : `auto-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    const existing = this.db.getAutomation(id);
+    if (existing) return existing;
 
     return this.db.createAutomation({
       id,

@@ -1,9 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
 import { withProviderRetry, isTransientError, NonRetryableError } from '../../src/providers/retry.js';
 import { CommandCodeCatalog } from '../../src/providers/commandcode.js';
+import { FireworksCatalog } from '../../src/providers/fireworks.js';
 import { ProviderRegistry, normalizeCatalogModelId } from '../../src/providers/provider-registry.js';
 import { FileCredentialStore } from '../../src/providers/credential-store.js';
 import { ComposioToolHandler } from '../../src/tools/composio.js';
+import { PokeDatabase } from '../../src/db/database.js';
 
 describe('Provider Retry & Error Classification', () => {
   it('identifies transient errors correctly', () => {
@@ -201,6 +203,35 @@ describe('resolveFlueModelSpecifier', () => {
     }
   });
 
+  it('does not advertise a live Fireworks model that Flue cannot resolve', async () => {
+    const directory = await import('node:fs/promises').then(({ mkdtemp }) => mkdtemp('/tmp/poke-provider-test-'));
+    const credentials = new FileCredentialStore(`${directory}/credentials.json`);
+    await credentials.modify('fireworks', async () => ({ type: 'api_key', key: 'stored-fireworks-key' }));
+    const registry = new ProviderRegistry(credentials);
+    const registered = registry.models.getModels('fireworks')[0]!;
+    const fetchLiveModels = vi.spyOn(FireworksCatalog, 'fetchLiveModels').mockResolvedValue([
+      {
+        id: registered.id,
+        name: registered.name,
+        capabilities: { reasoningEfforts: [] },
+      },
+      {
+        id: 'new-account-visible-model',
+        name: 'New account-visible model',
+        capabilities: { reasoningEfforts: [] },
+      },
+    ]);
+
+    try {
+      await expect(registry.fetchModels('fireworks')).resolves.toEqual([
+        expect.objectContaining({ id: registered.id }),
+      ]);
+    } finally {
+      fetchLiveModels.mockRestore();
+      await import('node:fs/promises').then(({ rm }) => rm(directory, { recursive: true, force: true }));
+    }
+  });
+
   it('rejects an absent model selection instead of silently picking a fallback', async () => {
     const { resolveFlueModelSpecifier } = await import('../../src/providers/provider-registry.js');
     expect(() => resolveFlueModelSpecifier()).toThrow(/No model is configured/);
@@ -223,6 +254,30 @@ describe('resolveFlueModelSpecifier', () => {
       baseUrl: 'https://api.commandcode.ai/provider/v1',
     });
   });
+
+  it('registers selected live Command Code metadata as a concrete Flue model', async () => {
+    const { createCommandCodeCredentialProvider } = await import('../../src/providers/models.js');
+    const provider = createCommandCodeCredentialProvider([
+      {
+        id: 'live-model',
+        name: 'Live model',
+        capabilities: {
+          reasoningEfforts: ['high'],
+          acceptsImages: true,
+          contextWindow: 400000,
+        },
+      },
+    ]);
+
+    expect(provider.getModels()[0]).toMatchObject({
+      id: 'live-model',
+      reasoning: true,
+      input: ['text', 'image'],
+      contextWindow: 400000,
+      maxTokens: 16384,
+    });
+    expect((provider.getModels()[0] as any).thinkingLevelMap.high).toBe('high');
+  });
 });
 
 describe('ComposioToolHandler', () => {
@@ -236,6 +291,7 @@ describe('ComposioToolHandler', () => {
           inputParameters: { type: 'object' },
         },
       ]),
+      listConnectedAccounts: vi.fn().mockResolvedValue([]),
       execute: vi.fn().mockRejectedValue(new Error('connection reset after action')),
     };
     const handler = new ComposioToolHandler('test-key', () => client);
@@ -251,7 +307,11 @@ describe('ComposioToolHandler', () => {
     await expect(handler.execute({ action: 'GMAIL_SEND_EMAIL' })).rejects.toThrow(
       'connection reset after action'
     );
-    expect(client.execute).toHaveBeenCalledWith('GMAIL_SEND_EMAIL', {});
+    expect(client.execute).toHaveBeenCalledWith(
+      'GMAIL_SEND_EMAIL',
+      {},
+      expect.objectContaining({ signal: expect.any(AbortSignal) })
+    );
     expect(client.execute).toHaveBeenCalledTimes(1);
   });
 
@@ -263,12 +323,14 @@ describe('ComposioToolHandler', () => {
 
     const firstClient = {
       listTools: vi.fn().mockReturnValue(firstPromise),
+      listConnectedAccounts: vi.fn().mockResolvedValue([]),
       execute: vi.fn(),
     };
     const secondClient = {
       listTools: vi.fn().mockResolvedValue([
         { slug: 'SECOND_TOOL', name: 'SECOND_TOOL', description: 'Second tool description' },
       ]),
+      listConnectedAccounts: vi.fn().mockResolvedValue([]),
       execute: vi.fn(),
     };
     const clients = [firstClient, secondClient];
@@ -291,5 +353,64 @@ describe('ComposioToolHandler', () => {
       actions: [{ name: 'SECOND_TOOL' }],
     });
     expect(secondClient.listTools).toHaveBeenCalledTimes(1);
+  });
+
+  it('filters file transfer actions and executes against the selected active account exactly once', async () => {
+    const client = {
+      listTools: vi.fn().mockResolvedValue([
+        {
+          slug: 'GMAIL_SEND_EMAIL',
+          name: 'GMAIL_SEND_EMAIL',
+          inputParameters: { type: 'object' },
+        },
+        {
+          slug: 'GOOGLEDRIVE_UPLOAD_FILE',
+          name: 'GOOGLEDRIVE_UPLOAD_FILE',
+          inputParameters: {
+            properties: { upload: { file_uploadable: true } },
+          },
+        },
+      ]),
+      listConnectedAccounts: vi.fn().mockResolvedValue([
+        { id: 'acct-active', toolkit: 'gmail', status: 'ACTIVE' },
+      ]),
+      execute: vi.fn().mockResolvedValue({ sent: true }),
+    };
+    const db = new PokeDatabase(undefined, true);
+    const handler = new ComposioToolHandler('test-key', () => client, db);
+
+    try {
+      await expect(handler.search({ query: 'email' })).resolves.toMatchObject({
+        actions: [{ name: 'GMAIL_SEND_EMAIL' }],
+        connected_accounts: [{ id: 'acct-active' }],
+      });
+
+      await expect(
+        handler.execute({
+          action: 'GMAIL_SEND_EMAIL',
+          params: { to: 'owner@example.com' },
+          connected_account_id: 'acct-active',
+          idempotencyKey: 'composio-tool-call-1',
+        })
+      ).resolves.toEqual({ result: { sent: true } });
+      await handler.execute({
+        action: 'GMAIL_SEND_EMAIL',
+        params: { to: 'owner@example.com' },
+        connected_account_id: 'acct-active',
+        idempotencyKey: 'composio-tool-call-1',
+      });
+
+      expect(client.execute).toHaveBeenCalledTimes(1);
+      expect(client.execute).toHaveBeenCalledWith(
+        'GMAIL_SEND_EMAIL',
+        { to: 'owner@example.com' },
+        expect.objectContaining({
+          connectedAccountId: 'acct-active',
+          signal: expect.any(AbortSignal),
+        })
+      );
+    } finally {
+      db.close();
+    }
   });
 });

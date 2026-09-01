@@ -142,6 +142,7 @@ describe('AutomationScheduler & Timezone (Asia/Karachi)', () => {
     scheduler.setDispatcher(async (signal) => {
       dispatched.push(signal);
       await new Promise((resolve) => setTimeout(resolve, 10));
+      return { submissionId: 'sub_ik_automation' };
     });
     scheduler.start(60_000);
 
@@ -153,8 +154,15 @@ describe('AutomationScheduler & Timezone (Asia/Karachi)', () => {
     expect(dispatched[0].attributes.id).toBe('auto-"<&');
     expect(dispatched[0].attributes.name).toBe('Daily "summary" & review');
     expect(dispatched[0].body).toBe('Read <untrusted> & report it.');
+    expect(dispatched[0].idempotencyKey).toBe(
+      `automation:auto-"<&:${new Date(scheduledAt).toISOString()}`
+    );
     expect(db.getAutomation('auto-"<&')?.last_outcome).toBe('dispatched');
     expect(db.getAutomation('auto-"<&')?.enabled).toBe(0);
+    expect(db.getAutomationOccurrence('auto-"<&', scheduledAt)).toMatchObject({
+      status: 'admitted',
+      submission_id: 'sub_ik_automation',
+    });
   });
 
   it('keeps a failed dispatch eligible for a bounded retry instead of leaving it claimed', async () => {
@@ -167,14 +175,23 @@ describe('AutomationScheduler & Timezone (Asia/Karachi)', () => {
       schedule_value: new Date(scheduledAt).toISOString(),
       next_run_at: scheduledAt,
     });
-    scheduler.setDispatcher(vi.fn().mockRejectedValue(new Error('main agent unavailable')));
+    const dispatch = vi.fn().mockRejectedValue(new Error('main agent unavailable'));
+    scheduler.setDispatcher(dispatch);
     scheduler.start(60_000);
 
     await scheduler.tick();
 
     const updated = db.getAutomation('auto-retry');
     expect(updated?.last_outcome).toContain('dispatch_error: main agent unavailable');
-    expect(updated?.next_run_at).toBeGreaterThan(Date.now());
+    expect(updated?.next_run_at).toBe(scheduledAt);
     expect(updated?.enabled).toBe(1);
+    expect(db.getDueAutomations(Date.now(), 30_000)).toHaveLength(0);
+
+    // Once the cooldown has elapsed, the same occurrence reuses the exact
+    // key, allowing a possibly admitted first dispatch to converge in Flue.
+    db.updateAutomation('auto-retry', { last_run_at: Date.now() - 30_001 });
+    await scheduler.tick();
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    expect(dispatch.mock.calls[1][0].idempotencyKey).toBe(dispatch.mock.calls[0][0].idempotencyKey);
   });
 });

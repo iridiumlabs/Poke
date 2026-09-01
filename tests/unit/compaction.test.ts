@@ -30,6 +30,9 @@ describe('CompactionManager', () => {
 
     manager.setEstimatedTokens(ACTIVE_COMPACTION_TOKEN_THRESHOLD);
     expect(manager.shouldCompactActive()).toBe(true);
+    // Active pressure is an admission gate even without 30 minutes of idle
+    // time, so a new submission cannot push an oversized context further.
+    expect(manager.shouldPreflightCompact()).toBe(true);
   });
 
   it('evaluates idle threshold accurately: 99k vs 100k at 30 minutes', () => {

@@ -7,10 +7,11 @@ import { SkillRegistry } from '../skills/registry.js';
 import { WorkerRunner } from './worker-runner.js';
 import { getLogger } from '../logger/logger.js';
 import { createWorkerCompletionSignal, SignalPayload } from '../agent/signals.js';
+import crypto from 'node:crypto';
 
 export const MAX_CONCURRENT_WORKERS = 4;
 
-export type DispatchSignalFn = (signal: SignalPayload) => Promise<void>;
+export type DispatchSignalFn = (signal: SignalPayload) => Promise<{ submissionId: string }>;
 
 export class WorkerManager {
   private activeRunners = new Map<string, WorkerRunner>();
@@ -56,8 +57,13 @@ export class WorkerManager {
     name: string;
     instruction: string;
     cwd?: string;
+    idempotencyKey?: string;
   }): Promise<WorkerJobRecord> {
-    const id = `job-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const id = params.idempotencyKey
+      ? `job-${crypto.createHash('sha256').update(params.idempotencyKey).digest('hex').slice(0, 24)}`
+      : `job-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const existing = this.db.getWorkerJob(id);
+    if (existing) return existing;
     const record = this.db.createWorkerJob({
       id,
       name: params.name,
@@ -95,14 +101,14 @@ export class WorkerManager {
     const logger = getLogger();
 
     if (runningJobs.length > 0) {
-      logger.warn({ count: runningJobs.length }, 'Reconciling interrupted running workers on startup');
+      logger.warn({ count: runningJobs.length }, 'Reattaching running workers after startup');
 
       for (const job of runningJobs) {
-        this.db.updateWorkerJob(job.id, {
-          status: 'failed',
-          error: 'Worker interrupted by daemon restart',
-          finished_at: Date.now(),
-        });
+        // WorkerRunner dispatches with a stable key and then reads the durable
+        // submission. Re-running it therefore reattaches to Flue recovery (or
+        // admits work that had not made it to Flue before the crash) instead of
+        // inventing a failed completion while Flue may still be executing.
+        void this.runJob(job, true);
       }
     }
 
@@ -134,15 +140,18 @@ export class WorkerManager {
     }
   }
 
-  private async runJob(job: WorkerJobRecord): Promise<void> {
+  private async runJob(job: WorkerJobRecord, recovering = false): Promise<void> {
     if (this.isStopped || !this.db.isOpen()) return;
+    if (this.activeRunners.has(job.id)) return;
     const logger = getLogger().child({ jobId: job.id, jobName: job.name });
-    logger.info('Assigning slot and starting worker execution');
+    logger.info({ recovering }, recovering ? 'Reattaching worker execution' : 'Assigning slot and starting worker execution');
 
-    this.db.updateWorkerJob(job.id, {
-      status: 'running',
-      started_at: Date.now(),
-    });
+    if (!recovering) {
+      this.db.updateWorkerJob(job.id, {
+        status: 'running',
+        started_at: Date.now(),
+      });
+    }
 
     const runner = new WorkerRunner(
       job,
@@ -240,7 +249,7 @@ export class WorkerManager {
     const logger = getLogger().child({ jobId: job.id, jobName: job.name });
 
     try {
-      await this.onDispatchCompletion(
+      const receipt = await this.onDispatchCompletion(
         createWorkerCompletionSignal({
           id: job.id,
           status: job.status,
@@ -249,7 +258,7 @@ export class WorkerManager {
         })
       );
       if (this.db.isOpen()) {
-        this.db.markWorkerCompletionDispatched(job.id);
+        this.db.markWorkerCompletionDispatched(job.id, receipt.submissionId);
       }
       logger.info('Dispatched worker completion signal to main agent');
     } catch (err: any) {

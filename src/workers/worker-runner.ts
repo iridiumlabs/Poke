@@ -55,11 +55,13 @@ export class WorkerRunner {
         throw new Error('No worker model configured. Run `poke model worker`.');
       }
 
-      // A durable receipt may be read again safely, but dispatching it again can repeat tool calls.
+      // A stable key means recovery reattaches to the exact worker submission
+      // rather than admitting a second worker conversation for the same job.
       this.agentHandle = init(PokeWorkerAgent, { id: this.job.id });
       const receipt = await this.agentHandle.dispatch({
         message: this.job.instruction,
         initialData: { cwd: this.job.cwd || undefined },
+        idempotencyKey: `worker:${this.job.id}:run`,
       });
       const reply = await this.agentHandle!.read(receipt, {
         signal: this.abortController?.signal,

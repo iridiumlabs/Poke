@@ -3,6 +3,8 @@ export interface SignalPayload {
   tagName: string;
   attributes: Record<string, string>;
   body: string;
+  /** Stable key for Flue admission when this signal represents one durable event. */
+  idempotencyKey?: string;
 }
 
 export function createWorkerCompletionSignal(params: {
@@ -20,6 +22,7 @@ export function createWorkerCompletionSignal(params: {
       name: params.name,
     },
     body: params.body,
+    idempotencyKey: `worker-completion:${params.id}`,
   };
 }
 
@@ -38,6 +41,6 @@ export function createAutomationTriggerSignal(params: {
       scheduled_at: params.scheduledAt,
     },
     body: params.instruction,
+    idempotencyKey: `automation:${params.id}:${params.scheduledAt}`,
   };
 }
-

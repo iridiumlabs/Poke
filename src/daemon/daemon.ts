@@ -44,8 +44,8 @@ export class PokeDaemon {
 
     const creds = this.configManager.getCredentials();
     this.exa = new ExaToolHandler(creds.exaApiKey);
-    this.supermemory = new SupermemoryToolHandler(creds.supermemoryApiKey);
-    this.composio = new ComposioToolHandler(creds.composioApiKey);
+    this.supermemory = new SupermemoryToolHandler(creds.supermemoryApiKey, 'poke-owner', this.db);
+    this.composio = new ComposioToolHandler(creds.composioApiKey, undefined, this.db);
     this.skills = new SkillRegistry(paths.skillsDir);
     this.compactionManager = new CompactionManager(this.db, this.configManager);
 

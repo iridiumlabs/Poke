@@ -125,4 +125,65 @@ describe('PokeDatabase', () => {
     expect(db.getOutgoingDelivery('send-1:part:0')).toMatchObject({ status: 'sent' });
     expect(db.checkIdempotency('send-1:part:0')?.response_data).toContain('wa-123');
   });
+
+  it('persists submission delivery settlement and automation admission separately from live callbacks', () => {
+    db.reserveSubmissionDelivery({
+      sourceKey: 'whatsapp:wamid-1',
+      source: 'whatsapp',
+      whatsappMessageId: 'wamid-1',
+    });
+    db.attachSubmissionDelivery('whatsapp:wamid-1', 'sub_ik_message');
+    expect(db.getPendingSubmissionDeliveries()).toContainEqual(
+      expect.objectContaining({ source_key: 'whatsapp:wamid-1', submission_id: 'sub_ik_message' })
+    );
+
+    db.settleSubmissionDelivery('sub_ik_message', 'failed', 'provider unavailable');
+    expect(db.getSubmissionDelivery('sub_ik_message')).toMatchObject({
+      status: 'failed',
+      error_message: 'provider unavailable',
+    });
+
+    const scheduledAt = Date.now() - 1_000;
+    db.createAutomation({
+      id: 'auto-admission',
+      name: 'One-time check',
+      instruction: 'Check once.',
+      schedule_type: 'once',
+      schedule_value: new Date(scheduledAt).toISOString(),
+      next_run_at: scheduledAt,
+    });
+    expect(db.claimDueAutomation('auto-admission', scheduledAt, Date.now())).toBe(true);
+    expect(
+      db.finalizeAutomationDispatch('auto-admission', scheduledAt, 'sub_ik_automation', {
+        next_run_at: null,
+        enabled: 0,
+      })
+    ).toBe(true);
+    expect(db.getAutomationOccurrence('auto-admission', scheduledAt)).toMatchObject({
+      status: 'admitted',
+      submission_id: 'sub_ik_automation',
+    });
+
+    const conflictAt = scheduledAt + 1;
+    db.createAutomation({
+      id: 'auto-admission-conflict',
+      name: 'Conflicting check',
+      instruction: 'Check once.',
+      schedule_type: 'once',
+      schedule_value: new Date(conflictAt).toISOString(),
+      next_run_at: conflictAt,
+    });
+    expect(db.claimDueAutomation('auto-admission-conflict', conflictAt, Date.now())).toBe(true);
+    db.updateAutomation('auto-admission-conflict', { last_outcome: 'edited concurrently' });
+    expect(
+      db.finalizeAutomationDispatch('auto-admission-conflict', conflictAt, 'sub_ik_conflict', {
+        next_run_at: null,
+        enabled: 0,
+      })
+    ).toBe(false);
+    expect(db.getAutomationOccurrence('auto-admission-conflict', conflictAt)).toMatchObject({
+      status: 'claimed',
+      submission_id: null,
+    });
+  });
 });

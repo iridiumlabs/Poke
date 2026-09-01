@@ -76,6 +76,26 @@ Perform exhaustive search across multiple sources.`
     expect(skill?.body).toContain('Perform exhaustive search');
   });
 
+  it('packages a skill’s supporting files for Flue activation', () => {
+    const skillDir = path.join(tempDir, 'researcher');
+    fs.mkdirSync(path.join(skillDir, 'references'), { recursive: true });
+    fs.writeFileSync(
+      path.join(skillDir, 'SKILL.md'),
+      `---
+name: researcher
+description: Research with a required checklist
+---
+Read references/checklist.md before researching.`
+    );
+    fs.writeFileSync(path.join(skillDir, 'references', 'checklist.md'), 'Verify primary sources first.');
+
+    const skill = registry.getFlueSkills().find((candidate) => candidate.name === 'researcher');
+    expect(skill?.instructions).toContain('references/checklist.md');
+    expect(new TextDecoder().decode(skill?.files?.['references/checklist.md'] as Uint8Array)).toBe(
+      'Verify primary sources first.'
+    );
+  });
+
   it('updates edited skills immediately', () => {
     const skillDir = path.join(tempDir, 'my-skill');
     fs.mkdirSync(skillDir);

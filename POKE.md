@@ -764,7 +764,7 @@ Retry only plausibly transient failures:
 - Temporary HTTP 5xx errors.
 - Explicit temporary provider-unavailable responses.
 
-Use five total attempts:
+For direct provider integrations that Poke owns, use five total attempts:
 
 ```text
 initial attempt
@@ -775,6 +775,8 @@ retry after 20 seconds
 ```
 
 If the provider supplies a sensible `Retry-After`, honor it instead of the fixed delay. Add small jitter to prevent synchronized retries, but keep behavior close to the schedule above.
+
+Agent model streams are executed by Flue. In the installed runtime, transient model failures receive the initial attempt plus up to three framework retries with jittered exponential delays based on 2, 4, and 8 seconds. Flue does not expose that retry policy for configuration. Poke sets five attempts separately for durable submission recovery after a process interruption.
 
 Do not retry:
 
@@ -794,7 +796,7 @@ Example:
 ```text
 Poke error
 
-Command Code returned 503 after 5 attempts: Service unavailable.
+Command Code returned 503 after the configured retries: Service unavailable.
 ```
 
 Worker failures normally arrive as a worker-completion error signal so the main agent can explain them. A worker provider configuration failure may also be surfaced directly because it can affect every queued job.
@@ -1131,7 +1133,8 @@ The build is not complete until these behaviors are covered by automated integra
 - Reasoning screens show only exact supported levels and are skipped for default-only models.
 - A live unknown Command Code model remains selectable with default reasoning.
 - Removing the selected model causes a clear status/doctor failure and a direct WhatsApp error, with no fallback.
-- A transient provider test follows approximately 2s, 5s, 10s, and 20s retry delays.
+- A direct provider integration transient test follows approximately 2s, 5s, 10s, and 20s retry delays.
+- A model-stream transient test follows Flue's framework retry behavior.
 - An invalid API key is not retried five times.
 - No error path leaks a secret.
 

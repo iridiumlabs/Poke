@@ -1,9 +1,9 @@
 import {
   useModel,
   useSandbox,
-  useInstruction,
   useTool,
   useInitialData,
+  useSkill,
 } from "@flue/runtime";
 import { local } from "@flue/runtime/node";
 import { createPokeTools, ToolContexts } from "./tools.js";
@@ -58,13 +58,11 @@ export function PokeWorkerAgent() {
   useTool(tools.memoryTool);
   useTool(tools.composioSearchTool);
   useTool(tools.composioExecuteTool);
-  useTool(tools.activateSkillTool);
-
-  // 4. Instruction & live skills catalog
-  const skillsCatalog = sharedWorkerContexts.skills.getCatalogPrompt();
-  if (skillsCatalog) {
-    useInstruction(`\n${skillsCatalog}`);
+  for (const skill of sharedWorkerContexts.skills.getFlueSkills()) {
+    useSkill(skill);
   }
 
   return WORKER_AGENT_SYSTEM_PROMPT;
 }
+
+PokeWorkerAgent.durability = { maxAttempts: 5, timeoutMs: 3_600_000 };

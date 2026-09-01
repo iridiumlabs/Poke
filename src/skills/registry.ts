@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { defineSkill, type SkillDefinition } from '@flue/runtime';
 import { getSkillsHome } from '../config/paths.js';
 import { getLogger } from '../logger/logger.js';
 
@@ -216,12 +217,29 @@ export class SkillRegistry {
     return this.skillsCache.get(name) || null;
   }
 
-  getCatalogPrompt(): string {
-    const skills = this.listSkills();
-    if (skills.length === 0) return '';
-
-    const lines = skills.map((s) => `- ${s.name}: ${s.description}`);
-    return `Available skills (use \`activate_skill\` with skill name to load full instructions):\n${lines.join('\n')}`;
+  /**
+   * Reconcile Poke's skill packages into Flue skills. `files` are packaged
+   * with the definition so activation exposes the referenced scripts,
+   * checklists, templates, and other resources rather than just SKILL.md.
+   */
+  getFlueSkills(): SkillDefinition[] {
+    return this.listSkills().flatMap((skill) => {
+      try {
+        const files = this.readSupportingFiles(skill);
+        return [defineSkill({
+          name: skill.name,
+          description: skill.description,
+          instructions: skill.body,
+          ...(Object.keys(files).length > 0 ? { files } : {}),
+        })];
+      } catch (err: any) {
+        getLogger().warn(
+          { err: err?.message || String(err), skill: skill.name },
+          'Skipping invalid skill package'
+        );
+        return [];
+      }
+    });
   }
 
   seedDefaultSkills(): void {
@@ -239,5 +257,30 @@ export class SkillRegistry {
 
     fs.mkdirSync(skillDir, { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(skillDir, 'SKILL.md'), content);
+  }
+
+  private readSupportingFiles(skill: SkillMetadata): Record<string, Uint8Array> {
+    const root = path.dirname(skill.path);
+    // A single markdown file has no private package directory. Do not package
+    // sibling skills as its resources.
+    if (path.resolve(root) === path.resolve(this.skillsDir)) return {};
+
+    const files: Record<string, Uint8Array> = {};
+    const visit = (directory: string): void => {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        if (entry.isSymbolicLink()) continue;
+        const fullPath = path.join(directory, entry.name);
+        if (entry.isDirectory()) {
+          visit(fullPath);
+          continue;
+        }
+        if (!entry.isFile() || fullPath === skill.path) continue;
+        const relative = path.relative(root, fullPath);
+        if (!relative || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) continue;
+        files[relative.split(path.sep).join('/')] = fs.readFileSync(fullPath);
+      }
+    };
+    visit(root);
+    return files;
   }
 }

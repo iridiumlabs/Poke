@@ -69,6 +69,7 @@ describe('WorkerManager', () => {
     const dispatchedSignals: SignalPayload[] = [];
     workerManager.setCompletionDispatcher(async (signal) => {
       dispatchedSignals.push(signal);
+      return { submissionId: `sub_ik_${signal.attributes.id}` };
     });
 
     const job = await workerManager.startJob({
@@ -122,7 +123,7 @@ describe('WorkerManager', () => {
     expect(queued.length).toBe(0);
   });
 
-  it('reconciles interrupted running jobs on startup recovery', async () => {
+  it('reattaches interrupted running jobs on startup recovery instead of fabricating failure', async () => {
     // Manually create a worker in running state (as if daemon crashed mid-execution)
     const crashedJob = db.createWorkerJob({
       id: 'job-crashed-1',
@@ -133,13 +134,16 @@ describe('WorkerManager', () => {
 
     expect(db.getRunningWorkerJobs().length).toBe(1);
 
+    const run = vi.spyOn(WorkerRunner.prototype, 'run').mockReturnValue(new Promise(() => {}));
+
     // Run startup reconciliation
     workerManager.reconcileStartupJobs();
 
     const updated = db.getWorkerJob(crashedJob.id);
-    expect(updated?.status).toBe('failed');
-    expect(updated?.error).toContain('Worker interrupted by daemon restart');
-    expect(db.getRunningWorkerJobs().length).toBe(0);
+    expect(updated?.status).toBe('running');
+    expect(updated?.error).toBeNull();
+    expect(db.getRunningWorkerJobs()).toHaveLength(1);
+    expect(run).toHaveBeenCalledTimes(1);
   });
 
   it('persists a terminal worker outcome even when no completion dispatcher is attached', async () => {
@@ -177,6 +181,7 @@ describe('WorkerManager', () => {
     const dispatched: SignalPayload[] = [];
     workerManager.setCompletionDispatcher(async (signal) => {
       dispatched.push(signal);
+      return { submissionId: `sub_ik_${signal.attributes.id}` };
     });
     const crashedJob = db.createWorkerJob({
       id: 'job-"<&',
@@ -207,6 +212,7 @@ describe('WorkerManager', () => {
         throw new Error('Temporary dispatch outage');
       }
       dispatched.push(signal);
+      return { submissionId: 'sub_ik_worker_completion' };
     });
 
     const finishedJob = db.createWorkerJob({
@@ -239,5 +245,7 @@ describe('WorkerManager', () => {
     expect(dispatched[0].tagName).toBe('worker_completion');
     expect(dispatched[0].attributes.id).toBe('job-undelivered-1');
     expect(dispatched[0].body).toBe('Finished job result');
+    expect(dispatched[0].idempotencyKey).toBe('worker-completion:job-undelivered-1');
+    expect(updated?.completion_submission_id).toBe('sub_ik_worker_completion');
   });
 });

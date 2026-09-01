@@ -5,6 +5,7 @@ import makeWASocket, {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   downloadMediaMessage,
+  normalizeMessageContent,
   proto,
   WAMessage,
 } from '@whiskeysockets/baileys';
@@ -68,25 +69,18 @@ export function formatVoiceTranscript(transcript: string): string {
   return `[voice] ${transcript.trim()}`;
 }
 
+function normalizeQuotedPreview(value: string): string {
+  const normalized = value
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return normalized.length > 2000 ? `${normalized.slice(0, 1997)}...` : normalized;
+}
+
 export function unwrapMessageContent(
   msg: proto.IMessage | null | undefined
 ): proto.IMessage | undefined {
-  let content = msg;
-  while (
-    (content as any)?.ephemeralMessage?.message ||
-    (content as any)?.viewOnceMessage?.message ||
-    (content as any)?.viewOnceMessageV2?.message ||
-    (content as any)?.viewOnceMessageV2Extension?.message ||
-    (content as any)?.documentWithCaptionMessage?.message
-  ) {
-    content =
-      (content as any).ephemeralMessage?.message ||
-      (content as any).viewOnceMessage?.message ||
-      (content as any).viewOnceMessageV2?.message ||
-      (content as any).viewOnceMessageV2Extension?.message ||
-      (content as any).documentWithCaptionMessage?.message;
-  }
-  return content || undefined;
+  return normalizeMessageContent(msg) || undefined;
 }
 
 export type MessageDispatchFn = (msg: NormalizedInboundMessage) => Promise<void>;
@@ -283,6 +277,10 @@ export class WhatsAppGateway {
       return;
     }
 
+    // Keep the original envelope. Baileys uses it to serialize a valid
+    // quoted reply, including the real quotedMessage payload.
+    this.sender.registerReplyTarget(msg as WAMessage);
+
     const senderNumber = normalizePhoneNumber(matchedJid.replace(/@.*$/, ''));
     const idempotencyKey = `inbound_msg:${messageId}`;
 
@@ -297,7 +295,6 @@ export class WhatsAppGateway {
 
     // Extract text and attachments (unwrapping ephemeral / view-once wrappers)
     const msgContent = unwrapMessageContent(msg.message) || {};
-    const normalizedMsg = { ...msg, message: msgContent } as WAMessage;
 
     let text =
       msgContent.conversation ||
@@ -348,12 +345,11 @@ export class WhatsAppGateway {
     }
 
     // Extract quoted context from contextInfo if present
-    const contextInfo =
-      msgContent.extendedTextMessage?.contextInfo ||
-      msgContent.imageMessage?.contextInfo ||
-      msgContent.videoMessage?.contextInfo ||
-      msgContent.documentMessage?.contextInfo ||
-      msgContent.audioMessage?.contextInfo;
+    const messageVariantWithContext = Object.values(msgContent as any)
+      .find((value: any) => value && typeof value === 'object' && value.contextInfo) as
+      | { contextInfo?: any }
+      | undefined;
+    const contextInfo = (msgContent as any).contextInfo || messageVariantWithContext?.contextInfo;
 
     if (contextInfo?.quotedMessage) {
       const quoted = unwrapMessageContent(contextInfo.quotedMessage) || {};
@@ -371,8 +367,11 @@ export class WhatsAppGateway {
         else if (quoted.audioMessage) quotedText = '[voice note/audio]';
         else quotedText = '[media]';
       }
-      const stanzaId = contextInfo.stanzaId ? ` ${contextInfo.stanzaId}` : '';
-      const replyPrefix = `[Replying to message ID:${stanzaId} "${quotedText}"]\n\n`;
+      const stanzaId = typeof contextInfo.stanzaId === 'string'
+        ? contextInfo.stanzaId.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 256)
+        : '';
+      const quotedPreview = JSON.stringify(normalizeQuotedPreview(quotedText));
+      const replyPrefix = `[Replying to message ID${stanzaId ? `: ${stanzaId}` : ':'} ${quotedPreview}]\n\n`;
       text = replyPrefix + text;
     }
 
@@ -393,7 +392,7 @@ export class WhatsAppGateway {
           const isPtt = Boolean(msgContent.audioMessage.ptt);
           const ext = isPtt ? 'ogg' : 'mp3';
           const filePath = path.join(msgInboxDir, `audio.${ext}`);
-          const buffer = await this.downloadMedia(normalizedMsg);
+          const buffer = await this.downloadMedia(msg as WAMessage);
           fs.writeFileSync(filePath, buffer as Buffer);
 
           const mime = msgContent.audioMessage.mimetype || 'audio/ogg';
@@ -451,7 +450,7 @@ export class WhatsAppGateway {
             fs.mkdirSync(msgInboxDir, { recursive: true, mode: 0o700 });
           }
           const filePath = path.join(msgInboxDir, 'image.jpg');
-          const buffer = await this.downloadMedia(normalizedMsg);
+          const buffer = await this.downloadMedia(msg as WAMessage);
           fs.writeFileSync(filePath, buffer as Buffer);
 
           attachments.push({
@@ -487,7 +486,7 @@ export class WhatsAppGateway {
             throw new Error(`Invalid document path: ${filePath}`);
           }
 
-          const buffer = await this.downloadMedia(normalizedMsg);
+          const buffer = await this.downloadMedia(msg as WAMessage);
           fs.writeFileSync(filePath, buffer as Buffer);
 
           attachments.push({
@@ -515,7 +514,7 @@ export class WhatsAppGateway {
             fs.mkdirSync(msgInboxDir, { recursive: true, mode: 0o700 });
           }
           const filePath = path.join(msgInboxDir, 'video.mp4');
-          const buffer = await this.downloadMedia(normalizedMsg);
+          const buffer = await this.downloadMedia(msg as WAMessage);
           fs.writeFileSync(filePath, buffer as Buffer);
 
           attachments.push({

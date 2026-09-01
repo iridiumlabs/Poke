@@ -113,7 +113,7 @@ export class CompactionManager {
   }
 
   shouldPreflightCompact(): boolean {
-    return this.shouldCompactIdle();
+    return this.shouldCompactActive() || this.shouldCompactIdle();
   }
 
   onCompactionSuccess(remainingTokens = RECENT_TOKENS_RETENTION): void {

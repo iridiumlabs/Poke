@@ -16,14 +16,51 @@ import type { ModelInfo, ReasoningEffort } from '../config/types.js';
 export const CODEX_PROVIDER_ID = 'openai-codex';
 export const FIREWORKS_PROVIDER_ID = 'fireworks';
 export const COMMAND_CODE_PROVIDER_ID = 'commandcode';
+const COMMAND_CODE_BASE_URL = 'https://api.commandcode.ai/provider/v1';
 
 const REASONING_EFFORTS = new Set<ReasoningEffort>(['low', 'medium', 'high', 'xhigh', 'max']);
 
-export function createCommandCodeCredentialProvider(): Provider<'openai-completions'> {
+export function createCommandCodeRuntimeModel(info: ModelInfo): Model<'openai-completions'> {
+  const supportedEfforts = new Set(info.capabilities.reasoningEfforts);
+  const reasoning = supportedEfforts.size > 0;
+  const thinkingLevelMap = reasoning
+    ? {
+        off: null,
+        minimal: null,
+        low: supportedEfforts.has('low') ? 'low' : null,
+        medium: supportedEfforts.has('medium') ? 'medium' : null,
+        high: supportedEfforts.has('high') ? 'high' : null,
+        xhigh: supportedEfforts.has('xhigh') ? 'xhigh' : null,
+        max: supportedEfforts.has('max') ? 'max' : null,
+      }
+    : undefined;
+  const contextWindow = Math.max(1, info.capabilities.contextWindow || 128000);
+
+  return {
+    id: info.id,
+    name: info.name || info.id,
+    api: 'openai-completions',
+    provider: COMMAND_CODE_PROVIDER_ID,
+    baseUrl: COMMAND_CODE_BASE_URL,
+    reasoning,
+    ...(thinkingLevelMap ? { thinkingLevelMap } : {}),
+    input: info.capabilities.acceptsImages ? ['text', 'image'] : ['text'],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow,
+    // The Command Code catalog does not advertise a completion limit. Keep a
+    // conservative non-zero bound so Flue can enable threshold compaction.
+    maxTokens: Math.min(16384, contextWindow),
+    compat: { supportsReasoningEffort: reasoning },
+  };
+}
+
+export function createCommandCodeCredentialProvider(
+  runtimeModels: readonly ModelInfo[] = []
+): Provider<'openai-completions'> {
   const provider = createProvider({
     id: COMMAND_CODE_PROVIDER_ID,
     name: 'Command Code',
-    baseUrl: 'https://api.commandcode.ai/provider/v1',
+    baseUrl: COMMAND_CODE_BASE_URL,
     auth: {
       apiKey: {
         name: 'Command Code API key',
@@ -36,13 +73,16 @@ export function createCommandCodeCredentialProvider(): Provider<'openai-completi
         },
       },
     },
-    models: [],
+    models: runtimeModels.map(createCommandCodeRuntimeModel),
     api: openAICompletionsApi(),
   }) as unknown as Provider<'openai-completions'>;
 
+  // Static models resolve before this fallback. Keep it for a startup where
+  // the live catalog is temporarily unavailable; selected known models never
+  // use the zero-metadata template.
   (provider as any)[Symbol.for('flue.dynamicModelTemplate')] = {
     api: 'openai-completions',
-    baseUrl: 'https://api.commandcode.ai/provider/v1',
+    baseUrl: COMMAND_CODE_BASE_URL,
   };
 
   return provider;

@@ -246,6 +246,22 @@ describe('CLI & Diagnostics', () => {
     expect(fs.readFileSync(configFile, 'utf8')).toContain('invalid-json');
   });
 
+  it('merges daemon and CLI config patches from fresh disk state', () => {
+    const daemonConfig = new ConfigManager(tempDir);
+    const cliConfig = new ConfigManager(tempDir);
+    daemonConfig.loadConfig(); // Simulates the daemon holding an old in-memory view.
+
+    cliConfig.setMainModel({ provider: 'commandcode', model: 'new-main-model' });
+    daemonConfig.addActiveCapability('automations');
+
+    const persisted = new ConfigManager(tempDir);
+    expect(persisted.getMainModel()).toEqual({
+      provider: 'commandcode',
+      model: 'new-main-model',
+    });
+    expect(persisted.getActiveCapabilities()).toEqual(['automations']);
+  });
+
   it('runs setup WhatsApp-first, rejects the paired account as owner, and persists completed service steps', async () => {
     const ui = new ScriptedUi(
       ['qr'],
