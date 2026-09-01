@@ -441,9 +441,7 @@ describe('CLI & Diagnostics', () => {
     const projectRoot = path.resolve(__dirname, '../..');
     const binPath = path.join(projectRoot, 'dist', 'bin', 'poke.js');
 
-    if (!fs.existsSync(binPath)) {
-      execSync('npm run build', { cwd: projectRoot, stdio: 'pipe' });
-    }
+    execSync('npm run build', { cwd: projectRoot, stdio: 'pipe' });
 
     if (process.platform !== 'win32') {
       const stat = fs.statSync(binPath);
@@ -452,7 +450,9 @@ describe('CLI & Diagnostics', () => {
     }
 
     const pkg = JSON.parse(fs.readFileSync(path.join(projectRoot, 'package.json'), 'utf8'));
-    const result = spawnSync(binPath, ['--version'], {
+    const command = process.platform === 'win32' ? process.execPath : binPath;
+    const args = process.platform === 'win32' ? [binPath, '--version'] : ['--version'];
+    const result = spawnSync(command, args, {
       encoding: 'utf8',
       cwd: projectRoot,
     });

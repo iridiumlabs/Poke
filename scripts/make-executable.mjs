@@ -11,8 +11,6 @@ const binaries = [
 
 if (process.platform !== 'win32') {
   for (const binPath of binaries) {
-    if (fs.existsSync(binPath)) {
-      fs.chmodSync(binPath, 0o755);
-    }
+    fs.chmodSync(binPath, 0o755);
   }
 }
