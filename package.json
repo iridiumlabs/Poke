@@ -11,6 +11,7 @@
   "scripts": {
     "preinstall": "node scripts/check-node-version.mjs",
     "build": "tsc",
+    "postbuild": "node scripts/make-executable.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
