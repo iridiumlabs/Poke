@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { WhatsAppGateway } from '../../src/gateway/whatsapp.js';
+import { WhatsAppGateway, unwrapMessageContent } from '../../src/gateway/whatsapp.js';
 import { WhatsAppSender, splitLongTextMessage } from '../../src/gateway/sender.js';
 import { ConfigManager } from '../../src/config/config.js';
 import { PokeDatabase } from '../../src/db/database.js';
@@ -277,6 +277,45 @@ describe('WhatsApp Gateway & Sender', () => {
     }));
   });
 
+  it('preserves quoted message ID and preview when transcribing a quoted voice note', async () => {
+    const dispatch = vi.fn();
+    const deepgramMock = {
+      transcribe: vi.fn().mockResolvedValue('Please summarize this.'),
+    };
+    const gateway = new WhatsAppGateway(
+      config,
+      db,
+      dispatch,
+      async () => {},
+      tempDir,
+      {
+        downloadMedia: vi.fn().mockResolvedValue(Buffer.from('audio')),
+        deepgram: deepgramMock as any,
+      }
+    );
+
+    await gateway.handleIncomingMessage({
+      key: { remoteJid: '923001234567@s.whatsapp.net', id: 'quoted-voice-transcribed' },
+      message: {
+        audioMessage: {
+          ptt: true,
+          mimetype: 'audio/ogg',
+          contextInfo: {
+            stanzaId: 'original-msg-123',
+            quotedMessage: {
+              conversation: 'Here is the original text to summarize.',
+            },
+          },
+        },
+      },
+    });
+
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({
+      isVoice: true,
+      text: expect.stringContaining('[Replying to message ID: original-msg-123 "Here is the original text to summarize."]\n\n[voice] Please summarize this.'),
+    }));
+  });
+
   it('targets Deepgram Flux /v2/speak API for WhatsApp-compatible TTS synthesis', async () => {
     const dg = new DeepgramHandler('test-api-key', tempDir);
 
@@ -327,6 +366,96 @@ describe('WhatsApp Gateway & Sender', () => {
     });
 
     expect(dispatched).toBe(true);
+  });
+
+  it('unwraps inbound ephemeral and view-once messages properly', async () => {
+    let dispatchedText = '';
+    const gateway = new WhatsAppGateway(
+      config,
+      db,
+      async (msg) => {
+        dispatchedText = msg.text;
+      },
+      async () => {},
+      tempDir
+    );
+
+    // Ephemeral message containing text
+    await gateway.handleIncomingMessage({
+      key: { remoteJid: '923001234567@s.whatsapp.net', id: 'm-ephemeral-1' },
+      message: {
+        ephemeralMessage: {
+          message: {
+            conversation: 'Secret message from ephemeral chat',
+          },
+        },
+      } as any,
+    });
+
+    expect(dispatchedText).toBe('Secret message from ephemeral chat');
+
+    // View-once message containing text
+    await gateway.handleIncomingMessage({
+      key: { remoteJid: '923001234567@s.whatsapp.net', id: 'm-viewonce-1' },
+      message: {
+        viewOnceMessage: {
+          message: {
+            extendedTextMessage: {
+              text: 'View once text content',
+            },
+          },
+        },
+      } as any,
+    });
+
+    expect(dispatchedText).toBe('View once text content');
+  });
+
+  it('uses Baileys normalization for document-with-caption wrappers', () => {
+    const content = unwrapMessageContent({
+      documentWithCaptionMessage: {
+        message: {
+          documentMessage: {
+            fileName: 'brief.pdf',
+            caption: 'Please summarize this document.',
+          },
+        },
+      },
+    } as any);
+
+    expect(content?.documentMessage?.fileName).toBe('brief.pdf');
+    expect(content?.documentMessage?.caption).toBe('Please summarize this document.');
+  });
+
+  it('extracts quoted/replied-to message context into inbound text', async () => {
+    let dispatchedText = '';
+    const gateway = new WhatsAppGateway(
+      config,
+      db,
+      async (msg) => {
+        dispatchedText = msg.text;
+      },
+      async () => {},
+      tempDir
+    );
+
+    await gateway.handleIncomingMessage({
+      key: { remoteJid: '923001234567@s.whatsapp.net', id: 'm-reply-1' },
+      message: {
+        extendedTextMessage: {
+          text: 'What does this mean?',
+          contextInfo: {
+            stanzaId: 'original-msg-999',
+            quotedMessage: {
+              conversation: 'Server CPU load at 98%',
+            },
+          },
+        },
+      } as any,
+    });
+
+    expect(dispatchedText).toContain('[Replying to message ID: original-msg-999 "Server CPU load at 98%"]');
+    expect(dispatchedText).toContain('What does this mean?');
   });
 
   it('deduplicates redelivered inbound messages using idempotency', async () => {
@@ -603,6 +732,106 @@ describe('WhatsApp Gateway & Sender', () => {
     expect(sentMessages[0].audio).toBeDefined();
     expect(sentMessages[1].image).toBeDefined();
     expect(res.mode).toBe('voice');
+  });
+
+  it('sends attachments without sending an empty text message when text is empty', async () => {
+    const sentMessages: any[] = [];
+    const mockSocket = {
+      sendMessage: vi.fn().mockImplementation(async (_jid: string, content: any) => {
+        sentMessages.push(content);
+        return { key: { id: `sent-msg-${sentMessages.length}` } };
+      }),
+    };
+
+    const dummyAttachmentPath = path.join(tempDir, 'photo.jpg');
+    fs.writeFileSync(dummyAttachmentPath, 'fake-photo-bytes');
+
+    const sender = new WhatsAppSender(
+      () => mockSocket,
+      '923001234567@s.whatsapp.net',
+      db,
+      new DeepgramHandler(undefined, tempDir)
+    );
+
+    const res = await sender.send({
+      mode: 'message',
+      text: '',
+      attachments: [{ path: dummyAttachmentPath, filename: 'photo.jpg', mimeType: 'image/jpeg' }],
+    });
+
+    expect(mockSocket.sendMessage).toHaveBeenCalledTimes(1);
+    expect(sentMessages[0].image).toBeDefined();
+    expect(sentMessages[0].text).toBeUndefined();
+    expect(res.mode).toBe('message');
+  });
+
+  it('uses the real inbound envelope for an attachment-only reply', async () => {
+    const mockSocket = {
+      sendMessage: vi.fn().mockResolvedValue({ key: { id: 'attachment-reply' } }),
+    };
+    const attachmentPath = path.join(tempDir, 'reply.jpg');
+    fs.writeFileSync(attachmentPath, 'fake-photo-bytes');
+    const sender = new WhatsAppSender(
+      () => mockSocket,
+      '923001234567@s.whatsapp.net',
+      db,
+      new DeepgramHandler(undefined, tempDir)
+    );
+    const inbound = {
+      key: {
+        remoteJid: '923001234567@s.whatsapp.net',
+        id: 'source-message-id',
+        fromMe: false,
+      },
+      message: { imageMessage: { caption: 'The original image caption' } },
+    } as any;
+    sender.registerReplyTarget(inbound);
+
+    await sender.send({
+      mode: 'message',
+      text: '',
+      attachments: [{ path: attachmentPath, filename: 'reply.jpg', mimeType: 'image/jpeg' }],
+      reply_to: 'source-message-id',
+    });
+
+    expect(mockSocket.sendMessage).toHaveBeenCalledTimes(1);
+    expect(mockSocket.sendMessage.mock.calls[0][2]).toEqual({ quoted: inbound });
+  });
+
+  it('restores a quoted inbound envelope after the sender is recreated', async () => {
+    const mockSocket = {
+      sendMessage: vi.fn().mockResolvedValue({ key: { id: 'recovered-reply' } }),
+    };
+    const firstSender = new WhatsAppSender(
+      () => mockSocket,
+      '923001234567@s.whatsapp.net',
+      db,
+      new DeepgramHandler(undefined, tempDir)
+    );
+    firstSender.registerReplyTarget({
+      key: {
+        remoteJid: '923001234567@s.whatsapp.net',
+        id: 'durable-source-message',
+        fromMe: false,
+      },
+      message: { conversation: 'Persist this quoted message.' },
+    } as any);
+
+    const recoveredSender = new WhatsAppSender(
+      () => mockSocket,
+      '923001234567@s.whatsapp.net',
+      db,
+      new DeepgramHandler(undefined, tempDir)
+    );
+    await recoveredSender.send({
+      mode: 'message',
+      text: 'A recovered answer',
+      reply_to: 'durable-source-message',
+    });
+
+    expect(mockSocket.sendMessage.mock.calls[0][2]?.quoted?.message?.conversation).toBe(
+      'Persist this quoted message.'
+    );
   });
 
   it('rejects reuse of a part idempotency key with altered content', async () => {

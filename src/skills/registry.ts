@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { defineSkill, type SkillDefinition } from '@flue/runtime';
 import { getSkillsHome } from '../config/paths.js';
 import { getLogger } from '../logger/logger.js';
 
@@ -85,8 +86,15 @@ description: Create and manage scheduled tasks and reminders. Use when the user 
 export function parseSkillFile(filePath: string): SkillMetadata | null {
   try {
     if (!fs.existsSync(filePath)) return null;
-    const content = fs.readFileSync(filePath, 'utf8');
     const stat = fs.statSync(filePath);
+    if (stat.size > MAX_SKILL_FILE_SIZE) {
+      getLogger().warn(
+        { filePath, size: stat.size },
+        'Skipping oversized skill file'
+      );
+      return null;
+    }
+    const content = fs.readFileSync(filePath, 'utf8');
 
     // Parse YAML frontmatter if present
     let name = path.basename(path.dirname(filePath));
@@ -126,6 +134,66 @@ export function parseSkillFile(filePath: string): SkillMetadata | null {
     getLogger().warn({ err: err.message, filePath }, 'Failed to parse skill file');
     return null;
   }
+}
+
+export const MAX_SKILL_FILE_SIZE = 512 * 1024; // 512 KB
+export const MAX_SKILL_PACKAGE_BYTES = 8 * 1024 * 1024; // 8 MB aggregate per skill
+export const MAX_SKILL_PACKAGE_DEPTH = 8;
+// Dependency folders and build output never belong in a skill package (see
+// skill-manager contract). Their bulk is excluded before any stat or read.
+export const BULK_EXCLUDED_DIRS = new Set([
+  'node_modules',
+  'dist',
+  'build',
+  'out',
+  'target',
+  'vendor',
+  '__pycache__',
+  '.venv',
+  'venv',
+]);
+
+export function isSecretLikePath(relPath: string): boolean {
+  const normalized = relPath.split(/[/\\]/).join('/');
+  const base = path.basename(normalized);
+  const lowerBase = base.toLowerCase();
+
+  // Hidden files/directories (e.g. .env, .git, .secrets)
+  if (base.startsWith('.') || normalized.split('/').some((seg) => seg.startsWith('.'))) {
+    return true;
+  }
+
+  // Common secret/key extensions
+  if (
+    lowerBase.endsWith('.pem') ||
+    lowerBase.endsWith('.key') ||
+    lowerBase.endsWith('.p12') ||
+    lowerBase.endsWith('.pfx') ||
+    lowerBase.endsWith('.pkcs12') ||
+    lowerBase.endsWith('.kdbx') ||
+    lowerBase.endsWith('.keystore')
+  ) {
+    return true;
+  }
+
+  // Exact names or substrings for secrets/credentials
+  if (
+    lowerBase === 'id_rsa' ||
+    lowerBase === 'id_ed25519' ||
+    lowerBase === 'id_ecdsa' ||
+    lowerBase === 'id_dsa' ||
+    lowerBase === '.netrc' ||
+    lowerBase === '.npmrc' ||
+    lowerBase.includes('secret') ||
+    lowerBase.includes('credential') ||
+    lowerBase.includes('password') ||
+    lowerBase.includes('token') ||
+    lowerBase.includes('api_key')
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 export class SkillRegistry {
@@ -216,12 +284,29 @@ export class SkillRegistry {
     return this.skillsCache.get(name) || null;
   }
 
-  getCatalogPrompt(): string {
-    const skills = this.listSkills();
-    if (skills.length === 0) return '';
-
-    const lines = skills.map((s) => `- ${s.name}: ${s.description}`);
-    return `Available skills (use \`activate_skill\` with skill name to load full instructions):\n${lines.join('\n')}`;
+  /**
+   * Reconcile Poke's skill packages into Flue skills. `files` are packaged
+   * with the definition so activation exposes the referenced scripts,
+   * checklists, templates, and other resources rather than just SKILL.md.
+   */
+  getFlueSkills(): SkillDefinition[] {
+    return this.listSkills().flatMap((skill) => {
+      try {
+        const files = this.readSupportingFiles(skill);
+        return [defineSkill({
+          name: skill.name,
+          description: skill.description,
+          instructions: skill.body,
+          ...(Object.keys(files).length > 0 ? { files } : {}),
+        })];
+      } catch (err: any) {
+        getLogger().warn(
+          { err: err?.message || String(err), skill: skill.name },
+          'Skipping invalid skill package'
+        );
+        return [];
+      }
+    });
   }
 
   seedDefaultSkills(): void {
@@ -239,5 +324,74 @@ export class SkillRegistry {
 
     fs.mkdirSync(skillDir, { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(skillDir, 'SKILL.md'), content);
+  }
+
+  private readSupportingFiles(skill: SkillMetadata): Record<string, Uint8Array> {
+    const root = path.dirname(skill.path);
+    // A single markdown file has no private package directory. Do not package
+    // sibling skills as its resources.
+    if (path.resolve(root) === path.resolve(this.skillsDir)) return {};
+
+    const files: Record<string, Uint8Array> = {};
+    let totalBytes = 0;
+    const visit = (directory: string, depth: number): void => {
+      if (depth > MAX_SKILL_PACKAGE_DEPTH) return;
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        if (entry.isSymbolicLink()) continue;
+        const fullPath = path.join(directory, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name.startsWith('.') || BULK_EXCLUDED_DIRS.has(entry.name)) continue;
+          visit(fullPath, depth + 1);
+          continue;
+        }
+        if (!entry.isFile() || fullPath === skill.path) continue;
+        const relative = path.relative(root, fullPath);
+        if (!relative || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) continue;
+
+        const normalized = relative.split(path.sep).join('/');
+
+        // 1. Only include explicitly declared/referenced files in skill instructions
+        if (!skill.body.includes(normalized)) {
+          continue;
+        }
+
+        // 2. Reject secret-like files
+        if (isSecretLikePath(normalized)) {
+          getLogger().warn(
+            { skill: skill.name, file: normalized },
+            'Skipping secret-like file in skill package'
+          );
+          continue;
+        }
+
+        // 3. Enforce per-file and aggregate size limits
+        try {
+          const stat = fs.statSync(fullPath);
+          if (stat.size > MAX_SKILL_FILE_SIZE) {
+            getLogger().warn(
+              { skill: skill.name, file: normalized, size: stat.size },
+              'Skipping oversized file in skill package'
+            );
+            continue;
+          }
+          if (totalBytes + stat.size > MAX_SKILL_PACKAGE_BYTES) {
+            getLogger().warn(
+              { skill: skill.name, file: normalized, totalBytes: totalBytes + stat.size },
+              'Skipping file that exceeds the skill package byte budget'
+            );
+            continue;
+          }
+          files[normalized] = fs.readFileSync(fullPath);
+          totalBytes += stat.size;
+        } catch (err: any) {
+          getLogger().warn(
+            { skill: skill.name, file: normalized, err: err?.message },
+            'Failed to read skill supporting file'
+          );
+        }
+      }
+    };
+    visit(root, 0);
+    return files;
   }
 }

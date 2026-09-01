@@ -87,4 +87,45 @@ export const MIGRATIONS: Migration[] = [
         ON outgoing_deliveries(status, updated_at);
     `,
   },
+  {
+    name: '003_runtime_handoffs',
+    up: `
+      ALTER TABLE worker_jobs ADD COLUMN completion_submission_id TEXT;
+      ALTER TABLE automations ADD COLUMN last_submission_id TEXT;
+
+      CREATE TABLE IF NOT EXISTS submission_deliveries (
+        source_key TEXT PRIMARY KEY,
+        submission_id TEXT UNIQUE,
+        source TEXT NOT NULL,
+        whatsapp_message_id TEXT,
+        status TEXT NOT NULL DEFAULT 'pending'
+          CHECK (status IN ('pending', 'completed', 'failed', 'aborted')),
+        error_message TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_submission_deliveries_pending
+        ON submission_deliveries(status, submission_id);
+
+      CREATE TABLE IF NOT EXISTS whatsapp_reply_targets (
+        message_id TEXT PRIMARY KEY,
+        envelope BLOB NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_whatsapp_reply_targets_created
+        ON whatsapp_reply_targets(created_at);
+
+      CREATE TABLE IF NOT EXISTS automation_occurrences (
+        automation_id TEXT NOT NULL,
+        scheduled_at INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('claimed', 'admitted')),
+        submission_id TEXT,
+        claimed_at INTEGER NOT NULL,
+        admitted_at INTEGER,
+        PRIMARY KEY (automation_id, scheduled_at)
+      );
+    `,
+  },
 ];

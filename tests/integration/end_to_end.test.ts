@@ -34,7 +34,7 @@ describe('Integration: End-to-End Poke Agent Flows', () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
-  it('mounts tools and handles send, jobs, load_tools, activate_skill, and automations', async () => {
+  it('mounts tools and handles send, jobs, load_tools, skills, and automations', async () => {
     const config = daemon.getConfigManager();
     const gateway = daemon.getGateway();
     const sender = gateway.getSender();
@@ -114,12 +114,10 @@ describe('Integration: End-to-End Poke Agent Flows', () => {
     expect(autoResult).toContain('Weekly summary');
     expect(autoResult).toContain('auto-');
 
-    // 4. Test `activate_skill` tool
-    const skillResult = await tools.activateSkillTool.run({
-      data: { name: 'automations' },
-    } as any);
-    expect(skillResult).toContain('# Automations');
-    expect(skillResult).toContain('Asia/Karachi');
+    // 4. Skills are registered through Flue with their package resources.
+    const automationSkill = skills.getFlueSkills().find((skill) => skill.name === 'automations');
+    expect(automationSkill?.instructions).toContain('# Automations');
+    expect(automationSkill?.instructions).toContain('Asia/Karachi');
 
     // 5. Test compaction resets conditional capabilities
     const compaction = daemon.getCompactionManager();

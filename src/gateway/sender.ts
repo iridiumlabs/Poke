@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'fs';
 import path from 'path';
+import { proto, type WAMessage } from '@whiskeysockets/baileys';
 import { PokeDatabase } from '../db/database.js';
 import { DeepgramHandler } from './deepgram.js';
 import { getLogger, redactSecrets } from '../logger/logger.js';
@@ -89,6 +90,8 @@ export function splitLongTextMessage(text: string, maxLength = 4000): string[] {
 }
 
 export class WhatsAppSender {
+  private readonly replyTargets = new Map<string, WAMessage>();
+
   constructor(
     private getSocket: () => WhatsAppSocketLike | null,
     private ownerJid: string,
@@ -98,6 +101,56 @@ export class WhatsAppSender {
 
   setOwnerJid(jid: string): void {
     this.ownerJid = jid;
+  }
+
+  /** Retain a bounded set of real inbound envelopes for quoted replies. */
+  registerReplyTarget(message: WAMessage): void {
+    const messageId = message.key?.id;
+    if (!messageId) return;
+    this.rememberReplyTarget(messageId, message);
+    try {
+      this.db.saveWhatsAppReplyTarget(messageId, proto.WebMessageInfo.encode(message).finish());
+    } catch (error: any) {
+      getLogger().warn(
+        { messageId, err: error?.message || String(error) },
+        'Failed to persist WhatsApp reply target'
+      );
+    }
+  }
+
+  private getQuoteOptions(replyTo?: string): { quoted: WAMessage } | undefined {
+    if (!replyTo) return undefined;
+    let quoted = this.replyTargets.get(replyTo);
+    if (!quoted) {
+      const encoded = this.db.getWhatsAppReplyTarget(replyTo);
+      if (encoded) {
+        try {
+          quoted = proto.WebMessageInfo.decode(encoded) as WAMessage;
+          this.rememberReplyTarget(replyTo, quoted);
+        } catch (error: any) {
+          getLogger().warn(
+            { replyTo, err: error?.message || String(error) },
+            'Failed to restore WhatsApp reply target'
+          );
+        }
+      }
+    }
+    if (!quoted) {
+      throw new Error(
+        `Cannot reply to WhatsApp message "${replyTo}" because its original message is unavailable.`
+      );
+    }
+    return { quoted };
+  }
+
+  private rememberReplyTarget(messageId: string, message: WAMessage): void {
+    this.replyTargets.delete(messageId);
+    this.replyTargets.set(messageId, message);
+    while (this.replyTargets.size > 200) {
+      const oldest = this.replyTargets.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.replyTargets.delete(oldest);
+    }
   }
 
   private getCompletedPartMessageId(
@@ -206,6 +259,7 @@ export class WhatsAppSender {
     const deliveryKey = idempotencyKey || `send:${crypto.randomUUID()}`;
     let messageId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     let partIndex = 0;
+    let quotePending = Boolean(params.reply_to);
 
     if (params.mode === 'voice') {
       const voicePartPayload = {
@@ -223,10 +277,12 @@ export class WhatsAppSender {
 
       if (cachedPart) {
         messageId = cachedPart;
+        quotePending = false;
       } else {
         logger.info('Synthesizing and sending voice note');
         const { audioPath, mimeType } = await this.deepgram.synthesizeToAudioFile(params.text);
         const audioBuffer = fs.readFileSync(audioPath);
+        const quoteOptions = quotePending ? this.getQuoteOptions(params.reply_to) : undefined;
         messageId = await this.sendPart(
           partKey,
           'whatsapp_send_part',
@@ -239,29 +295,27 @@ export class WhatsAppSender {
               mimetype: mimeType,
               ptt: true,
             },
-            params.reply_to
-              ? {
-                  quoted: {
-                    key: { remoteJid: targetJid, id: params.reply_to },
-                    message: { conversation: '' },
-                  },
-                }
-              : undefined
+            quoteOptions
           )
         );
+        quotePending = false;
       }
       partIndex++;
     } else {
       // mode === "message"
-      const chunks = splitLongTextMessage(params.text);
+      const chunks =
+        params.text.trim().length > 0 || !params.attachments?.length
+          ? splitLongTextMessage(params.text)
+          : [];
 
       for (let i = 0; i < chunks.length; i++) {
         const chunk = chunks[i];
-        const isFirst = i === 0;
+        const replyTo = quotePending ? params.reply_to : undefined;
+        const quoteOptions = this.getQuoteOptions(replyTo);
         const chunkPartPayload = {
           mode: 'message',
           chunk,
-          reply_to: isFirst ? params.reply_to : undefined,
+          reply_to: replyTo,
         };
         const partPayloadHash = computePayloadHash(chunkPartPayload);
         const partKey = `${deliveryKey}:part:${partIndex}`;
@@ -273,16 +327,10 @@ export class WhatsAppSender {
           () => sock.sendMessage(
             targetJid,
             { text: chunk },
-            isFirst && params.reply_to
-              ? {
-                  quoted: {
-                    key: { remoteJid: targetJid, id: params.reply_to },
-                    message: { conversation: '' },
-                  },
-                }
-              : undefined
+            quoteOptions
           )
         );
+        quotePending = false;
         partIndex++;
       }
     }
@@ -290,12 +338,15 @@ export class WhatsAppSender {
     // Send attachments if present
     if (params.attachments && params.attachments.length > 0) {
       for (const att of params.attachments) {
+        const replyTo = quotePending ? params.reply_to : undefined;
+        const quoteOptions = this.getQuoteOptions(replyTo);
         const attPartPayload = {
           attachment: {
             path: att.path,
             filename: att.filename,
             mimeType: att.mimeType,
           },
+          reply_to: replyTo,
         };
         const partPayloadHash = computePayloadHash(attPartPayload);
         const partKey = `${deliveryKey}:part:${partIndex}`;
@@ -307,6 +358,7 @@ export class WhatsAppSender {
         if (cachedPart) {
           messageId = cachedPart;
           partIndex++;
+          quotePending = false;
           continue;
         }
 
@@ -324,24 +376,41 @@ export class WhatsAppSender {
           messageId,
           () => {
             if (mime.startsWith('image/')) {
-              return sock.sendMessage(targetJid, {
-                image: buffer,
-                caption: filename !== path.basename(att.path) ? filename : undefined,
-              });
+              return sock.sendMessage(
+                targetJid,
+                {
+                  image: buffer,
+                  caption: filename !== path.basename(att.path) ? filename : undefined,
+                },
+                quoteOptions
+              );
             }
             if (mime.startsWith('video/')) {
-              return sock.sendMessage(targetJid, { video: buffer, caption: filename });
+              return sock.sendMessage(
+                targetJid,
+                { video: buffer, caption: filename },
+                quoteOptions
+              );
             }
             if (mime.startsWith('audio/')) {
-              return sock.sendMessage(targetJid, { audio: buffer, mimetype: mime });
+              return sock.sendMessage(
+                targetJid,
+                { audio: buffer, mimetype: mime },
+                quoteOptions
+              );
             }
-            return sock.sendMessage(targetJid, {
-              document: buffer,
-              mimetype: mime,
-              fileName: filename,
-            });
+            return sock.sendMessage(
+              targetJid,
+              {
+                document: buffer,
+                mimetype: mime,
+                fileName: filename,
+              },
+              quoteOptions
+            );
           }
         );
+        quotePending = false;
         partIndex++;
       }
     }

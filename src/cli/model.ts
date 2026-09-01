@@ -5,6 +5,7 @@ import { migrateLegacyProviderCredentials } from '../providers/credentials-migra
 import { ProviderRegistry, type ProviderCatalog } from '../providers/provider-registry.js';
 import { redactSecrets } from '../logger/logger.js';
 import { CliCancelledError, createCliUi, type CliUi } from './ui.js';
+import { isDaemonRunning, runRestart } from './lifecycle.js';
 
 const PROVIDER_CHOICES: ReadonlyArray<{ value: ProviderType; name: string; description: string }> = [
   { value: 'commandcode', name: 'Command Code', description: 'Provider API' },
@@ -94,6 +95,10 @@ export async function runModelSelection(
         config.setMainModel(selection);
       } else {
         config.setWorkerModel(selection);
+      }
+      if (isDaemonRunning(customHome)) {
+        ui.note('Restarting the running daemon so the new model definition is applied.');
+        await runRestart({}, customHome);
       }
       ui.success(`${target === 'main' ? 'Main' : 'Worker'} model set to ${describeSelection(selection)}.`);
       return;

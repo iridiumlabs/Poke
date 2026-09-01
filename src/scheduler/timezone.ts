@@ -41,10 +41,14 @@ export function computeNextRun(
       return parsedNum;
     }
 
-    const hasTzOffset = /([zZ]|[+-]\d{2}(:?\d{2})?)$/.test(toParse);
-    if (!hasTzOffset) {
-      toParse = toParse.replace(' ', 'T');
-      toParse = `${toParse}+05:00`;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(toParse)) {
+      toParse = `${toParse}T00:00:00+05:00`;
+    } else {
+      const hasTzOffset = /([zZ]|[+-]\d{2}(:?\d{2})?)$/.test(toParse);
+      if (!hasTzOffset) {
+        toParse = toParse.replace(' ', 'T');
+        toParse = `${toParse}+05:00`;
+      }
     }
 
     const parsed = Date.parse(toParse);

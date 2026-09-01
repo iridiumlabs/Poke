@@ -1,3 +1,5 @@
+import crypto from 'node:crypto';
+import { PokeDatabase } from '../db/database.js';
 import { getLogger } from '../logger/logger.js';
 import { withProviderRetry } from '../providers/retry.js';
 import { providerRequestSignal } from '../providers/fetch.js';
@@ -5,6 +7,8 @@ import { providerRequestSignal } from '../providers/fetch.js';
 export interface MemorySaveParams {
   content: string;
   metadata?: Record<string, string>;
+  idempotencyKey?: string;
+  signal?: AbortSignal;
 }
 
 export interface MemoryRecallParams {
@@ -23,7 +27,11 @@ export interface MemoryItem {
 const SUPERMEMORY_V4_URL = 'https://api.supermemory.ai/v4';
 
 export class SupermemoryToolHandler {
-  constructor(private apiKey?: string, private readonly containerTag = 'poke-owner') {}
+  constructor(
+    private apiKey?: string,
+    private readonly containerTag = 'poke-owner',
+    private readonly db?: PokeDatabase
+  ) {}
 
   setApiKey(apiKey: string): void {
     this.apiKey = apiKey;
@@ -37,6 +45,34 @@ export class SupermemoryToolHandler {
       throw new Error('Memory content is required.');
     }
 
+    const payloadHash = crypto
+      .createHash('sha256')
+      .update(JSON.stringify({ content: params.content, metadata: params.metadata || {} }))
+      .digest('hex');
+    if (params.idempotencyKey && this.db) {
+      const existing = this.db.getOutgoingDelivery(params.idempotencyKey);
+      if (existing) {
+        if (existing.action_type !== 'supermemory_save' || existing.payload_hash !== payloadHash) {
+          throw new Error('This memory save key is already associated with different content.');
+        }
+        if (existing.status === 'pending') {
+          throw new Error('Memory save outcome is unknown. Refusing to replay it automatically.');
+        }
+        return parseStoredMemoryResult(existing.response_data);
+      }
+      const reservation = this.db.reserveOutgoingDelivery(
+        params.idempotencyKey,
+        'supermemory_save',
+        payloadHash
+      );
+      if (!reservation.created) {
+        if (reservation.record.status === 'pending') {
+          throw new Error('Memory save outcome is unknown. Refusing to replay it automatically.');
+        }
+        return parseStoredMemoryResult(reservation.record.response_data);
+      }
+    }
+
     getLogger().info({ containerTag: this.containerTag }, 'Saving memory to Supermemory');
     // The v4 memories endpoint has no Poke-controlled idempotency key. Do not
     // replay an ambiguous mutation after a transport failure.
@@ -46,7 +82,7 @@ export class SupermemoryToolHandler {
         Authorization: `Bearer ${this.apiKey}`,
         'Content-Type': 'application/json',
       },
-      signal: providerRequestSignal(),
+      signal: providerRequestSignal(params.signal),
       body: JSON.stringify({
         containerTag: this.containerTag,
         memories: [{ content: params.content, metadata: params.metadata }],
@@ -59,7 +95,7 @@ export class SupermemoryToolHandler {
     const data = (await response.json().catch(() => ({}))) as Record<string, unknown>;
     const memories = Array.isArray(data.memories) ? data.memories : [];
     const first = memories[0] as Record<string, unknown> | undefined;
-    return {
+    const result = {
       success: true,
       ...(typeof first?.id === 'string'
         ? { id: first.id }
@@ -67,6 +103,15 @@ export class SupermemoryToolHandler {
           ? { id: data.id }
           : {}),
     };
+    if (params.idempotencyKey && this.db) {
+      this.db.completeOutgoingDelivery(
+        params.idempotencyKey,
+        'supermemory_save',
+        payloadHash,
+        JSON.stringify(result)
+      );
+    }
+    return result;
   }
 
   async recall(params: MemoryRecallParams): Promise<{ results: MemoryItem[] }> {
@@ -125,6 +170,14 @@ export class SupermemoryToolHandler {
         }),
       };
     });
+  }
+}
+
+function parseStoredMemoryResult(responseData: string | null | undefined): { success: boolean; id?: string } {
+  try {
+    return JSON.parse(responseData || '{}') as { success: boolean; id?: string };
+  } catch {
+    throw new Error('Completed memory save has an unreadable stored result.');
   }
 }
 

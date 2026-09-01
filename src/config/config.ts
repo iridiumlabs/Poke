@@ -27,7 +27,6 @@ export function getDefaultConfig(): PokeConfig {
 
 export class ConfigManager {
   private paths: PokePaths;
-  private configCache: PokeConfig | null = null;
   private readonly initialize: boolean;
 
   constructor(customHome?: string, options: { initialize?: boolean } = {}) {
@@ -43,16 +42,24 @@ export class ConfigManager {
   }
 
   loadConfig(): PokeConfig {
-    if (this.configCache) {
-      return this.configCache;
-    }
-
     if (!fs.existsSync(this.paths.configFile)) {
       const defaultConfig = getDefaultConfig();
       if (this.initialize) {
-        this.saveConfig(defaultConfig);
+        this.withConfigLock(() => {
+          if (!fs.existsSync(this.paths.configFile)) {
+            this.writeConfig(defaultConfig);
+          }
+        });
       }
-      this.configCache = defaultConfig;
+      return this.readConfig();
+    }
+
+    return this.readConfig();
+  }
+
+  private readConfig(): PokeConfig {
+    if (!fs.existsSync(this.paths.configFile)) {
+      const defaultConfig = getDefaultConfig();
       return defaultConfig;
     }
 
@@ -66,7 +73,7 @@ export class ConfigManager {
       );
     }
 
-    this.configCache = {
+    const config: PokeConfig = {
       ...getDefaultConfig(),
       ...parsed,
       timezone: DEFAULT_TIMEZONE, // Invariant: always Asia/Karachi
@@ -74,16 +81,34 @@ export class ConfigManager {
         ...parsed?.credentials,
       },
     };
-    return this.configCache!;
+    return config;
   }
 
   saveConfig(config: PokeConfig): void {
+    this.withConfigLock((lockId) => this.writeConfig(config, lockId));
+  }
+
+  private writeConfig(config: PokeConfig, lockId?: string): void {
     ensurePokeDirectories(this.paths);
+    if (lockId) {
+      const lockFile = `${this.paths.configFile}.lock`;
+      try {
+        const owner = fs.readFileSync(lockFile, 'utf8');
+        if (owner !== lockId) {
+          throw new Error('Config lock lease expired or was taken over.');
+        }
+      } catch (err: any) {
+        if (err.message === 'Config lock lease expired or was taken over.') throw err;
+        throw new Error(`Config lock is missing: ${err.message}`);
+      }
+    }
+    const normalized: PokeConfig = {
+      ...config,
+      timezone: DEFAULT_TIMEZONE,
+      credentials: { ...config.credentials },
+    };
     const content = JSON.stringify(
-      {
-        ...config,
-        timezone: DEFAULT_TIMEZONE,
-      },
+      normalized,
       null,
       2
     );
@@ -96,7 +121,67 @@ export class ConfigManager {
     } catch {
       // Ignore if chmod fails on some FS
     }
-    this.configCache = config;
+  }
+
+  private updateConfig(mutator: (config: PokeConfig) => void): void {
+    this.withConfigLock((lockId) => {
+      // Always start from disk while holding the lock. A live daemon and a
+      // CLI process therefore patch only their own fields instead of writing
+      // a stale whole-document cache over each other.
+      const config = this.readConfig();
+      mutator(config);
+      this.writeConfig(config, lockId);
+    });
+  }
+
+  private withConfigLock<T>(operation: (lockId: string) => T): T {
+    ensurePokeDirectories(this.paths);
+    const lockFile = `${this.paths.configFile}.lock`;
+    const deadline = Date.now() + 5_000;
+    let descriptor: number | undefined;
+    const lockId = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    while (descriptor === undefined) {
+      try {
+        descriptor = fs.openSync(lockFile, 'wx', 0o600);
+        fs.writeFileSync(descriptor, lockId, 'utf8');
+      } catch (error: any) {
+        if (error?.code !== 'EEXIST') throw error;
+        try {
+          const ageMs = Date.now() - fs.statSync(lockFile).mtimeMs;
+          if (ageMs > 60_000) {
+            fs.unlinkSync(lockFile);
+            continue;
+          }
+        } catch (lockError: any) {
+          if (lockError?.code !== 'ENOENT') throw lockError;
+          continue;
+        }
+        if (Date.now() >= deadline) {
+          throw new Error(`Timed out waiting to update configuration at ${this.paths.configFile}.`);
+        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+      }
+    }
+
+    try {
+      return operation(lockId);
+    } finally {
+      try {
+        fs.closeSync(descriptor);
+      } finally {
+        try {
+          if (fs.existsSync(lockFile)) {
+            const currentOwner = fs.readFileSync(lockFile, 'utf8');
+            if (currentOwner === lockId) {
+              fs.unlinkSync(lockFile);
+            }
+          }
+        } catch (error: any) {
+          if (error?.code !== 'ENOENT') throw error;
+        }
+      }
+    }
   }
 
   getOwnerPhoneNumber(): string | undefined {
@@ -106,9 +191,9 @@ export class ConfigManager {
 
   setOwnerPhoneNumber(phoneNumber: string): void {
     const normalized = normalizePhoneNumber(phoneNumber);
-    const config = this.loadConfig();
-    config.ownerPhoneNumber = normalized;
-    this.saveConfig(config);
+    this.updateConfig((config) => {
+      config.ownerPhoneNumber = normalized;
+    });
   }
 
   getWhatsAppAccount(): string | undefined {
@@ -116,9 +201,9 @@ export class ConfigManager {
   }
 
   setWhatsAppAccount(phoneNumber: string | undefined): void {
-    const config = this.loadConfig();
-    config.whatsappAccount = phoneNumber;
-    this.saveConfig(config);
+    this.updateConfig((config) => {
+      config.whatsappAccount = phoneNumber;
+    });
   }
 
   getCredentials(): ServiceCredentials {
@@ -127,22 +212,22 @@ export class ConfigManager {
   }
 
   updateCredentials(credentials: Partial<ServiceCredentials>): void {
-    const config = this.loadConfig();
-    config.credentials = {
-      ...config.credentials,
-      ...credentials,
-    };
-    this.saveConfig(config);
+    this.updateConfig((config) => {
+      config.credentials = {
+        ...config.credentials,
+        ...credentials,
+      };
+    });
   }
 
   clearProviderCredentials(): void {
-    const config = this.loadConfig();
-    const { fireworksApiKey, commandCodeApiKey, codexAuth, ...retained } = config.credentials;
-    void fireworksApiKey;
-    void commandCodeApiKey;
-    void codexAuth;
-    config.credentials = retained;
-    this.saveConfig(config);
+    this.updateConfig((config) => {
+      const { fireworksApiKey, commandCodeApiKey, codexAuth, ...retained } = config.credentials;
+      void fireworksApiKey;
+      void commandCodeApiKey;
+      void codexAuth;
+      config.credentials = retained;
+    });
   }
 
   getMainModel(): ModelSelection | undefined {
@@ -151,9 +236,9 @@ export class ConfigManager {
   }
 
   setMainModel(modelSelection: ModelSelection): void {
-    const config = this.loadConfig();
-    config.mainModel = modelSelection;
-    this.saveConfig(config);
+    this.updateConfig((config) => {
+      config.mainModel = modelSelection;
+    });
   }
 
   getWorkerModel(): ModelSelection | undefined {
@@ -162,9 +247,9 @@ export class ConfigManager {
   }
 
   setWorkerModel(modelSelection: ModelSelection): void {
-    const config = this.loadConfig();
-    config.workerModel = modelSelection;
-    this.saveConfig(config);
+    this.updateConfig((config) => {
+      config.workerModel = modelSelection;
+    });
   }
 
   getActiveCapabilities(): string[] {
@@ -173,16 +258,16 @@ export class ConfigManager {
   }
 
   addActiveCapability(capability: string): void {
-    const config = this.loadConfig();
-    const caps = new Set(config.activeCapabilities || []);
-    caps.add(capability);
-    config.activeCapabilities = Array.from(caps);
-    this.saveConfig(config);
+    this.updateConfig((config) => {
+      const caps = new Set(config.activeCapabilities || []);
+      caps.add(capability);
+      config.activeCapabilities = Array.from(caps);
+    });
   }
 
   clearActiveCapabilities(): void {
-    const config = this.loadConfig();
-    config.activeCapabilities = [];
-    this.saveConfig(config);
+    this.updateConfig((config) => {
+      config.activeCapabilities = [];
+    });
   }
 }

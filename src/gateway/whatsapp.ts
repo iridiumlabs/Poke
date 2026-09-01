@@ -5,6 +5,7 @@ import makeWASocket, {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
   downloadMediaMessage,
+  normalizeMessageContent,
   proto,
   WAMessage,
 } from '@whiskeysockets/baileys';
@@ -66,6 +67,20 @@ export function formatInboundMessageText(
 
 export function formatVoiceTranscript(transcript: string): string {
   return `[voice] ${transcript.trim()}`;
+}
+
+function normalizeQuotedPreview(value: string): string {
+  const normalized = value
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return normalized.length > 2000 ? `${normalized.slice(0, 1997)}...` : normalized;
+}
+
+export function unwrapMessageContent(
+  msg: proto.IMessage | null | undefined
+): proto.IMessage | undefined {
+  return normalizeMessageContent(msg) || undefined;
 }
 
 export type MessageDispatchFn = (msg: NormalizedInboundMessage) => Promise<void>;
@@ -262,6 +277,10 @@ export class WhatsAppGateway {
       return;
     }
 
+    // Keep the original envelope. Baileys uses it to serialize a valid
+    // quoted reply, including the real quotedMessage payload.
+    this.sender.registerReplyTarget(msg as WAMessage);
+
     const senderNumber = normalizePhoneNumber(matchedJid.replace(/@.*$/, ''));
     const idempotencyKey = `inbound_msg:${messageId}`;
 
@@ -274,8 +293,9 @@ export class WhatsAppGateway {
 
     logger.info({ messageId }, 'Received WhatsApp message from owner');
 
-    // Extract text and attachments
-    const msgContent = msg.message!;
+    // Extract text and attachments (unwrapping ephemeral / view-once wrappers)
+    const msgContent = unwrapMessageContent(msg.message) || {};
+
     let text =
       msgContent.conversation ||
       msgContent.extendedTextMessage?.text ||
@@ -324,6 +344,38 @@ export class WhatsAppGateway {
       return;
     }
 
+    // Extract quoted context from contextInfo if present
+    const messageVariantWithContext = Object.values(msgContent as any)
+      .find((value: any) => value && typeof value === 'object' && value.contextInfo) as
+      | { contextInfo?: any }
+      | undefined;
+    const contextInfo = (msgContent as any).contextInfo || messageVariantWithContext?.contextInfo;
+
+    let replyPrefix = '';
+    if (contextInfo?.quotedMessage) {
+      const quoted = unwrapMessageContent(contextInfo.quotedMessage) || {};
+      let quotedText =
+        quoted.conversation ||
+        quoted.extendedTextMessage?.text ||
+        quoted.imageMessage?.caption ||
+        quoted.videoMessage?.caption ||
+        quoted.documentMessage?.caption ||
+        '';
+      if (!quotedText) {
+        if (quoted.imageMessage) quotedText = '[image]';
+        else if (quoted.videoMessage) quotedText = '[video]';
+        else if (quoted.documentMessage) quotedText = `[document: ${quoted.documentMessage.fileName || 'file'}]`;
+        else if (quoted.audioMessage) quotedText = '[voice note/audio]';
+        else quotedText = '[media]';
+      }
+      const stanzaId = typeof contextInfo.stanzaId === 'string'
+        ? contextInfo.stanzaId.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 256)
+        : '';
+      const quotedPreview = JSON.stringify(normalizeQuotedPreview(quotedText));
+      replyPrefix = `[Replying to message ID${stanzaId ? `: ${stanzaId}` : ':'} ${quotedPreview}]\n\n`;
+      text = replyPrefix + text;
+    }
+
     try {
       // Handle Media & Attachments
       const attachments: InboundMediaAttachment[] = [];
@@ -362,7 +414,7 @@ export class WhatsAppGateway {
             try {
               const transcript = await this.deepgram.transcribe(buffer as Buffer, mime);
               if (transcript) {
-                text = formatVoiceTranscript(transcript);
+                text = replyPrefix + formatVoiceTranscript(transcript);
                 isVoice = true;
                 logger.info({ messageId, transcriptLength: transcript.length }, 'Voice note transcribed');
               } else {
@@ -371,7 +423,7 @@ export class WhatsAppGateway {
                   messageId,
                   'Poke could not transcribe the voice message. Please send it again.'
                 );
-                if (!text.trim()) return;
+                if (!text.trim() || text === replyPrefix) return;
               }
             } catch (sttErr: any) {
               logger.error({ err: sttErr.message }, 'Voice note transcription failed');
@@ -379,7 +431,7 @@ export class WhatsAppGateway {
                 messageId,
                 'Poke could not transcribe the voice message. Please send it again.'
               );
-              if (!text.trim()) return;
+              if (!text.trim() || text === replyPrefix) return;
             }
           }
         } catch (err: any) {
@@ -388,7 +440,7 @@ export class WhatsAppGateway {
             messageId,
             'Poke could not download the audio message. Please send it again.'
           );
-          if (!text.trim()) return;
+          if (!text.trim() || text === replyPrefix) return;
         }
       }
 
