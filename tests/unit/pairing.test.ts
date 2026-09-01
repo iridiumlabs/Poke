@@ -60,7 +60,7 @@ describe('WhatsAppPairingService', () => {
     expect(socket.end).toHaveBeenCalled();
   });
 
-  it('does not call requestPairingCode before the socket reaches pairing-ready state', async () => {
+  it('does not call requestPairingCode before the socket reaches pairing-ready state and ignores connecting update', async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'poke-pairing-'));
     directories.push(home);
     const paths = resolvePokePaths(home);
@@ -85,7 +85,11 @@ describe('WhatsAppPairingService', () => {
     // Before any pairing-ready update is emitted, requestPairingCode MUST NOT be called.
     expect(socket.requestPairingCode).not.toHaveBeenCalled();
 
-    // Emit initial pairing-ready update
+    // Emitting connection: 'connecting' must NOT prematurely trigger requestPairingCode
+    socket.ev.emit('connection.update', { connection: 'connecting' });
+    expect(socket.requestPairingCode).not.toHaveBeenCalled();
+
+    // Emitting initial pairing-ready QR update triggers requestPairingCode
     socket.ev.emit('connection.update', { qr: 'initial-qr-payload' });
 
     await vi.waitFor(() => {
@@ -99,6 +103,53 @@ describe('WhatsAppPairingService', () => {
     const result = await pairPromise;
     expect(result.paired).toBe(true);
     expect(result.pairedAccount).toBe('923001111111');
+  });
+
+  it('ignores pairing code rejection from a superseded socket during 515 reconnection and succeeds on replacement socket', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'poke-pairing-'));
+    directories.push(home);
+    const paths = resolvePokePaths(home);
+    const socket1 = new FakeSocket();
+    const socket2 = new FakeSocket();
+    let callCount = 0;
+
+    socket1.requestPairingCode.mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      throw new Error('Connection Closed on superseded socket');
+    });
+
+    const service = new WhatsAppPairingService(paths, {
+      async create(stagingDirectory) {
+        callCount++;
+        if (callCount === 1) {
+          fs.writeFileSync(path.join(stagingDirectory, 'creds.json'), 'new-staged');
+          setTimeout(() => {
+            socket1.ev.emit('connection.update', { qr: 'test-qr-1' });
+            setTimeout(() => {
+              socket1.ev.emit('connection.update', {
+                connection: 'close',
+                lastDisconnect: { error: { output: { statusCode: 515 } } },
+              });
+            }, 5);
+          }, 0);
+          return { socket: socket1, saveCreds: vi.fn() };
+        } else {
+          setTimeout(() => socket2.ev.emit('connection.update', { connection: 'open' }), 30);
+          return { socket: socket2, saveCreds: vi.fn() };
+        }
+      },
+    });
+
+    const result = await service.pair({
+      method: { type: 'phone', phoneNumber: '+923001111111' },
+    });
+
+    expect(callCount).toBe(2);
+    expect(result.paired).toBe(true);
+    expect(result.pairedAccount).toBe('923001111111');
+    expect(socket1.end).toHaveBeenCalled();
+    expect(socket2.end).toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(paths.whatsappDir, 'creds.json'), 'utf8')).toBe('new-staged');
   });
 
   it('waits for the final WhatsApp connection before committing the session in phone pairing', async () => {

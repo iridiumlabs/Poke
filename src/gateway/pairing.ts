@@ -184,6 +184,7 @@ export class WhatsAppPairingService {
     return await new Promise<string | undefined>((resolve, reject) => {
       let settled = false;
       let currentSocket = initialSocket;
+      let currentGeneration = 0;
       let pairingCodeRequested = false;
 
       const finish = (outcome: () => void) => {
@@ -209,19 +210,17 @@ export class WhatsAppPairingService {
           request.onQr?.(update.qr);
         }
 
-        if (
-          phoneNumber &&
-          !pairingCodeRequested &&
-          (update.qr || (update.connection && update.connection !== 'close'))
-        ) {
+        if (phoneNumber && !pairingCodeRequested && update.qr) {
           pairingCodeRequested = true;
           request.onStatus?.('Requesting a WhatsApp pairing code…');
+          const requestGen = currentGeneration;
           void currentSocket.requestPairingCode(phoneNumber).then(
             (code) => {
               if (settled) return;
               request.onPairingCode?.(formatPairingCode(code));
             },
             (err: unknown) => {
+              if (settled || requestGen !== currentGeneration) return;
               finish(() => reject(err instanceof Error ? err : new Error(String(err))));
             }
           );
@@ -234,6 +233,7 @@ export class WhatsAppPairingService {
         } else if (update.connection === 'close') {
           const statusCode = (update.lastDisconnect?.error as { output?: { statusCode?: unknown } } | undefined)?.output?.statusCode;
           if (statusCode === DisconnectReason.restartRequired || statusCode === 515) {
+            currentGeneration++;
             currentSocket.ev.off?.('connection.update', onUpdate);
             void Promise.resolve(currentSocket.end()).catch(() => {});
             void recreateSocket().then(
