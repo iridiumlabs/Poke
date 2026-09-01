@@ -681,6 +681,21 @@ export class PokeDatabase {
       .all() as SubmissionDeliveryRecord[];
   }
 
+  hasFlueSubmission(submissionId: string): boolean {
+    if (!this.isOpen()) return false;
+    const row = this.db
+      .prepare('SELECT 1 FROM flue_agent_submissions WHERE submission_id = ?')
+      .get(submissionId);
+    return Boolean(row);
+  }
+
+  removeUnattachedSubmissionDelivery(sourceKey: string): void {
+    if (!this.isOpen()) return;
+    this.db
+      .prepare('DELETE FROM submission_deliveries WHERE source_key = ? AND submission_id IS NULL')
+      .run(sourceKey);
+  }
+
   saveWhatsAppReplyTarget(messageId: string, envelope: Uint8Array): void {
     if (!this.isOpen()) return;
     this.db

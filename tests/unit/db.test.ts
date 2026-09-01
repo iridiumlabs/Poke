@@ -187,4 +187,46 @@ describe('PokeDatabase', () => {
       submission_id: null,
     });
   });
+
+  it('prunes unattached submission deliveries and checks flue submissions', () => {
+    db.reserveSubmissionDelivery({
+      sourceKey: 'whatsapp:unattached-1',
+      source: 'whatsapp',
+      whatsappMessageId: 'unattached-1',
+    });
+    db.reserveSubmissionDelivery({
+      sourceKey: 'whatsapp:attached-1',
+      source: 'whatsapp',
+      whatsappMessageId: 'attached-1',
+    });
+    db.attachSubmissionDelivery('whatsapp:attached-1', 'sub_ik_attached');
+
+    expect(db.getSubmissionDeliveryBySourceKey('whatsapp:unattached-1')).toMatchObject({
+      submission_id: null,
+      status: 'pending',
+    });
+
+    db.removeUnattachedSubmissionDelivery('whatsapp:unattached-1');
+    expect(db.getSubmissionDeliveryBySourceKey('whatsapp:unattached-1')).toBeNull();
+
+    // Does not remove attached delivery even if called
+    db.removeUnattachedSubmissionDelivery('whatsapp:attached-1');
+    expect(db.getSubmissionDeliveryBySourceKey('whatsapp:attached-1')).not.toBeNull();
+
+    // Propagates lookup error when Flue table is missing
+    expect(() => db.hasFlueSubmission('sub_ik_nonexistent')).toThrow();
+
+    (db as any).db.exec(`
+      CREATE TABLE IF NOT EXISTS flue_agent_submissions (
+        submission_id TEXT NOT NULL UNIQUE
+      )
+    `);
+
+    expect(db.hasFlueSubmission('sub_ik_nonexistent')).toBe(false);
+
+    (db as any).db
+      .prepare('INSERT INTO flue_agent_submissions (submission_id) VALUES (?)')
+      .run('sub_ik_existing');
+    expect(db.hasFlueSubmission('sub_ik_existing')).toBe(true);
+  });
 });
