@@ -52,12 +52,73 @@ describe('CompactionManager', () => {
     expect(manager.shouldCompactIdle()).toBe(false);
   });
 
-  it('resets conditional capabilities after successful compaction', () => {
+  it('resets conditional capabilities after successful compaction without updating last activity time', () => {
     config.addActiveCapability('automations');
     expect(config.getActiveCapabilities()).toContain('automations');
+
+    const pastTime = Date.now() - 3600000;
+    manager.setLastActivityTime(pastTime);
 
     manager.onCompactionSuccess(20000);
     expect(config.getActiveCapabilities()).toEqual([]);
     expect(manager.getEstimatedTokens()).toBe(20000);
+    // Compaction must not mutate last activity time
+    expect(manager.getLastActivityTime()).toBe(pastTime);
+  });
+
+  it('setMainAgentBusy updates busy state without triggering phantom activity', () => {
+    const pastTime = Date.now() - 3600000;
+    manager.setLastActivityTime(pastTime);
+
+    expect(manager.isBusy()).toBe(false);
+    manager.setMainAgentBusy(true);
+    expect(manager.isBusy()).toBe(true);
+    expect(manager.getLastActivityTime()).toBe(pastTime);
+
+    manager.setMainAgentBusy(false);
+    expect(manager.isBusy()).toBe(false);
+    expect(manager.getLastActivityTime()).toBe(pastTime);
+  });
+
+  it('calculates active conversation token estimate and reflects compaction reduction', () => {
+    // Setup Flue table in sqlite
+    (db as any).db.exec(`
+      CREATE TABLE IF NOT EXISTS flue_conversation_stream_batches (
+        path TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        data TEXT NOT NULL,
+        PRIMARY KEY (path, seq)
+      );
+    `);
+
+    const streamPath = 'agents/PokeMainAgent/owner';
+    const longMessage = 'A'.repeat(40000); // ~10,000 tokens
+
+    // 1. Initial messages before compaction
+    const batch1 = [
+      { type: 'user_message', content: longMessage },
+      { type: 'assistant_text_completed', text: longMessage },
+    ];
+    (db as any).db
+      .prepare('INSERT INTO flue_conversation_stream_batches (path, seq, data) VALUES (?, ?, ?)')
+      .run(streamPath, 1, JSON.stringify(batch1));
+
+    const beforeEstimate = db.getActiveConversationTokenEstimate('PokeMainAgent', 'owner');
+    expect(beforeEstimate).toBeGreaterThanOrEqual(20000);
+
+    // 2. Add compaction record + small recent message
+    const summary = 'Summary of prior discussion.';
+    const recentMsg = 'Short recent message.';
+    const batch2 = [
+      { type: 'compaction', entryId: 'c1', summary, details: { readFiles: ['/a/b'] } },
+      { type: 'user_message', content: recentMsg },
+    ];
+    (db as any).db
+      .prepare('INSERT INTO flue_conversation_stream_batches (path, seq, data) VALUES (?, ?, ?)')
+      .run(streamPath, 2, JSON.stringify(batch2));
+
+    const afterEstimate = db.getActiveConversationTokenEstimate('PokeMainAgent', 'owner');
+    expect(afterEstimate).toBeLessThan(beforeEstimate!);
+    expect(afterEstimate).toBeLessThan(1000);
   });
 });

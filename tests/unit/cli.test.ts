@@ -485,4 +485,28 @@ describe('CLI & Diagnostics', () => {
     expect(updateCmd).toBeDefined();
     expect(updateCmd?.description()).toContain('Update Poke from origin/main');
   });
+
+  it('registers the compact command with clear description', () => {
+    const program = createCli();
+    const compactCmd = program.commands.find((cmd) => cmd.name() === 'compact');
+
+    expect(compactCmd).toBeDefined();
+    expect(compactCmd?.description()).toContain('Manually compact the main agent conversation');
+  });
+
+  it('getMobileStatusText produces concise mobile-friendly status from database', async () => {
+    const { getMobileStatusText } = await import('../../src/cli/status.js');
+    db.setState('approximate_tokens', '145000');
+    db.setState('main_agent_busy', 'false');
+    config.setMainModel({ provider: 'commandcode', model: 'claude-sonnet-4-6' });
+    config.setWorkerModel({ provider: 'commandcode', model: 'claude-sonnet-4-6' });
+
+    const statusText = await getMobileStatusText(tempDir, config);
+    expect(statusText).toContain('*Poke Status*');
+    expect(statusText).toContain('• Context: ~145,000 tokens');
+    expect(statusText).toContain('• Active Threshold: 272,000 tokens');
+    expect(statusText).toContain('• Idle Threshold: 100,000 tokens (after 30m)');
+    expect(statusText).toContain('• State: Idle');
+    expect(statusText).toContain('• Main: commandcode / claude-sonnet-4-6');
+  });
 });

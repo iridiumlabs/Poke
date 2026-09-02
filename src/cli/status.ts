@@ -161,3 +161,59 @@ export async function runStatus(customHome?: string): Promise<void> {
   }
   console.log('\n========================================\n');
 }
+
+export async function getMobileStatusText(
+  sqliteFileOrCustomHome?: string,
+  config?: ConfigManager
+): Promise<string> {
+  const isSqlitePath = typeof sqliteFileOrCustomHome === 'string' && sqliteFileOrCustomHome.endsWith('.sqlite');
+  const paths = resolvePokePaths(isSqlitePath ? undefined : sqliteFileOrCustomHome);
+  const sqliteFile = isSqlitePath ? sqliteFileOrCustomHome : paths.sqliteFile;
+  const cfg = config || new ConfigManager(isSqlitePath ? undefined : sqliteFileOrCustomHome, { initialize: false });
+  const database = await readStatusDatabase(sqliteFile);
+  const mainModel = cfg.getMainModel();
+  const workerModel = cfg.getWorkerModel();
+
+  const stats = database || {
+    approximateTokens: 0,
+    agentBusy: false,
+    runningWorkers: 0,
+    queuedWorkers: 0,
+    enabledAutomations: 0,
+    totalAutomations: 0,
+  };
+
+  const lines: string[] = [
+    '*Poke Status*',
+    '',
+    '*Agent & Context*',
+    `• State: ${stats.agentBusy ? 'Active' : 'Idle'}`,
+    `• Context: ~${stats.approximateTokens.toLocaleString()} tokens`,
+    `• Active Threshold: ${ACTIVE_COMPACTION_TOKEN_THRESHOLD.toLocaleString()} tokens`,
+    `• Idle Threshold: ${IDLE_COMPACTION_TOKEN_THRESHOLD.toLocaleString()} tokens (after 30m)`,
+  ];
+
+  if (stats.lastActivityTime) {
+    lines.push(`• Last Activity: ${new Date(stats.lastActivityTime).toISOString()}`);
+  }
+
+  lines.push(
+    '',
+    '*Models*',
+    `• Main: ${describeModel(mainModel)}`,
+    `• Worker: ${describeModel(workerModel)}`,
+    '',
+    '*Workers*',
+    `• Running: ${stats.runningWorkers} / 4`,
+    `• Queued: ${stats.queuedWorkers}`,
+    '',
+    '*Automations*',
+    `• Active: ${stats.enabledAutomations} / ${stats.totalAutomations}`
+  );
+
+  if (stats.nextAutomation) {
+    lines.push(`• Next Run: ${new Date(stats.nextAutomation.nextRunAt).toISOString()} (${stats.nextAutomation.name})`);
+  }
+
+  return lines.join('\n');
+}

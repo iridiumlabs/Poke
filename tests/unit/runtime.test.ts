@@ -338,3 +338,149 @@ describe('PokeRuntime: Submission Delivery & Replay Recovery', () => {
   });
 });
 
+describe('PokeRuntime: Compaction Mechanics & Manual Compaction', () => {
+  let tempDir: string;
+  let db: PokeDatabase;
+  let config: ConfigManager;
+  let sender: WhatsAppSender;
+  let compactionManager: CompactionManager;
+  let runtime: PokeRuntime;
+
+  let mockAgentHandle: {
+    dispatch: ReturnType<typeof vi.fn>;
+    read: ReturnType<typeof vi.fn>;
+    abort: ReturnType<typeof vi.fn>;
+  };
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'poke-runtime-compact-test-'));
+    db = new PokeDatabase(tempDir);
+    config = new ConfigManager(tempDir);
+    config.setOwnerPhoneNumber('923001234567');
+
+    sender = new WhatsAppSender(
+      {} as any,
+      '923001234567@s.whatsapp.net',
+      db,
+      {} as any
+    );
+    compactionManager = new CompactionManager(db, config);
+
+    runtime = new PokeRuntime(
+      config,
+      db,
+      new ExaToolHandler(),
+      new SupermemoryToolHandler(),
+      new ComposioToolHandler(),
+      new SkillRegistry(path.join(tempDir, 'skills')),
+      new WorkerManager(db, config, {} as any, {} as any, {} as any, {} as any),
+      new AutomationScheduler(db),
+      sender,
+      compactionManager,
+      tempDir
+    );
+
+    mockAgentHandle = {
+      dispatch: vi.fn().mockResolvedValue({ submissionId: 'sub_comp_1' }),
+      read: vi.fn().mockResolvedValue({ text: 'compacted' }),
+      abort: vi.fn().mockResolvedValue(undefined),
+    };
+    (runtime as any).agentHandle = mockAgentHandle;
+  });
+
+  afterEach(() => {
+    db.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('compactMainConversation(manual) throws if main agent is busy with an active turn', async () => {
+    (runtime as any).runningOwnerSubmissions.add('active_user_turn_1');
+
+    await expect(runtime.compactMainConversation('manual')).rejects.toThrow(
+      'Main agent is currently busy processing a turn.'
+    );
+
+    expect(mockAgentHandle.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('compactMainConversation(manual) forces compaction below thresholds when idle and reports before/after tokens', async () => {
+    compactionManager.setEstimatedTokens(50000); // below 100k and 272k
+    config.addActiveCapability('automations');
+
+    const result = await runtime.compactMainConversation('manual');
+
+    expect(mockAgentHandle.dispatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: expect.objectContaining({
+          type: 'poke.context_compact',
+          attributes: { reason: 'manual' },
+        }),
+      })
+    );
+
+    expect(result.compacted).toBe(true);
+    expect(result.beforeTokens).toBe(50000);
+  });
+
+  it('ignores internal compaction turns in observeOwnerEvent so last activity is not touched and tokens do not jump', () => {
+    const pastTime = Date.now() - 3600000;
+    compactionManager.setLastActivityTime(pastTime);
+    compactionManager.setEstimatedTokens(167000);
+
+    const compSubmissionId = 'sub_internal_comp_123';
+    (runtime as any).internalCompactionSubmissions.add(compSubmissionId);
+
+    // 1. submission_running for internal compaction must not set main_agent_busy to true
+    (runtime as any).observeOwnerEvent({
+      type: 'submission_running',
+      submissionId: compSubmissionId,
+      agentName: PokeMainAgent.name,
+      instanceId: MAIN_AGENT_INSTANCE_ID,
+    });
+    expect(compactionManager.isBusy()).toBe(false);
+
+    // 2. turn_request for internal compaction must not record activity or jump approximateTokens
+    (runtime as any).observeOwnerEvent({
+      type: 'turn_request',
+      turnId: 't_comp_1',
+      submissionId: compSubmissionId,
+      purpose: 'agent',
+      request: { input: 'B'.repeat(888000) }, // ~222k tokens
+      agentName: PokeMainAgent.name,
+      instanceId: MAIN_AGENT_INSTANCE_ID,
+    });
+    expect(compactionManager.getEstimatedTokens()).toBe(167000);
+    expect(compactionManager.getLastActivityTime()).toBe(pastTime);
+
+    // 3. turn for internal compaction must not record activity or overwrite tokens
+    (runtime as any).observeOwnerEvent({
+      type: 'turn',
+      turnId: 't_comp_1',
+      submissionId: compSubmissionId,
+      purpose: 'agent',
+      response: { usage: { totalTokens: 167000 } },
+      agentName: PokeMainAgent.name,
+      instanceId: MAIN_AGENT_INSTANCE_ID,
+    });
+    expect(compactionManager.getLastActivityTime()).toBe(pastTime);
+  });
+
+  it('checkIdleCompaction automatically dispatches when tokens >100k and idle >= 30m', async () => {
+    compactionManager.setEstimatedTokens(167000);
+    const thirtyFiveMinutesAgo = Date.now() - 35 * 60 * 1000;
+    compactionManager.setLastActivityTime(thirtyFiveMinutesAgo);
+
+    await runtime.checkIdleCompaction();
+
+    expect(mockAgentHandle.dispatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: expect.objectContaining({
+          type: 'poke.context_compact',
+          attributes: { reason: 'idle' },
+        }),
+      })
+    );
+  });
+});
+
+

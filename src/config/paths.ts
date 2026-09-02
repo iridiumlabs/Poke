@@ -28,6 +28,7 @@ export interface PokePaths {
   logsDir: string;
   cacheDir: string;
   skillsDir: string;
+  socketFile: string;
 }
 
 export function resolvePokePaths(customHome?: string): PokePaths {
@@ -48,6 +49,7 @@ export function resolvePokePaths(customHome?: string): PokePaths {
     logsDir: path.join(root, 'logs'),
     cacheDir: path.join(root, 'cache'),
     skillsDir,
+    socketFile: path.join(root, 'daemon.sock'),
   };
 }
 
