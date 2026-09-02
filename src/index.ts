@@ -26,6 +26,7 @@ export * from './scheduler/scheduler.js';
 export * from './gateway/deepgram.js';
 export * from './gateway/pairing.js';
 export * from './gateway/runtime-status.js';
+export * from './gateway/presence.js';
 export * from './gateway/sender.js';
 export * from './gateway/whatsapp.js';
 export * from './agent/prompts.js';

@@ -4,6 +4,7 @@ import path from 'path';
 import { proto, type WAMessage } from '@whiskeysockets/baileys';
 import { PokeDatabase } from '../db/database.js';
 import { DeepgramHandler } from './deepgram.js';
+import { WhatsAppPresence, WAPresenceType } from './presence.js';
 import { getLogger, redactSecrets } from '../logger/logger.js';
 
 export interface SendParams {
@@ -29,6 +30,10 @@ export interface WhatsAppSocketLike {
     content: any,
     options?: any
   ): Promise<any>;
+  sendPresenceUpdate?(
+    type: WAPresenceType,
+    toJid?: string
+  ): Promise<void>;
 }
 
 function computePayloadHash(payload: unknown): string {
@@ -96,11 +101,24 @@ export class WhatsAppSender {
     private getSocket: () => WhatsAppSocketLike | null,
     private ownerJid: string,
     private db: PokeDatabase,
-    private deepgram: DeepgramHandler
+    private deepgram: DeepgramHandler,
+    private presence?: WhatsAppPresence
   ) {}
+
+  getOwnerJid(): string {
+    return this.ownerJid;
+  }
 
   setOwnerJid(jid: string): void {
     this.ownerJid = jid;
+  }
+
+  setPresence(presence: WhatsAppPresence): void {
+    this.presence = presence;
+  }
+
+  getPresence(): WhatsAppPresence | undefined {
+    return this.presence;
   }
 
   /** Retain a bounded set of real inbound envelopes for quoted replies. */
@@ -280,25 +298,30 @@ export class WhatsAppSender {
         quotePending = false;
       } else {
         logger.info('Synthesizing and sending voice note');
-        const { audioPath, mimeType } = await this.deepgram.synthesizeToAudioFile(params.text);
-        const audioBuffer = fs.readFileSync(audioPath);
-        const quoteOptions = quotePending ? this.getQuoteOptions(params.reply_to) : undefined;
-        messageId = await this.sendPart(
-          partKey,
-          'whatsapp_send_part',
-          partPayloadHash,
-          messageId,
-          () => sock.sendMessage(
-            targetJid,
-            {
-              audio: audioBuffer,
-              mimetype: mimeType,
-              ptt: true,
-            },
-            quoteOptions
-          )
-        );
-        quotePending = false;
+        const recordingToken = this.presence?.startRecording();
+        try {
+          const { audioPath, mimeType } = await this.deepgram.synthesizeToAudioFile(params.text);
+          const audioBuffer = fs.readFileSync(audioPath);
+          const quoteOptions = quotePending ? this.getQuoteOptions(params.reply_to) : undefined;
+          messageId = await this.sendPart(
+            partKey,
+            'whatsapp_send_part',
+            partPayloadHash,
+            messageId,
+            () => sock.sendMessage(
+              targetJid,
+              {
+                audio: audioBuffer,
+                mimetype: mimeType,
+                ptt: true,
+              },
+              quoteOptions
+            )
+          );
+          quotePending = false;
+        } finally {
+          this.presence?.stopRecording(recordingToken);
+        }
       }
       partIndex++;
     } else {

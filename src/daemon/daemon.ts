@@ -85,7 +85,8 @@ export class PokeDaemon {
       this.scheduler,
       this.gateway.getSender(),
       this.compactionManager,
-      customHome
+      customHome,
+      this.gateway.getPresence()
     );
   }
 
