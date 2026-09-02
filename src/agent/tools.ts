@@ -35,7 +35,7 @@ export function createPokeTools(ctx: ToolContexts) {
   // 1. send
   const sendTool = defineTool({
     name: 'send',
-    description: 'Send a message or voice note to the user on WhatsApp. Only content sent through this tool reaches the user. To quote the current inbound message, pass its [WhatsApp message ID: …] marker as reply_to.',
+    description: 'Send a message or voice note to the user on WhatsApp. Only content sent through this tool reaches the user. Omit reply_to for normal messages; the presence of a [WhatsApp message ID: …] marker does not itself justify quoting it. Set reply_to to a specific message ID only when quoting that message materially helps disambiguate the response (such as answering one of multiple separate messages).',
     input: v.object({
       mode: v.picklist(['message', 'voice']),
       text: v.string(),
