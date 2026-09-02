@@ -8,6 +8,7 @@ import { ConfigManager } from '../../src/config/config.js';
 import { PokeDatabase } from '../../src/db/database.js';
 import { DeepgramHandler } from '../../src/gateway/deepgram.js';
 import { GroqTranscriptionError, GroqTranscriptionHandler } from '../../src/gateway/groq.js';
+import { boundedErrorDetail, compactErrorMessage } from '../../src/gateway/error-detail.js';
 
 describe('WhatsApp Gateway & Sender', () => {
   let tempDir: string;
@@ -1167,4 +1168,80 @@ describe('WhatsApp Gateway & Sender', () => {
     // No additional message should be sent
     expect(callCount).toBe(2);
   });
+
+  it('bounds, sanitizes, and redacts error details in shared error-detail helper', () => {
+    const raw = 'Bearer super-secret-key-value \u0000 with   lots   of \r\n whitespace\t';
+    const cleaned = boundedErrorDetail(raw);
+    expect(cleaned).not.toContain('super-secret-key-value');
+    expect(cleaned).toContain('Bearer [REDACTED]');
+    expect(cleaned).toBe('Bearer [REDACTED] with lots of whitespace');
+
+    const longError = 'x'.repeat(700);
+    const bounded = boundedErrorDetail(longError);
+    expect(bounded.length).toBe(600);
+    expect(bounded.endsWith('...')).toBe(true);
+
+    expect(compactErrorMessage(new Error('something failed'))).toBe('something failed');
+    expect(compactErrorMessage('')).toBe('Unknown error.');
+    expect(compactErrorMessage(null)).toBe('Unknown error.');
+    expect(compactErrorMessage(undefined)).toBe('Unknown error.');
+  });
+
+  it('records idempotency without dispatch when incoming media preparation intentionally returns null', async () => {
+    let dispatched = false;
+    const gateway = new WhatsAppGateway(
+      config,
+      db,
+      async () => {
+        dispatched = true;
+      },
+      async () => {},
+      tempDir,
+      {
+        downloadMedia: vi.fn().mockRejectedValue(new Error('Image download failed')),
+      }
+    );
+
+    const messageId = 'm-failed-image-no-caption';
+    await gateway.handleIncomingMessage({
+      key: { remoteJid: '923001234567@s.whatsapp.net', id: messageId },
+      message: {
+        imageMessage: {
+          mimetype: 'image/jpeg',
+          caption: '',
+        },
+      },
+    });
+
+    expect(dispatched).toBe(false);
+    expect(db.checkIdempotency(`inbound_msg:${messageId}`)).not.toBeNull();
+  });
+
+  it('does not record idempotency when inbound message preparation throws an unhandled rejection', async () => {
+    let dispatched = false;
+    const gateway = new WhatsAppGateway(
+      config,
+      db,
+      async () => {
+        dispatched = true;
+      },
+      async () => {},
+      tempDir
+    );
+
+    // Force prepareIncomingMessage to throw directly
+    vi.spyOn(gateway as any, 'prepareIncomingMessage').mockRejectedValue(new Error('Fatal preparation crash'));
+
+    const messageId = 'm-fatal-prep-crash';
+    await expect(
+      gateway.handleIncomingMessage({
+        key: { remoteJid: '923001234567@s.whatsapp.net', id: messageId },
+        message: { conversation: 'Hello' },
+      })
+    ).rejects.toThrow('Fatal preparation crash');
+
+    expect(dispatched).toBe(false);
+    expect(db.checkIdempotency(`inbound_msg:${messageId}`)).toBeNull();
+  });
 });
+

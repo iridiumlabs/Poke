@@ -1,8 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { getLogger, redactSecrets } from '../logger/logger.js';
+import { getLogger } from '../logger/logger.js';
 import { providerRequestSignal } from '../providers/fetch.js';
 import { withProviderRetry } from '../providers/retry.js';
+import { boundedErrorDetail } from './error-detail.js';
 
 export const GROQ_STT_MODEL = 'whisper-large-v3';
 const GROQ_TRANSCRIPTIONS_URL = 'https://api.groq.com/openai/v1/audio/transcriptions';
@@ -56,14 +57,6 @@ export class GroqTranscriptionError extends Error {
     this.requestId = details.requestId;
     this.cause = details.cause;
   }
-}
-
-function boundedProviderDetail(detail: string): string {
-  const cleaned = String(redactSecrets(detail))
-    .replace(/[\u0000-\u001f\u007f]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  return cleaned.length > 600 ? `${cleaned.slice(0, 597)}...` : cleaned;
 }
 
 function errorStatus(error: unknown): number | undefined {
@@ -155,11 +148,11 @@ async function errorDetail(response: Response): Promise<string> {
   if (!body) return '';
   try {
     const parsed = JSON.parse(body) as { error?: { message?: unknown } };
-    if (typeof parsed.error?.message === 'string') return boundedProviderDetail(parsed.error.message);
+    if (typeof parsed.error?.message === 'string') return boundedErrorDetail(parsed.error.message);
   } catch {
     // Keep the bounded raw response below when it is not JSON.
   }
-  return boundedProviderDetail(body);
+  return boundedErrorDetail(body);
 }
 
 export class GroqTranscriptionHandler {
@@ -226,7 +219,7 @@ export class GroqTranscriptionHandler {
       });
     } catch (error: unknown) {
       const retryCount = Math.max(1, attempts);
-      const reason = error instanceof Error ? redactSecrets(error.message) : redactSecrets(String(error));
+      const reason = boundedErrorDetail(error);
       throw new GroqTranscriptionError(
         `Groq ${GROQ_STT_MODEL} transcription failed after ${retryCount} attempt${retryCount === 1 ? '' : 's'}: ${reason}`,
         {

@@ -325,9 +325,9 @@ describe('CLI & Diagnostics', () => {
     const validateService = vi.fn().mockResolvedValue(undefined);
     const restartDaemon = vi.fn().mockResolvedValue(undefined);
     const ui = new ScriptedUi(
-      ['supermemoryApiKey', 'composioApiKey', 'deepgramApiKey', 'groqApiKey', 'done'],
+      ['supermemoryApiKey', 'composioApiKey', 'exaApiKey', 'deepgramApiKey', 'groqApiKey', 'done'],
       [],
-      ['supermemory-key', 'composio-key', 'deepgram-key', 'gsk_groq-key']
+      ['supermemory-key', 'composio-key', 'exa-key', 'deepgram-key', 'gsk_groq-key']
     );
 
     await runConfigure(tempDir, ui, {
@@ -339,12 +339,14 @@ describe('CLI & Diagnostics', () => {
     expect(config.getCredentials()).toMatchObject({
       supermemoryApiKey: 'supermemory-key',
       composioApiKey: 'composio-key',
+      exaApiKey: 'exa-key',
       deepgramApiKey: 'deepgram-key',
       groqApiKey: 'gsk_groq-key',
     });
     expect(validateService.mock.calls).toEqual([
       ['supermemoryApiKey', 'supermemory-key'],
       ['composioApiKey', 'composio-key'],
+      ['exaApiKey', 'exa-key'],
       ['deepgramApiKey', 'deepgram-key'],
       ['groqApiKey', 'gsk_groq-key'],
     ]);
@@ -593,6 +595,7 @@ describe('CLI & Diagnostics', () => {
     const configureCmd = program.commands.find((cmd) => cmd.name() === 'configure');
 
     expect(configureCmd?.description()).toContain('Groq API keys');
+    expect(configureCmd?.description()).toContain('Exa');
   });
 
   it('registers the compact command with clear description', () => {

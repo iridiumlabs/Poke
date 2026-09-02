@@ -11,6 +11,7 @@ import { CliCancelledError, createCliUi, type CliUi } from './ui.js';
 const CONFIGURABLE_SERVICES = [
   { name: 'Supermemory', key: 'supermemoryApiKey' },
   { name: 'Composio', key: 'composioApiKey' },
+  { name: 'Exa', key: 'exaApiKey' },
   { name: 'Deepgram', key: 'deepgramApiKey' },
   { name: 'Groq', key: 'groqApiKey' },
 ] as const satisfies readonly RequiredService[];

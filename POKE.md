@@ -895,7 +895,7 @@ Validate keys with cheap read-only calls where supported. A failed validation sh
 
 ### 19.2 `poke configure`
 
-Provide an interactive menu for Supermemory, Composio, Deepgram, and Groq service keys. Do not display existing secrets. Keep an existing key unless the user explicitly confirms replacement. Validate a replacement before saving it to the existing Poke credential store, then restart a running daemon after one or more keys change.
+Provide an interactive menu for Supermemory, Composio, Exa, Deepgram, and Groq service keys. Do not display existing secrets. Keep an existing key unless the user explicitly confirms replacement. Validate a replacement before saving it to the existing Poke credential store, then restart a running daemon after one or more keys change.
 
 ### 19.3 `poke login`
 

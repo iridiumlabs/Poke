@@ -32,7 +32,7 @@ export function createCli(): Command {
 
   program
     .command('configure')
-    .description('Add or replace Supermemory, Composio, Deepgram, and Groq API keys')
+    .description('Add or replace Supermemory, Composio, Exa, Deepgram, and Groq API keys')
     .action(async () => {
       await runConfigure();
     });

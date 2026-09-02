@@ -19,4 +19,4 @@ npm run build
 
 The committed `allowScripts` policy approves only the version-pinned scripts required by Baileys, better-sqlite3, and esbuild. Run `npm install-scripts ls --json` after dependency changes and review new entries before approving them.
 
-Then run `poke setup`, `poke login`, and `poke model`. Use `poke configure` later to add or replace service API keys. The lifecycle commands install and use a user-owned systemd service when systemd is available.
+Then run `poke setup`, `poke login`, and `poke model`. Use `poke configure` later to add or replace Supermemory, Composio, Exa, Deepgram, and Groq service API keys. The lifecycle commands install and use a user-owned systemd service when systemd is available.

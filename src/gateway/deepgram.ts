@@ -1,17 +1,10 @@
 import fs from 'fs';
 import path from 'path';
-import { getLogger, redactSecrets } from '../logger/logger.js';
+import { getLogger } from '../logger/logger.js';
 import { withProviderRetry } from '../providers/retry.js';
 import { providerRequestSignal } from '../providers/fetch.js';
 import { resolvePokePaths } from '../config/paths.js';
-
-function providerErrorDetail(detail: string): string {
-  const cleaned = String(redactSecrets(detail))
-    .replace(/[\u0000-\u001f\u007f]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  return cleaned.length > 600 ? `${cleaned.slice(0, 597)}...` : cleaned;
-}
+import { boundedErrorDetail } from './error-detail.js';
 
 export class DeepgramHandler {
   constructor(private apiKey?: string, private customHome?: string) {}
@@ -51,7 +44,7 @@ export class DeepgramHandler {
       if (!res.ok) {
         const detail = await res.text().catch(() => '');
         const message = detail
-          ? `Deepgram TTS returned ${res.status}: ${providerErrorDetail(detail)}`
+          ? `Deepgram TTS returned ${res.status}: ${boundedErrorDetail(detail)}`
           : `Deepgram TTS returned ${res.status}.`;
         const err = new Error(message);
         (err as any).status = res.status;

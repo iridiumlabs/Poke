@@ -20,10 +20,10 @@ import {
 } from './groq.js';
 import { WhatsAppSender } from './sender.js';
 import { WhatsAppPresence, WhatsAppPresenceOptions } from './presence.js';
-import { getLogger, redactSecrets } from '../logger/logger.js';
+import { getLogger } from '../logger/logger.js';
 import { resolvePokePaths, ensurePokeDirectories } from '../config/paths.js';
 import { writeGatewayRuntimeStatus } from './runtime-status.js';
-
+import { compactErrorMessage } from './error-detail.js';
 export interface InboundMediaAttachment {
   path: string;
   filename: string;
@@ -99,14 +99,6 @@ function audioExtension(mimeType: string, isPtt: boolean): string {
   return isPtt ? 'ogg' : 'bin';
 }
 
-function compactErrorMessage(error: unknown): string {
-  const raw = error instanceof Error ? error.message : String(error);
-  const redacted = String(redactSecrets(raw))
-    .replace(/[\u0000-\u001f\u007f]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  return redacted.length > 600 ? `${redacted.slice(0, 597)}...` : redacted || 'Unknown error.';
-}
 
 function transcriptionFailureNotice(messageId: string, error: unknown): string {
   return `Poke could not transcribe voice message ${messageId}. ${compactErrorMessage(error)} Please send it again.`;
@@ -564,9 +556,9 @@ export class WhatsAppGateway {
     try {
       await this.enqueueInboundAdmission(async () => {
         const normalized = await normalizedPromise;
-        if (!normalized) return;
-
-        await this.onDispatch(normalized);
+        if (normalized) {
+          await this.onDispatch(normalized);
+        }
 
         // Only acknowledge the inbound message after dispatch admission succeeds,
         // so a transient runtime failure can be retried by a redelivery.
