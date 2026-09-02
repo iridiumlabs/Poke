@@ -229,6 +229,32 @@ describe('poke update CLI command', () => {
     expect(executedCommands.some((c) => c.includes('git reset --hard'))).toBe(false);
   });
 
+  it('rejects update when git status execution fails', async () => {
+    const ui = new MockCliUi();
+    const fakeExec = (cmd: string) => {
+      if (cmd.includes('--is-inside-work-tree')) return 'true\n';
+      if (cmd.includes('git fetch')) return '';
+      if (cmd.includes('rev-parse HEAD')) return '1111111111111111111111111111111111111111\n';
+      if (cmd.includes('rev-parse refs/remotes/origin/main')) return '2222222222222222222222222222222222222222\n';
+      if (cmd.includes('git status --porcelain')) {
+        throw new Error('Index lock exists');
+      }
+      return '';
+    };
+
+    await expect(
+      runUpdate(tempHomeDir, ui, {
+        exec: fakeExec,
+        installationPaths: {
+          pokeBinPath: path.join(tempRepoDir, 'dist/bin/poke.js'),
+          workingDir: tempRepoDir,
+        },
+      })
+    ).rejects.toThrow(CliCommandFailedError);
+
+    expect(ui.errors.some((e) => e.includes('Failed to check Git status: Index lock exists'))).toBe(true);
+  });
+
   it('rejects update when local branch has diverged from origin/main without modifying tree or stopping daemon', async () => {
     const ui = new MockCliUi();
     const executedCommands: string[] = [];
@@ -312,13 +338,64 @@ describe('poke update CLI command', () => {
         stopDaemon,
         startDaemon,
       })
-    ).rejects.toThrow(CliCommandFailedError);
+    ).rejects.toThrow(/Restored previous version \(1111111\)/);
 
     // Rollback checks
     expect(executedCommands).toContain(`git checkout -B main ${oldCommit}`);
     expect(startDaemon).toHaveBeenCalledTimes(1); // Restarted previous daemon version
     expect(ui.errors.some((e) => e.includes('Build failed: TypeScript compilation error in new version'))).toBe(true);
     expect(ui.notes.some((n) => n.includes(`Restoring repository to ${oldCommit.slice(0, 7)}`))).toBe(true);
+  });
+
+  it('handles startDaemon exception rejection by rolling back and restoring previous daemon', async () => {
+    const ui = new MockCliUi();
+    const executedCommands: string[] = [];
+    const stopDaemon = vi.fn().mockResolvedValue(undefined);
+    let startAttempts = 0;
+    const startDaemon = vi.fn().mockImplementation(async () => {
+      startAttempts++;
+      if (startAttempts === 1) {
+        throw new Error('systemctl start failed: service exit code 1');
+      }
+    });
+    const isDaemonRunning = vi.fn().mockReturnValue(true);
+
+    const oldCommit = '1111111111111111111111111111111111111111';
+    const newCommit = '2222222222222222222222222222222222222222';
+
+    const fakeExec = (cmd: string) => {
+      executedCommands.push(cmd);
+      if (cmd.includes('--is-inside-work-tree')) return 'true\n';
+      if (cmd.includes('git fetch')) return '';
+      if (cmd.includes('rev-parse HEAD')) return `${oldCommit}\n`;
+      if (cmd.includes('rev-parse refs/remotes/origin/main')) return `${newCommit}\n`;
+      if (cmd.includes('git status --porcelain')) return '';
+      if (cmd.includes('git merge-base --is-ancestor')) return '';
+      if (cmd.includes('git symbolic-ref')) return 'refs/heads/main\n';
+      if (cmd.includes('git merge --ff-only')) return '';
+      if (cmd.includes('npm install')) return '';
+      if (cmd.includes('npm run build')) return '';
+      if (cmd.includes('git checkout -B main')) return '';
+      return '';
+    };
+
+    await expect(
+      runUpdate(tempHomeDir, ui, {
+        exec: fakeExec,
+        installationPaths: {
+          pokeBinPath: path.join(tempRepoDir, 'dist/bin/poke.js'),
+          workingDir: tempRepoDir,
+        },
+        isDaemonRunning,
+        stopDaemon,
+        startDaemon,
+      })
+    ).rejects.toThrow(/Restored previous version \(1111111\)/);
+
+    // Rollback was executed
+    expect(executedCommands).toContain(`git checkout -B main ${oldCommit}`);
+    expect(startDaemon).toHaveBeenCalledTimes(2); // Initial failed start + rollback start
+    expect(ui.errors.some((e) => e.includes('Failed to start updated daemon: systemctl start failed'))).toBe(true);
   });
 
   it('handles post-update daemon verification failure by rolling back to previous commit and restoring previous daemon', async () => {
@@ -360,13 +437,96 @@ describe('poke update CLI command', () => {
         startDaemon,
         verifyDaemonRunning,
       })
-    ).rejects.toThrow(CliCommandFailedError);
+    ).rejects.toThrow(/Restored previous version \(1111111\)/);
 
     // Verified rollback was called
     expect(executedCommands).toContain(`git checkout -B main ${oldCommit}`);
     expect(stopDaemon).toHaveBeenCalledTimes(2); // Initial stop + stop failed daemon during rollback
     expect(startDaemon).toHaveBeenCalledTimes(2); // Attempted start + rollback restart
     expect(ui.errors.some((e) => e.includes('Updated Poke daemon failed to start or stay running'))).toBe(true);
+  });
+
+  it('accurately reports rollback failure when rollback build also fails', async () => {
+    const ui = new MockCliUi();
+    const stopDaemon = vi.fn().mockResolvedValue(undefined);
+    const startDaemon = vi.fn().mockResolvedValue(undefined);
+    const isDaemonRunning = vi.fn().mockReturnValue(true);
+
+    const oldCommit = '1111111111111111111111111111111111111111';
+    const newCommit = '2222222222222222222222222222222222222222';
+
+    const fakeExec = (cmd: string) => {
+      if (cmd.includes('--is-inside-work-tree')) return 'true\n';
+      if (cmd.includes('git fetch')) return '';
+      if (cmd.includes('rev-parse HEAD')) return `${oldCommit}\n`;
+      if (cmd.includes('rev-parse refs/remotes/origin/main')) return `${newCommit}\n`;
+      if (cmd.includes('git status --porcelain')) return '';
+      if (cmd.includes('git merge-base --is-ancestor')) return '';
+      if (cmd.includes('git symbolic-ref')) return 'refs/heads/main\n';
+      if (cmd.includes('git merge --ff-only')) return '';
+      if (cmd.includes('npm install')) {
+        throw new Error('NPM registry unreachable');
+      }
+      return '';
+    };
+
+    await expect(
+      runUpdate(tempHomeDir, ui, {
+        exec: fakeExec,
+        installationPaths: {
+          pokeBinPath: path.join(tempRepoDir, 'dist/bin/poke.js'),
+          workingDir: tempRepoDir,
+        },
+        isDaemonRunning,
+        stopDaemon,
+        startDaemon,
+      })
+    ).rejects.toThrow(/Rollback to 1111111 also failed/);
+
+    expect(ui.errors.some((e) => e.includes('Rollback encountered an error: NPM registry unreachable'))).toBe(true);
+  });
+
+  it('default verification detects when daemon appears briefly but crashes during startup', async () => {
+    const ui = new MockCliUi();
+    const oldCommit = '1111111111111111111111111111111111111111';
+    const newCommit = '2222222222222222222222222222222222222222';
+
+    let runningChecks = 0;
+    // Daemon starts alive (check 1 = true), then crashes immediately (check 2 = false)
+    const isDaemonRunning = vi.fn().mockImplementation(() => {
+      runningChecks++;
+      if (runningChecks === 1) return true; // Initial pre-update check
+      if (runningChecks === 2) return true; // Appeared initially in verifyDaemonRunning
+      return false; // Crashed before stabilization window completed
+    });
+
+    const fakeExec = (cmd: string) => {
+      if (cmd.includes('--is-inside-work-tree')) return 'true\n';
+      if (cmd.includes('git fetch')) return '';
+      if (cmd.includes('rev-parse HEAD')) return `${oldCommit}\n`;
+      if (cmd.includes('rev-parse refs/remotes/origin/main')) return `${newCommit}\n`;
+      if (cmd.includes('git status --porcelain')) return '';
+      if (cmd.includes('git merge-base --is-ancestor')) return '';
+      if (cmd.includes('git symbolic-ref')) return 'refs/heads/main\n';
+      if (cmd.includes('git merge --ff-only')) return '';
+      if (cmd.includes('npm install')) return '';
+      if (cmd.includes('npm run build')) return '';
+      if (cmd.includes('git checkout -B main')) return '';
+      return '';
+    };
+
+    await expect(
+      runUpdate(tempHomeDir, ui, {
+        exec: fakeExec,
+        installationPaths: {
+          pokeBinPath: path.join(tempRepoDir, 'dist/bin/poke.js'),
+          workingDir: tempRepoDir,
+        },
+        isDaemonRunning,
+        stopDaemon: vi.fn().mockResolvedValue(undefined),
+        startDaemon: vi.fn().mockResolvedValue(undefined),
+      })
+    ).rejects.toThrow(/Updated daemon failed to stay running/);
   });
 
   it('rejects update when directory is not a Git repository', async () => {
@@ -474,9 +634,9 @@ describe('poke update CLI command', () => {
     execSync('git init', { cwd: upstreamDir, stdio: 'pipe' });
     execSync('git config user.name "Test User"', { cwd: upstreamDir, stdio: 'pipe' });
     execSync('git config user.email "test@example.com"', { cwd: upstreamDir, stdio: 'pipe' });
-    execSync('git branch -M main', { cwd: upstreamDir, stdio: 'pipe' });
     fs.writeFileSync(path.join(upstreamDir, 'file.txt'), 'version 1');
     execSync('git add file.txt && git commit -m "initial commit"', { cwd: upstreamDir, stdio: 'pipe' });
+    execSync('git branch -M main', { cwd: upstreamDir, stdio: 'pipe' });
     execSync(`git remote add origin ${bareRemoteDir}`, { cwd: upstreamDir, stdio: 'pipe' });
     execSync('git push -u origin main', { cwd: upstreamDir, stdio: 'pipe' });
 

@@ -30,6 +30,11 @@ export interface UpdateResult {
   updated: boolean;
 }
 
+export interface RollbackResult {
+  success: boolean;
+  error?: string;
+}
+
 async function rollback(options: {
   workingDir: string;
   previousCommit: string;
@@ -50,7 +55,7 @@ async function rollback(options: {
   ) => Promise<void>;
   stopDaemon?: (customHome?: string) => Promise<void>;
   ui: CliUi;
-}): Promise<void> {
+}): Promise<RollbackResult> {
   const {
     workingDir,
     previousCommit,
@@ -67,7 +72,7 @@ async function rollback(options: {
 
   ui.note(`Restoring repository to ${previousCommit.slice(0, 7)}...`);
   try {
-    if (stopDaemon) {
+    if (stopDaemon && wasRunning) {
       await stopDaemon(customHome).catch(() => {});
     }
 
@@ -88,9 +93,47 @@ async function rollback(options: {
         exec: (cmd: string) => exec(cmd, { cwd: workingDir }),
       });
     }
+
+    return { success: true };
   } catch (rollbackErr: any) {
-    ui.error(`Rollback encountered an error: ${rollbackErr.message}`);
+    const errorMsg = rollbackErr.stderr?.toString().trim() || rollbackErr.message;
+    ui.error(`Rollback encountered an error: ${errorMsg}`);
+    return { success: false, error: errorMsg };
   }
+}
+
+async function defaultVerifyDaemonRunning(
+  checkRunning: (customHome?: string) => boolean,
+  customHome?: string,
+  timeoutMs = 5000,
+  stabilizationChecks = 3,
+  pollIntervalMs = 250
+): Promise<boolean> {
+  const start = Date.now();
+  let appeared = false;
+
+  // 1. Wait for daemon to appear and write PID
+  while (Date.now() - start < timeoutMs) {
+    if (checkRunning(customHome)) {
+      appeared = true;
+      break;
+    }
+    await new Promise((r) => setTimeout(r, pollIntervalMs));
+  }
+
+  if (!appeared) {
+    return false;
+  }
+
+  // 2. Ensure daemon remains running throughout stabilization window
+  for (let i = 0; i < stabilizationChecks; i++) {
+    await new Promise((r) => setTimeout(r, pollIntervalMs));
+    if (!checkRunning(customHome)) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 export async function runUpdate(
@@ -154,7 +197,15 @@ export async function runUpdate(
   }
 
   // 5. Check working tree cleanliness before making changes
-  const statusOutput = String(exec('git status --porcelain', { cwd: workingDir })).trim();
+  let statusOutput: string;
+  try {
+    statusOutput = String(exec('git status --porcelain', { cwd: workingDir })).trim();
+  } catch (err: any) {
+    const msg = `Failed to check Git status: ${err.stderr?.toString().trim() || err.message}`;
+    ui.error(msg);
+    throw new CliCommandFailedError(msg);
+  }
+
   if (statusOutput.length > 0) {
     const msg = 'Cannot update: working tree has uncommitted changes. Please commit, stash, or discard local changes before updating.';
     ui.error(msg);
@@ -217,8 +268,9 @@ export async function runUpdate(
     ui.note('Building Poke...');
     exec(`${npm} run build`, { cwd: workingDir });
   } catch (buildErr: any) {
-    ui.error(`Build failed: ${buildErr.stderr?.toString().trim() || buildErr.message}`);
-    await rollback({
+    const buildErrorMsg = buildErr.stderr?.toString().trim() || buildErr.message;
+    ui.error(`Build failed: ${buildErrorMsg}`);
+    const rollbackResult = await rollback({
       workingDir,
       previousCommit,
       currentBranch,
@@ -231,34 +283,44 @@ export async function runUpdate(
       stopDaemon,
       ui,
     });
-    throw new CliCommandFailedError(
-      `Update failed during build. Restored previous version (${previousCommit.slice(0, 7)}).`
-    );
+    if (rollbackResult.success) {
+      throw new CliCommandFailedError(
+        `Update failed during build. Restored previous version (${previousCommit.slice(0, 7)}).`
+      );
+    } else {
+      throw new CliCommandFailedError(
+        `Update failed during build. Rollback to ${previousCommit.slice(0, 7)} also failed: ${rollbackResult.error || 'unknown error'}`
+      );
+    }
   }
 
   // 11. Start newly built version and verify (if daemon was running)
   if (wasRunning) {
-    ui.note('Starting updated Poke daemon...');
-    await startDaemon({}, customHome, {
-      installationPaths: paths,
-      exec: (cmd: string) => exec(cmd, { cwd: workingDir }),
-    });
+    let startupFailed = false;
+    let startupErrorMsg = '';
 
-    ui.note('Verifying Poke daemon is running...');
-    const verifyFn = dependencies.verifyDaemonRunning || (async (home?: string, timeoutMs = 5000) => {
-      const pollInterval = 250;
-      const maxAttempts = Math.max(1, Math.floor(timeoutMs / pollInterval));
-      for (let i = 0; i < maxAttempts; i++) {
-        await new Promise((r) => setTimeout(r, pollInterval));
-        if (checkDaemonRunning(home)) return true;
+    try {
+      ui.note('Starting updated Poke daemon...');
+      await startDaemon({}, customHome, {
+        installationPaths: paths,
+        exec: (cmd: string) => exec(cmd, { cwd: workingDir }),
+      });
+
+      ui.note('Verifying Poke daemon is running...');
+      const verifyFn = dependencies.verifyDaemonRunning || ((home?: string) => defaultVerifyDaemonRunning(checkDaemonRunning, home));
+      const isRunning = await verifyFn(customHome);
+      if (!isRunning) {
+        startupFailed = true;
+        startupErrorMsg = 'Updated Poke daemon failed to start or stay running.';
       }
-      return checkDaemonRunning(home);
-    });
+    } catch (startErr: any) {
+      startupFailed = true;
+      startupErrorMsg = `Failed to start updated daemon: ${startErr.stderr?.toString().trim() || startErr.message}`;
+    }
 
-    const isRunning = await verifyFn(customHome);
-    if (!isRunning) {
-      ui.error('Updated Poke daemon failed to start or stay running.');
-      await rollback({
+    if (startupFailed) {
+      ui.error(startupErrorMsg);
+      const rollbackResult = await rollback({
         workingDir,
         previousCommit,
         currentBranch,
@@ -271,9 +333,15 @@ export async function runUpdate(
         stopDaemon,
         ui,
       });
-      throw new CliCommandFailedError(
-        `Updated daemon failed to stay running. Restored previous version (${previousCommit.slice(0, 7)}).`
-      );
+      if (rollbackResult.success) {
+        throw new CliCommandFailedError(
+          `Updated daemon failed to stay running. Restored previous version (${previousCommit.slice(0, 7)}).`
+        );
+      } else {
+        throw new CliCommandFailedError(
+          `Updated daemon failed to stay running. Rollback to ${previousCommit.slice(0, 7)} also failed: ${rollbackResult.error || 'unknown error'}`
+        );
+      }
     }
 
     ui.success(`Poke successfully updated to ${remoteCommit.slice(0, 7)} and daemon restarted.`);
