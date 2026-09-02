@@ -141,7 +141,7 @@ export function createPokeTools(ctx: ToolContexts) {
   // 6. search_tools (Composio discovery)
   const searchToolsTool = defineTool({
     name: 'search_tools',
-    description: 'Search available third-party connected tools and actions (e.g. Gmail, GitHub, Google Calendar) via Composio.',
+    description: 'Search Composio\'s full tool catalog for available actions (e.g. Gmail, GitHub, Google Calendar, utility tools). Results are not limited to connected accounts, and connected accounts are returned separately. Some actions require an authenticated connection while others require no auth.',
     input: v.object({
       query: v.string(),
     }),
@@ -155,7 +155,7 @@ export function createPokeTools(ctx: ToolContexts) {
   // 7. execute_tools (Composio execution)
   const executeToolsTool = defineTool({
     name: 'execute_tools',
-    description: 'Execute a connected service action discovered via search_tools.',
+    description: 'Execute an action discovered via search_tools.',
     input: v.object({
       action: v.string(),
       params: v.optional(v.record(v.string(), v.any())),
