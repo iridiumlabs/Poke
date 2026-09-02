@@ -236,6 +236,41 @@ describe('FireworksCatalog', () => {
     }
   });
 
+  it('preserves explicit empty effort lists and supports_reasoning: false without populating known defaults', async () => {
+    const originalFetch = global.fetch;
+    global.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          data: [
+            {
+              id: 'accounts/fireworks/models/deepseek-r1',
+              displayName: 'DeepSeek R1 Disabled Reasoning',
+              reasoning_efforts: [],
+            },
+            {
+              id: 'accounts/fireworks/models/qwq-32b',
+              displayName: 'QwQ 32B No Reasoning Flag',
+              supports_reasoning: false,
+            },
+          ],
+        }),
+        { status: 200 }
+      )) as typeof fetch;
+
+    try {
+      const models = await FireworksCatalog.fetchLiveModels('fireworks-key');
+      expect(models).toHaveLength(2);
+
+      const r1 = models.find((m) => m.id === 'accounts/fireworks/models/deepseek-r1')!;
+      expect(r1.capabilities.reasoningEfforts).toEqual([]);
+
+      const qwq = models.find((m) => m.id === 'accounts/fireworks/models/qwq-32b')!;
+      expect(qwq.capabilities.reasoningEfforts).toEqual([]);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
   it('applies conservative defaults when capability metadata is absent', async () => {
     const originalFetch = global.fetch;
     global.fetch = (async () =>

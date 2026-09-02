@@ -225,12 +225,21 @@ export function extractFireworksModelInfo(item: unknown): ModelInfo | null {
 
   // Reasoning support & efforts
   const reasoningEfforts: ReasoningEffort[] = [];
-  const rawEfforts = (obj.reasoning_efforts ||
-    obj.reasoningEfforts ||
-    obj.supported_thinking_levels ||
+  const rawEfforts = (obj.reasoning_efforts ??
+    obj.reasoningEfforts ??
+    obj.supported_thinking_levels ??
     obj.supportedThinkingLevels) as unknown;
 
-  if (Array.isArray(rawEfforts) && rawEfforts.length > 0) {
+  const supportsReasoning =
+    typeof obj.supports_reasoning === 'boolean'
+      ? obj.supports_reasoning
+      : typeof obj.supportsReasoning === 'boolean'
+        ? obj.supportsReasoning
+        : typeof obj.reasoning === 'boolean'
+          ? obj.reasoning
+          : undefined;
+
+  if (Array.isArray(rawEfforts)) {
     for (const effort of rawEfforts) {
       if (typeof effort === 'string') {
         const normalized = effort.trim().toLowerCase() as ReasoningEffort;
@@ -239,13 +248,12 @@ export function extractFireworksModelInfo(item: unknown): ModelInfo | null {
         }
       }
     }
-  } else if (obj.supports_reasoning === true || obj.supportsReasoning === true || obj.reasoning === true) {
-    // If flagged as reasoning-capable without specific efforts list, provide standard efforts
-    reasoningEfforts.push('low', 'medium', 'high');
-  }
-
-  // Retain authoritative known metadata when live response omits capability fields
-  if (reasoningEfforts.length === 0) {
+  } else if (typeof supportsReasoning === 'boolean') {
+    if (supportsReasoning) {
+      reasoningEfforts.push('low', 'medium', 'high');
+    }
+  } else {
+    // Retain authoritative known metadata when live response omits capability fields
     const known = FIREWORKS_KNOWN_REASONING[id] || FIREWORKS_KNOWN_REASONING[lowerId];
     if (known) {
       reasoningEfforts.push(...known);
