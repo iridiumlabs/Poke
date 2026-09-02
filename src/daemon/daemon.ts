@@ -10,6 +10,8 @@ import { AutomationScheduler } from '../scheduler/scheduler.js';
 import { CompactionManager } from '../context/compaction-manager.js';
 import { WhatsAppGateway } from '../gateway/whatsapp.js';
 import { PokeRuntime } from '../agent/runtime.js';
+import { DaemonIpcServer } from './ipc.js';
+import { getMobileStatusText } from '../cli/status.js';
 import { getLogger } from '../logger/logger.js';
 import { resolvePokePaths, ensurePokeDirectories } from '../config/paths.js';
 import { resolvePokeInstallationPaths } from '../config/installation.js';
@@ -28,6 +30,7 @@ export class PokeDaemon {
   private compactionManager: CompactionManager;
   private gateway: WhatsAppGateway;
   private runtime: PokeRuntime;
+  private ipcServer: DaemonIpcServer;
   private pidFile: string;
   private isRunning = false;
   private ownsPidFile = false;
@@ -71,7 +74,23 @@ export class PokeDaemon {
         // Exact /stop handler
         await this.runtime.abortAll();
       },
-      customHome
+      customHome,
+      {
+        onCompact: async () => {
+          if (this.compactionManager.isBusy()) {
+            return { success: false, busy: true, error: 'Main agent is currently busy processing a turn.' };
+          }
+          try {
+            const result = await this.runtime.compactMainConversation('manual');
+            return { success: true, ...result };
+          } catch (err: any) {
+            return { success: false, error: err?.message || String(err) };
+          }
+        },
+        onStatus: async () => {
+          return await getMobileStatusText(paths.sqliteFile, this.configManager);
+        },
+      }
     );
 
     this.runtime = new PokeRuntime(
@@ -87,6 +106,12 @@ export class PokeDaemon {
       this.compactionManager,
       customHome,
       this.gateway.getPresence()
+    );
+
+    this.ipcServer = new DaemonIpcServer(
+      paths.socketFile,
+      this.runtime,
+      this.compactionManager
     );
   }
 
@@ -138,6 +163,7 @@ export class PokeDaemon {
     try {
       this.compactionManager.setMainAgentBusy(false);
       await this.runtime.start();
+      await this.ipcServer.start();
       await this.gateway.start();
       this.gateway.heartbeat();
       this.heartbeatInterval = setInterval(() => this.gateway.heartbeat(), 30_000);
@@ -187,6 +213,7 @@ export class PokeDaemon {
       }
     };
 
+    await cleanup('IPC server', () => this.ipcServer.stop());
     await cleanup('WhatsApp gateway', () => this.gateway.stop());
     await cleanup('worker manager', () => this.workerManager.stop());
     await cleanup('Flue runtime', () => this.runtime.stop());

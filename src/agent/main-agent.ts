@@ -60,14 +60,15 @@ export function PokeMainAgent() {
   const thinkingLevel = mainModel?.reasoningEffort as any;
 
   const contextWindow = getModelContextWindow(mainModel?.model, mainModel?.provider);
-  const reserveTokens =
-    contextWindow > ACTIVE_COMPACTION_TOKEN_THRESHOLD
+  const reserveTokens = isInternalCompaction
+    ? Number.MAX_SAFE_INTEGER
+    : contextWindow > ACTIVE_COMPACTION_TOKEN_THRESHOLD
       ? contextWindow - ACTIVE_COMPACTION_TOKEN_THRESHOLD
       : Math.min(20000, Math.floor(contextWindow / 4));
 
   // 1. Declare model
   useModel(modelSpecifier, {
-    thinkingLevel,
+    thinkingLevel: isInternalCompaction ? 'off' : thinkingLevel,
     compaction: {
       keepRecentTokens: RECENT_TOKENS_RETENTION,
       reserveTokens,
@@ -77,39 +78,38 @@ export function PokeMainAgent() {
   // 2. Attach the trusted host sandbox with the daemon's full environment.
   useSandbox(local({ env: createPokeSandboxEnvironment() }));
 
-  // 3. Mount tools
-  const tools = createPokeTools(sharedContexts);
-  useTool(tools.sendTool);
-  useTool(tools.webSearchTool);
-  useTool(tools.webFetchTool);
-  useTool(tools.memoryTool);
-  useTool(tools.recallTool);
-  useTool(tools.composioSearchTool);
-  useTool(tools.composioExecuteTool);
-  useTool(tools.jobsTool);
-  useTool(tools.loadToolsTool);
-  for (const skill of sharedContexts.skills.getFlueSkills()) {
-    useSkill(skill);
-  }
+  // 3. Mount tools (skip during internal context compaction turns)
+  if (!isInternalCompaction) {
+    const tools = createPokeTools(sharedContexts);
+    useTool(tools.sendTool);
+    useTool(tools.webSearchTool);
+    useTool(tools.webFetchTool);
+    useTool(tools.memoryTool);
+    useTool(tools.recallTool);
+    useTool(tools.composioSearchTool);
+    useTool(tools.composioExecuteTool);
+    useTool(tools.jobsTool);
+    useTool(tools.loadToolsTool);
+    for (const skill of sharedContexts.skills.getFlueSkills()) {
+      useSkill(skill);
+    }
 
-  // Conditionally mount automation tool if capability is active
-  const activeCaps = sharedContexts.configManager.getActiveCapabilities();
-  if (activeCaps.includes('automations')) {
-    useTool(tools.automationTool);
+    // Conditionally mount automation tool if capability is active
+    const activeCaps = sharedContexts.configManager.getActiveCapabilities();
+    if (activeCaps.includes('automations')) {
+      useTool(tools.automationTool);
+    }
   }
 
   // 4. Lifecycle hooks
-  useAgentStart(async ({ harness }) => {
-    if (isInternalCompaction) {
-      await harness.compact();
-    }
-    if (sharedCompactionManager) {
+  useAgentStart(async () => {
+    if (!isInternalCompaction && sharedCompactionManager) {
       sharedCompactionManager.recordActivity();
     }
   });
 
   useAgentFinish(async () => {
-    if (sharedCompactionManager) {
+    if (!isInternalCompaction && sharedCompactionManager) {
       sharedCompactionManager.recordActivity();
     }
   });

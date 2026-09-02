@@ -86,12 +86,22 @@ export function unwrapMessageContent(
 
 export type MessageDispatchFn = (msg: NormalizedInboundMessage) => Promise<void>;
 export type StopHandlerFn = () => Promise<void>;
+export type CompactHandlerFn = () => Promise<{
+  success: boolean;
+  busy?: boolean;
+  beforeTokens?: number;
+  afterTokens?: number;
+  error?: string;
+}>;
+export type StatusHandlerFn = () => Promise<string>;
 
 export interface WhatsAppGatewayDependencies {
   downloadMedia?: (message: WAMessage) => Promise<Buffer>;
   deepgram?: DeepgramHandler;
   presence?: WhatsAppPresence;
   presenceOptions?: WhatsAppPresenceOptions;
+  onCompact?: CompactHandlerFn;
+  onStatus?: StatusHandlerFn;
 }
 
 export class WhatsAppGateway {
@@ -108,6 +118,8 @@ export class WhatsAppGateway {
   private lastConnectedAt: number | undefined;
   private pairedAccount: string | undefined;
   private readonly downloadMedia: (message: WAMessage) => Promise<Buffer>;
+  private readonly onCompact?: CompactHandlerFn;
+  private readonly onStatus?: StatusHandlerFn;
 
   constructor(
     private configManager: ConfigManager,
@@ -117,6 +129,8 @@ export class WhatsAppGateway {
     private customHome?: string,
     dependencies: WhatsAppGatewayDependencies = {}
   ) {
+    this.onCompact = dependencies.onCompact;
+    this.onStatus = dependencies.onStatus;
     this.downloadMedia = dependencies.downloadMedia || (async (message) =>
       (await downloadMediaMessage(
         message,
@@ -356,6 +370,92 @@ export class WhatsAppGateway {
           await this.sender.sendDirectNotice('Stopped.');
         } catch (err: any) {
           logger.error({ err: err.message }, 'Failed to send stop confirmation notice');
+        }
+      }
+      return;
+    }
+
+    if (isPureTextMessage && trimmedText === '/compact') {
+      logger.info({ messageId }, 'Received exact /compact command.');
+      let noticeToSend: { type: 'notice' | 'error'; text: string } | null = null;
+      try {
+        if (this.onCompact) {
+          const res = await this.onCompact();
+          if (res.busy) {
+            noticeToSend = {
+              type: 'notice',
+              text: 'Main agent is busy with an active turn. Please try /compact again once it finishes.',
+            };
+          } else if (res.success) {
+            const beforeStr = res.beforeTokens !== undefined ? `~${res.beforeTokens.toLocaleString()}` : 'unknown';
+            const afterStr = res.afterTokens !== undefined ? `~${res.afterTokens.toLocaleString()}` : 'unknown';
+            noticeToSend = {
+              type: 'notice',
+              text: `Compacted.\nContext: ${beforeStr} → ${afterStr} tokens`,
+            };
+          } else {
+            noticeToSend = {
+              type: 'error',
+              text: `Compaction failed: ${res.error || 'Unknown error'}`,
+            };
+          }
+        } else {
+          noticeToSend = {
+            type: 'error',
+            text: 'Compaction handler not configured.',
+          };
+        }
+        if (this.db.isOpen()) {
+          this.db.recordIdempotency(idempotencyKey, 'whatsapp_inbound', messageId);
+        }
+      } catch (err: any) {
+        logger.error({ err: err?.message }, 'Failed during /compact handling');
+        noticeToSend = {
+          type: 'error',
+          text: `Compaction failed: ${err?.message || String(err)}`,
+        };
+      } finally {
+        this.inFlightInbound.delete(idempotencyKey);
+      }
+
+      if (noticeToSend) {
+        try {
+          if (noticeToSend.type === 'error') {
+            await this.sender.sendDirectError(noticeToSend.text);
+          } else {
+            await this.sender.sendDirectNotice(noticeToSend.text);
+          }
+        } catch (sendErr: any) {
+          logger.error({ err: sendErr?.message }, 'Failed to send compaction notice/error');
+        }
+      }
+      return;
+    }
+
+    if (isPureTextMessage && trimmedText === '/status') {
+      logger.info({ messageId }, 'Received exact /status command.');
+      let statusText: string | null = null;
+      try {
+        if (this.onStatus) {
+          statusText = await this.onStatus();
+        } else {
+          statusText = 'Status handler not configured.';
+        }
+        if (this.db.isOpen()) {
+          this.db.recordIdempotency(idempotencyKey, 'whatsapp_inbound', messageId);
+        }
+      } catch (err: any) {
+        logger.error({ err: err?.message }, 'Failed during /status handling');
+        statusText = `Failed to get status: ${err?.message || String(err)}`;
+      } finally {
+        this.inFlightInbound.delete(idempotencyKey);
+      }
+
+      if (statusText) {
+        try {
+          await this.sender.sendDirectNotice(statusText);
+        } catch (sendErr: any) {
+          logger.error({ err: sendErr?.message }, 'Failed to send status notice');
         }
       }
       return;

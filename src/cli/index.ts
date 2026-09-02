@@ -12,6 +12,7 @@ import {
   runRestart,
 } from './lifecycle.js';
 import { runUpdate } from './update.js';
+import { runCompact } from './compact.js';
 
 export function createCli(): Command {
   const program = new Command();
@@ -81,6 +82,13 @@ export function createCli(): Command {
     .description('Show runtime status, WhatsApp state, models, worker queue, and compaction info')
     .action(async () => {
       await runStatus();
+    });
+
+  program
+    .command('compact')
+    .description('Manually compact the main agent conversation')
+    .action(async () => {
+      await runCompact();
     });
 
   program

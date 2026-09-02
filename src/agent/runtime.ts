@@ -14,7 +14,7 @@ import { WorkerManager } from '../workers/worker-manager.js';
 import { AutomationScheduler } from '../scheduler/scheduler.js';
 import { WhatsAppSender } from '../gateway/sender.js';
 import { WhatsAppPresence } from '../gateway/presence.js';
-import { CompactionManager, estimateTokenCount } from '../context/compaction-manager.js';
+import { CompactionManager, estimateTokenCount, RECENT_TOKENS_RETENTION } from '../context/compaction-manager.js';
 import { getLogger } from '../logger/logger.js';
 import { resolvePokePaths, ensurePokeDirectories } from '../config/paths.js';
 import { registerAllProviders, ProviderRegistry, normalizeCatalogModelId } from '../providers/provider-registry.js';
@@ -36,6 +36,7 @@ export class PokeRuntime {
   private unsubscribeObserver: (() => void) | null = null;
   private compactionRequest: Promise<void> | null = null;
   private runningOwnerSubmissions = new Set<string>();
+  private internalCompactionSubmissions = new Set<string>();
   private ownerTurnTokenEstimates = new Map<string, number>();
   private watchedSubmissionSettlements = new Set<string>();
 
@@ -225,7 +226,7 @@ export class PokeRuntime {
   async checkIdleCompaction(): Promise<void> {
     if (this.compactionManager.shouldCompactIdle()) {
       getLogger().info('Idle compaction threshold reached (>100k tokens and 30m inactive).');
-      await this.requestOwnerCompaction('idle');
+      await this.compactMainConversation('idle');
     }
   }
 
@@ -456,13 +457,20 @@ export class PokeRuntime {
 
   private observeOwnerEvent(event: any): void {
     switch (event.type) {
-      case 'submission_running':
+      case 'submission_running': {
         this.runningOwnerSubmissions.add(event.submissionId);
-        this.compactionManager.setMainAgentBusy(true);
+        const hasForeground = [...this.runningOwnerSubmissions].some(
+          (id) => !this.internalCompactionSubmissions.has(id)
+        );
+        this.compactionManager.setMainAgentBusy(hasForeground);
         return;
+      }
       case 'submission_settled': {
         this.runningOwnerSubmissions.delete(event.submissionId);
-        this.compactionManager.setMainAgentBusy(this.runningOwnerSubmissions.size > 0);
+        const hasForeground = [...this.runningOwnerSubmissions].some(
+          (id) => !this.internalCompactionSubmissions.has(id)
+        );
+        this.compactionManager.setMainAgentBusy(hasForeground);
         const delivery = this.db.getSubmissionDelivery(event.submissionId);
         if (delivery?.source_key) {
           this.presence?.stopTurn(delivery.source_key);
@@ -476,16 +484,24 @@ export class PokeRuntime {
         });
         return;
       }
-      case 'turn_request':
+      case 'turn_request': {
         if (event.purpose === 'agent') {
-          const tokens = estimateTokenCount(event.request?.input);
-          this.ownerTurnTokenEstimates.set(event.turnId, tokens);
-          this.compactionManager.setEstimatedTokens(tokens);
-          this.compactionManager.recordActivity();
+          const isCompaction = event.submissionId && this.internalCompactionSubmissions.has(event.submissionId);
+          if (!isCompaction) {
+            const tokens = estimateTokenCount(event.request?.input);
+            this.ownerTurnTokenEstimates.set(event.turnId, tokens);
+            this.compactionManager.setEstimatedTokens(tokens);
+            this.compactionManager.recordActivity();
+          }
         }
         return;
+      }
       case 'turn': {
         if (event.purpose !== 'agent') return;
+        const isCompaction = event.submissionId && this.internalCompactionSubmissions.has(event.submissionId);
+        if (isCompaction) {
+          return;
+        }
         const inputTokens = this.ownerTurnTokenEstimates.get(event.turnId)
           ?? this.compactionManager.getEstimatedTokens();
         this.ownerTurnTokenEstimates.delete(event.turnId);
@@ -504,7 +520,7 @@ export class PokeRuntime {
         }
         this.compactionManager.recordActivity();
         if (this.compactionManager.shouldCompactActive()) {
-          void this.requestOwnerCompaction('active');
+          void this.compactMainConversation('active');
         }
         return;
       }
@@ -539,23 +555,53 @@ export class PokeRuntime {
 
     // Store the marker only after the capability transition succeeds. If the
     // process dies in between, startup repeats the idempotent clear.
-    this.compactionManager.onCompactionSuccess();
+    const activeTokens = this.db.getActiveConversationTokenEstimate(PokeMainAgent.name, MAIN_AGENT_INSTANCE_ID);
+    const remainingTokens = activeTokens ?? RECENT_TOKENS_RETENTION;
+    this.compactionManager.onCompactionSuccess(remainingTokens);
     this.db.setState(OWNER_COMPACTION_ENTRY_STATE_KEY, entryId);
   }
 
   private async ensurePreflightCompaction(): Promise<void> {
     if (this.compactionManager.shouldPreflightCompact()) {
-      await this.requestOwnerCompaction('preflight');
+      await this.compactMainConversation('preflight');
     }
   }
 
-  private async requestOwnerCompaction(reason: 'active' | 'idle' | 'preflight'): Promise<void> {
+  async compactMainConversation(
+    reason: 'active' | 'idle' | 'preflight' | 'manual'
+  ): Promise<{ beforeTokens: number; afterTokens: number; compacted: boolean }> {
+    if (!this.agentHandle) {
+      throw new Error('Poke runtime is not started.');
+    }
+
+    if (reason === 'manual') {
+      const hasForeground = [...this.runningOwnerSubmissions].some(
+        (id) => !this.internalCompactionSubmissions.has(id)
+      );
+      if (hasForeground || this.compactionManager.isBusy() || Boolean(this.compactionRequest)) {
+        throw new Error('Main agent is currently busy processing a turn.');
+      }
+    }
+
+    const beforeTokens = this.compactionManager.getEstimatedTokens();
+
+    await this.requestOwnerCompaction(reason);
+
+    const afterTokens = this.compactionManager.getEstimatedTokens();
+    return {
+      beforeTokens,
+      afterTokens,
+      compacted: true,
+    };
+  }
+
+  private async requestOwnerCompaction(reason: 'active' | 'idle' | 'preflight' | 'manual'): Promise<void> {
     if (!this.agentHandle) return;
     if (this.compactionRequest) {
       try {
         await this.compactionRequest;
       } catch (error: any) {
-        if (reason === 'preflight') throw error;
+        if (reason === 'preflight' || reason === 'manual') throw error;
         getLogger().error(
           { err: error?.message || String(error), reason },
           'A shared owner compaction request failed'
@@ -577,8 +623,13 @@ export class PokeRuntime {
         } as any,
         idempotencyKey: `owner-compaction:${reason}:${Date.now()}`,
       });
-      await handle.read(receipt);
-      this.reconcileOwnerCompactionState();
+      this.internalCompactionSubmissions.add(receipt.submissionId);
+      try {
+        await handle.read(receipt);
+        this.reconcileOwnerCompactionState();
+      } finally {
+        this.internalCompactionSubmissions.delete(receipt.submissionId);
+      }
     })();
     this.compactionRequest = request;
     try {
@@ -591,7 +642,7 @@ export class PokeRuntime {
       // A preflight is the admission gate: do not add new work to a context
       // that could not be compacted. Background active/idle attempts remain
       // best-effort and are retried at their next seam.
-      if (reason === 'preflight') throw error;
+      if (reason === 'preflight' || reason === 'manual') throw error;
     } finally {
       if (this.compactionRequest === request) this.compactionRequest = null;
     }

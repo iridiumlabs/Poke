@@ -64,9 +64,10 @@ export class CompactionManager {
   setMainAgentBusy(busy: boolean): void {
     this.isMainAgentBusy = busy;
     this.db.setState('main_agent_busy', busy ? 'true' : 'false');
-    if (busy) {
-      this.recordActivity();
-    }
+  }
+
+  isBusy(): boolean {
+    return this.isMainAgentBusy;
   }
 
   setEstimatedTokens(tokens: number): void {
@@ -126,7 +127,6 @@ export class CompactionManager {
     // 2. Reset token counter to retained raw tokens + summary estimate
     this.approximateTokens = remainingTokens;
     this.db.setState('approximate_tokens', String(this.approximateTokens));
-    this.recordActivity();
   }
 
   onCompactionFailure(error: any): void {

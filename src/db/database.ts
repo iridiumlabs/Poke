@@ -192,6 +192,97 @@ export class PokeDatabase {
     return null;
   }
 
+  /**
+   * Estimates the current token size of the active conversation for an agent instance,
+   * taking into account any recent compaction summary and subsequent conversation records.
+   */
+  getActiveConversationTokenEstimate(agentName: string, instanceId: string): number | null {
+    if (!this.isOpen()) return null;
+    const streamPath = `agents/${agentName}/${instanceId}`;
+    try {
+      const batchSeqs = this.db
+        .prepare(
+          `SELECT seq FROM flue_conversation_stream_batches
+           WHERE path = ? ORDER BY seq DESC`
+        )
+        .all(streamPath) as Array<{ seq: number }>;
+
+      if (batchSeqs.length === 0) return null;
+
+      const activeRecords: any[] = [];
+
+      for (const { seq } of batchSeqs) {
+        const batch = this.db
+          .prepare(
+            `SELECT data FROM flue_conversation_stream_batches
+             WHERE path = ? AND seq = ?`
+          )
+          .get(streamPath, seq) as { data: string } | undefined;
+        if (!batch) continue;
+        let data = batch.data;
+        if (data.startsWith('{')) {
+          const chunks = this.db
+            .prepare(
+              `SELECT data FROM flue_conversation_stream_batch_chunks
+               WHERE path = ? AND seq = ? ORDER BY chunk_index ASC`
+            )
+            .all(streamPath, seq) as Array<{ data: string }>;
+          if (chunks.length > 0) {
+            data = chunks.map((chunk) => chunk.data).join('');
+          }
+        }
+        try {
+          const parsed = JSON.parse(data);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            let compactionIdx = -1;
+            for (let i = parsed.length - 1; i >= 0; i--) {
+              if (parsed[i]?.type === 'compaction') {
+                compactionIdx = i;
+                break;
+              }
+            }
+
+            if (compactionIdx >= 0) {
+              activeRecords.unshift(...parsed.slice(compactionIdx));
+              break;
+            } else {
+              activeRecords.unshift(...parsed);
+            }
+          }
+        } catch {}
+      }
+
+      if (activeRecords.length === 0) return null;
+
+      let totalChars = 0;
+      for (const rec of activeRecords) {
+        if (!rec) continue;
+        if (rec.type === 'compaction') {
+          if (typeof rec.summary === 'string') totalChars += rec.summary.length;
+          if (rec.details) totalChars += JSON.stringify(rec.details).length;
+        } else if (rec.type === 'user_message' || rec.type === 'signal') {
+          if (typeof rec.content === 'string') totalChars += rec.content.length;
+          else if (rec.content) totalChars += JSON.stringify(rec.content).length;
+        } else if (rec.type === 'assistant_text_delta') {
+          if (typeof rec.delta === 'string') totalChars += rec.delta.length;
+        } else if (rec.type === 'assistant_text_completed') {
+          if (typeof rec.text === 'string') totalChars += rec.text.length;
+        } else if (rec.type === 'tool_outcome' || rec.type === 'tool_results_committed') {
+          if (rec.content) totalChars += JSON.stringify(rec.content).length;
+        } else if (rec.type === 'assistant_tool_call') {
+          if (rec.toolName) totalChars += String(rec.toolName).length;
+          if (rec.arguments) totalChars += JSON.stringify(rec.arguments).length;
+        }
+      }
+
+      // Base overhead estimate for system prompt / instructions
+      const estimatedTokens = Math.max(Math.ceil(totalChars / 4), 100);
+      return estimatedTokens;
+    } catch {
+      return null;
+    }
+  }
+
 
   // --- Worker Jobs ---
   createWorkerJob(job: {
