@@ -1,0 +1,290 @@
+import { execSync } from 'node:child_process';
+import { resolvePokeInstallationPaths, type PokeInstallationPaths } from '../config/installation.js';
+import { isDaemonRunning, runStart, runStop } from './lifecycle.js';
+import { createCliUi, type CliUi, CliCommandFailedError } from './ui.js';
+
+export interface UpdateDependencies {
+  exec?: (command: string, options?: { cwd?: string; encoding?: 'utf8'; stdio?: any }) => string | Buffer;
+  installationPaths?: PokeInstallationPaths;
+  isDaemonRunning?: (customHome?: string) => boolean;
+  stopDaemon?: (customHome?: string) => Promise<void>;
+  startDaemon?: (
+    options: { foreground?: boolean },
+    customHome?: string,
+    dependencies?: {
+      exec?: (cmd: string) => any;
+      installationPaths?: { pokeBinPath: string; workingDir: string };
+      spawn?: typeof import('node:child_process').spawn;
+    }
+  ) => Promise<void>;
+  verifyDaemonRunning?: (customHome?: string, timeoutMs?: number) => Promise<boolean>;
+  npmCommand?: string;
+  remoteBranch?: string;
+  remoteName?: string;
+}
+
+export interface UpdateResult {
+  success: boolean;
+  previousCommit: string;
+  updatedCommit: string;
+  updated: boolean;
+}
+
+async function rollback(options: {
+  workingDir: string;
+  previousCommit: string;
+  currentBranch: string | null;
+  wasRunning: boolean;
+  customHome?: string;
+  paths: PokeInstallationPaths;
+  exec: (command: string, options?: { cwd?: string; encoding?: 'utf8'; stdio?: any }) => any;
+  npm: string;
+  startDaemon: (
+    options: { foreground?: boolean },
+    customHome?: string,
+    dependencies?: {
+      exec?: (cmd: string) => any;
+      installationPaths?: { pokeBinPath: string; workingDir: string };
+      spawn?: typeof import('node:child_process').spawn;
+    }
+  ) => Promise<void>;
+  stopDaemon?: (customHome?: string) => Promise<void>;
+  ui: CliUi;
+}): Promise<void> {
+  const {
+    workingDir,
+    previousCommit,
+    currentBranch,
+    wasRunning,
+    customHome,
+    paths,
+    exec,
+    npm,
+    startDaemon,
+    stopDaemon,
+    ui,
+  } = options;
+
+  ui.note(`Restoring repository to ${previousCommit.slice(0, 7)}...`);
+  try {
+    if (stopDaemon) {
+      await stopDaemon(customHome).catch(() => {});
+    }
+
+    if (currentBranch) {
+      exec(`git checkout -B ${currentBranch} ${previousCommit}`, { cwd: workingDir });
+    } else {
+      exec(`git checkout --detach ${previousCommit}`, { cwd: workingDir });
+    }
+
+    ui.note('Rebuilding previous version...');
+    exec(`${npm} install`, { cwd: workingDir });
+    exec(`${npm} run build`, { cwd: workingDir });
+
+    if (wasRunning) {
+      ui.note('Restarting previous daemon version...');
+      await startDaemon({}, customHome, {
+        installationPaths: paths,
+        exec: (cmd: string) => exec(cmd, { cwd: workingDir }),
+      });
+    }
+  } catch (rollbackErr: any) {
+    ui.error(`Rollback encountered an error: ${rollbackErr.message}`);
+  }
+}
+
+export async function runUpdate(
+  customHome?: string,
+  ui: CliUi = createCliUi(),
+  dependencies: UpdateDependencies = {}
+): Promise<UpdateResult> {
+  const paths = dependencies.installationPaths || resolvePokeInstallationPaths();
+  const workingDir = paths.workingDir;
+  const exec = dependencies.exec || ((cmd, opts) => execSync(cmd, { encoding: 'utf8', ...opts }));
+  const checkDaemonRunning = dependencies.isDaemonRunning || isDaemonRunning;
+  const stopDaemon = dependencies.stopDaemon || runStop;
+  const startDaemon = dependencies.startDaemon || runStart;
+  const npm = dependencies.npmCommand || (process.platform === 'win32' ? 'npm.cmd' : 'npm');
+  const remote = dependencies.remoteName || 'origin';
+  const branch = dependencies.remoteBranch || 'main';
+
+  // 1. Verify working directory is a Git repository
+  try {
+    const isInsideWorkTree = String(exec('git rev-parse --is-inside-work-tree', { cwd: workingDir })).trim();
+    if (isInsideWorkTree !== 'true') {
+      throw new Error('Not inside a Git work tree');
+    }
+  } catch {
+    const msg = `Poke installation directory (${workingDir}) is not a Git repository.`;
+    ui.error(msg);
+    throw new CliCommandFailedError(msg);
+  }
+
+  // 2. Fetch latest remote state
+  ui.note(`Fetching latest updates from ${remote}/${branch}...`);
+  try {
+    exec(`git fetch ${remote} +refs/heads/${branch}:refs/remotes/${remote}/${branch}`, { cwd: workingDir });
+  } catch (err: any) {
+    const msg = `Failed to fetch from ${remote}/${branch}: ${err.stderr?.toString().trim() || err.message}`;
+    ui.error(msg);
+    throw new CliCommandFailedError(msg);
+  }
+
+  // 3. Resolve local HEAD and remote commit
+  let localCommit: string;
+  let remoteCommit: string;
+  try {
+    localCommit = String(exec('git rev-parse HEAD', { cwd: workingDir })).trim();
+    remoteCommit = String(exec(`git rev-parse refs/remotes/${remote}/${branch}`, { cwd: workingDir })).trim();
+  } catch (err: any) {
+    const msg = `Failed to resolve Git commits: ${err.stderr?.toString().trim() || err.message}`;
+    ui.error(msg);
+    throw new CliCommandFailedError(msg);
+  }
+
+  // 4. If HEAD matches remote, report up-to-date and exit immediately
+  if (localCommit === remoteCommit) {
+    ui.success(`Poke is already up to date (${localCommit.slice(0, 7)}).`);
+    return {
+      success: true,
+      previousCommit: localCommit,
+      updatedCommit: localCommit,
+      updated: false,
+    };
+  }
+
+  // 5. Check working tree cleanliness before making changes
+  const statusOutput = String(exec('git status --porcelain', { cwd: workingDir })).trim();
+  if (statusOutput.length > 0) {
+    const msg = 'Cannot update: working tree has uncommitted changes. Please commit, stash, or discard local changes before updating.';
+    ui.error(msg);
+    throw new CliCommandFailedError(msg);
+  }
+
+  // 6. Check if local HEAD can be fast-forwarded to remote
+  try {
+    exec(`git merge-base --is-ancestor HEAD refs/remotes/${remote}/${branch}`, { cwd: workingDir });
+  } catch {
+    const msg = `Cannot update: local branch has diverged from ${remote}/${branch}. Automatic fast-forward update is not possible.`;
+    ui.error(msg);
+    throw new CliCommandFailedError(msg);
+  }
+
+  // 7. Record pre-update state
+  const previousCommit = localCommit;
+  const wasRunning = checkDaemonRunning(customHome);
+  let currentBranch: string | null = null;
+  try {
+    const branchOutput = String(exec('git symbolic-ref --short -q HEAD', { cwd: workingDir })).trim();
+    if (branchOutput) {
+      currentBranch = branchOutput.replace(/^refs\/heads\//, '');
+    }
+  } catch {
+    currentBranch = null; // Detached HEAD
+  }
+
+  // 8. Gracefully stop Poke daemon if running
+  if (wasRunning) {
+    ui.note('Stopping Poke daemon...');
+    await stopDaemon(customHome);
+  }
+
+  // 9. Fast-forward to origin/main
+  ui.note(`Updating Poke from ${previousCommit.slice(0, 7)} to ${remoteCommit.slice(0, 7)}...`);
+  try {
+    if (currentBranch) {
+      exec(`git merge --ff-only refs/remotes/${remote}/${branch}`, { cwd: workingDir });
+    } else {
+      exec(`git checkout --detach refs/remotes/${remote}/${branch}`, { cwd: workingDir });
+    }
+  } catch (mergeErr: any) {
+    ui.error(`Fast-forward failed: ${mergeErr.stderr?.toString().trim() || mergeErr.message}`);
+    if (wasRunning) {
+      await startDaemon({}, customHome, {
+        installationPaths: paths,
+        exec: (cmd: string) => exec(cmd, { cwd: workingDir }),
+      }).catch(() => {});
+    }
+    throw new CliCommandFailedError(
+      `Fast-forward update failed: ${mergeErr.stderr?.toString().trim() || mergeErr.message}`
+    );
+  }
+
+  // 10. Install dependencies and build production artifacts
+  try {
+    ui.note('Installing dependencies...');
+    exec(`${npm} install`, { cwd: workingDir });
+    ui.note('Building Poke...');
+    exec(`${npm} run build`, { cwd: workingDir });
+  } catch (buildErr: any) {
+    ui.error(`Build failed: ${buildErr.stderr?.toString().trim() || buildErr.message}`);
+    await rollback({
+      workingDir,
+      previousCommit,
+      currentBranch,
+      wasRunning,
+      customHome,
+      paths,
+      exec,
+      npm,
+      startDaemon,
+      stopDaemon,
+      ui,
+    });
+    throw new CliCommandFailedError(
+      `Update failed during build. Restored previous version (${previousCommit.slice(0, 7)}).`
+    );
+  }
+
+  // 11. Start newly built version and verify (if daemon was running)
+  if (wasRunning) {
+    ui.note('Starting updated Poke daemon...');
+    await startDaemon({}, customHome, {
+      installationPaths: paths,
+      exec: (cmd: string) => exec(cmd, { cwd: workingDir }),
+    });
+
+    ui.note('Verifying Poke daemon is running...');
+    const verifyFn = dependencies.verifyDaemonRunning || (async (home?: string, timeoutMs = 5000) => {
+      const pollInterval = 250;
+      const maxAttempts = Math.max(1, Math.floor(timeoutMs / pollInterval));
+      for (let i = 0; i < maxAttempts; i++) {
+        await new Promise((r) => setTimeout(r, pollInterval));
+        if (checkDaemonRunning(home)) return true;
+      }
+      return checkDaemonRunning(home);
+    });
+
+    const isRunning = await verifyFn(customHome);
+    if (!isRunning) {
+      ui.error('Updated Poke daemon failed to start or stay running.');
+      await rollback({
+        workingDir,
+        previousCommit,
+        currentBranch,
+        wasRunning,
+        customHome,
+        paths,
+        exec,
+        npm,
+        startDaemon,
+        stopDaemon,
+        ui,
+      });
+      throw new CliCommandFailedError(
+        `Updated daemon failed to stay running. Restored previous version (${previousCommit.slice(0, 7)}).`
+      );
+    }
+
+    ui.success(`Poke successfully updated to ${remoteCommit.slice(0, 7)} and daemon restarted.`);
+  } else {
+    ui.success(`Poke successfully updated to ${remoteCommit.slice(0, 7)}.`);
+  }
+
+  return {
+    success: true,
+    previousCommit,
+    updatedCommit: remoteCommit,
+    updated: true,
+  };
+}

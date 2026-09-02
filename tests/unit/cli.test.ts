@@ -477,4 +477,12 @@ describe('CLI & Diagnostics', () => {
     expect(result.status).toBe(0);
     expect(result.stdout.trim()).toBe(pkg.version);
   });
+
+  it('registers the update command with clear description', () => {
+    const program = createCli();
+    const updateCmd = program.commands.find((cmd) => cmd.name() === 'update');
+
+    expect(updateCmd).toBeDefined();
+    expect(updateCmd?.description()).toContain('Update Poke from origin/main');
+  });
 });
