@@ -11,6 +11,7 @@ import {
   runStop,
   runRestart,
 } from './lifecycle.js';
+import { runUpdate } from './update.js';
 
 export function createCli(): Command {
   const program = new Command();
@@ -102,6 +103,13 @@ export function createCli(): Command {
         follow: options.follow,
         lines: parseInt(options.lines, 10) || 100,
       });
+    });
+
+  program
+    .command('update')
+    .description('Update Poke from origin/main, install dependencies, rebuild, and restart daemon if running')
+    .action(async () => {
+      await runUpdate();
     });
 
   return program;
