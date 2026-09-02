@@ -403,6 +403,16 @@ describe('PokeRuntime: Compaction Mechanics & Manual Compaction', () => {
     expect(mockAgentHandle.dispatch).not.toHaveBeenCalled();
   });
 
+  it('compactMainConversation(manual) throws if another compaction request is already in-flight', async () => {
+    (runtime as any).compactionRequest = Promise.resolve();
+
+    await expect(runtime.compactMainConversation('manual')).rejects.toThrow(
+      'Main agent is currently busy processing a turn.'
+    );
+
+    expect(mockAgentHandle.dispatch).not.toHaveBeenCalled();
+  });
+
   it('compactMainConversation(manual) forces compaction below thresholds when idle and reports before/after tokens', async () => {
     compactionManager.setEstimatedTokens(50000); // below 100k and 272k
     config.addActiveCapability('automations');

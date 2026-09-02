@@ -167,9 +167,12 @@ export async function getMobileStatusText(
   config?: ConfigManager
 ): Promise<string> {
   const isSqlitePath = typeof sqliteFileOrCustomHome === 'string' && sqliteFileOrCustomHome.endsWith('.sqlite');
-  const paths = resolvePokePaths(isSqlitePath ? undefined : sqliteFileOrCustomHome);
+  const customHome = isSqlitePath
+    ? path.dirname(sqliteFileOrCustomHome)
+    : sqliteFileOrCustomHome;
+  const paths = resolvePokePaths(customHome);
   const sqliteFile = isSqlitePath ? sqliteFileOrCustomHome : paths.sqliteFile;
-  const cfg = config || new ConfigManager(isSqlitePath ? undefined : sqliteFileOrCustomHome, { initialize: false });
+  const cfg = config || new ConfigManager(customHome, { initialize: false });
   const database = await readStatusDatabase(sqliteFile);
   const mainModel = cfg.getMainModel();
   const workerModel = cfg.getWorkerModel();

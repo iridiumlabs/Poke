@@ -120,5 +120,17 @@ describe('CompactionManager', () => {
     const afterEstimate = db.getActiveConversationTokenEstimate('PokeMainAgent', 'owner');
     expect(afterEstimate).toBeLessThan(beforeEstimate!);
     expect(afterEstimate).toBeLessThan(1000);
+
+    // 3. Add older historical batches and a second newer compaction
+    const batch3 = [
+      { type: 'compaction', entryId: 'c2', summary: 'Second compaction summary.', details: {} },
+      { type: 'user_message', content: 'Newest message.' },
+    ];
+    (db as any).db
+      .prepare('INSERT INTO flue_conversation_stream_batches (path, seq, data) VALUES (?, ?, ?)')
+      .run(streamPath, 3, JSON.stringify(batch3));
+
+    const newestEstimate = db.getActiveConversationTokenEstimate('PokeMainAgent', 'owner');
+    expect(newestEstimate).toBeLessThan(1000);
   });
 });

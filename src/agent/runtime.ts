@@ -578,7 +578,7 @@ export class PokeRuntime {
       const hasForeground = [...this.runningOwnerSubmissions].some(
         (id) => !this.internalCompactionSubmissions.has(id)
       );
-      if (hasForeground || this.compactionManager.isBusy()) {
+      if (hasForeground || this.compactionManager.isBusy() || Boolean(this.compactionRequest)) {
         throw new Error('Main agent is currently busy processing a turn.');
       }
     }

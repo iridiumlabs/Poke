@@ -203,13 +203,14 @@ export class PokeDatabase {
       const batchSeqs = this.db
         .prepare(
           `SELECT seq FROM flue_conversation_stream_batches
-           WHERE path = ? ORDER BY seq ASC`
+           WHERE path = ? ORDER BY seq DESC`
         )
         .all(streamPath) as Array<{ seq: number }>;
 
       if (batchSeqs.length === 0) return null;
 
-      const allRecords: any[] = [];
+      const activeRecords: any[] = [];
+
       for (const { seq } of batchSeqs) {
         const batch = this.db
           .prepare(
@@ -232,28 +233,29 @@ export class PokeDatabase {
         }
         try {
           const parsed = JSON.parse(data);
-          if (Array.isArray(parsed)) {
-            allRecords.push(...parsed);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            let compactionIdx = -1;
+            for (let i = parsed.length - 1; i >= 0; i--) {
+              if (parsed[i]?.type === 'compaction') {
+                compactionIdx = i;
+                break;
+              }
+            }
+
+            if (compactionIdx >= 0) {
+              activeRecords.unshift(...parsed.slice(compactionIdx));
+              break;
+            } else {
+              activeRecords.unshift(...parsed);
+            }
           }
         } catch {}
       }
 
-      if (allRecords.length === 0) return null;
-
-      // Find the last compaction index
-      let lastCompactionIndex = -1;
-      for (let i = allRecords.length - 1; i >= 0; i--) {
-        if (allRecords[i]?.type === 'compaction') {
-          lastCompactionIndex = i;
-          break;
-        }
-      }
+      if (activeRecords.length === 0) return null;
 
       let totalChars = 0;
-      const startIndex = lastCompactionIndex >= 0 ? lastCompactionIndex : 0;
-
-      for (let i = startIndex; i < allRecords.length; i++) {
-        const rec = allRecords[i];
+      for (const rec of activeRecords) {
         if (!rec) continue;
         if (rec.type === 'compaction') {
           if (typeof rec.summary === 'string') totalChars += rec.summary.length;

@@ -61,7 +61,7 @@ export function PokeMainAgent() {
 
   const contextWindow = getModelContextWindow(mainModel?.model, mainModel?.provider);
   const reserveTokens = isInternalCompaction
-    ? Math.max(contextWindow, 1)
+    ? Number.MAX_SAFE_INTEGER
     : contextWindow > ACTIVE_COMPACTION_TOKEN_THRESHOLD
       ? contextWindow - ACTIVE_COMPACTION_TOKEN_THRESHOLD
       : Math.min(20000, Math.floor(contextWindow / 4));

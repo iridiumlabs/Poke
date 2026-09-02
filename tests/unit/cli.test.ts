@@ -508,5 +508,9 @@ describe('CLI & Diagnostics', () => {
     expect(statusText).toContain('• Idle Threshold: 100,000 tokens (after 30m)');
     expect(statusText).toContain('• State: Idle');
     expect(statusText).toContain('• Main: commandcode / claude-sonnet-4-6');
+
+    // Also verify when called with sqlite path and omitted config
+    const statusFromSqlite = await getMobileStatusText(config.getPaths().sqliteFile);
+    expect(statusFromSqlite).toContain('• Main: commandcode / claude-sonnet-4-6');
   });
 });
