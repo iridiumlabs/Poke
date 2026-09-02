@@ -170,6 +170,81 @@ describe('WhatsApp Presence: Composing, Recording, Refresh & Lifecycle', () => {
       presence.stop();
     });
 
+    it('cleans up all alias references when stopTurn is called with the primary key', () => {
+      const mockSocket = {
+        sendPresenceUpdate: vi.fn().mockResolvedValue(undefined),
+      };
+
+      const presence = new WhatsAppPresence(
+        () => mockSocket,
+        () => '923001234567@s.whatsapp.net'
+      );
+
+      presence.startTurn('primary-turn-1');
+      presence.attachTurnAlias('primary-turn-1', 'alias-sub-1');
+      presence.attachTurnAlias('primary-turn-1', 'alias-sub-2');
+
+      // Stop using primary key
+      presence.stopTurn('primary-turn-1');
+      expect(presence.getActiveTurnCount()).toBe(0);
+
+      // Stopping by alias subsequently should be a clean no-op
+      presence.stopTurn('alias-sub-1');
+      expect(presence.getActiveTurnCount()).toBe(0);
+      presence.stop();
+    });
+
+    it('handles concurrent overlapping voice recordings with tokens without premature pause', () => {
+      const presenceUpdates: Array<{ type: string; toJid?: string }> = [];
+      const mockSocket = {
+        sendPresenceUpdate: vi.fn().mockImplementation(async (type, toJid) => {
+          presenceUpdates.push({ type, toJid });
+        }),
+      };
+
+      const presence = new WhatsAppPresence(
+        () => mockSocket,
+        () => '923001234567@s.whatsapp.net'
+      );
+
+      // Start turn -> composing
+      presence.startTurn('t-main');
+      expect(presence.getCurrentPresence()).toBe('composing');
+
+      // First voice recording starts
+      const token1 = presence.startRecording();
+      expect(presence.getCurrentPresence()).toBe('recording');
+      expect(presence.isRecording()).toBe(true);
+
+      // Second concurrent voice recording starts
+      const token2 = presence.startRecording();
+      expect(presence.getCurrentPresence()).toBe('recording');
+      expect(presence.isRecording()).toBe(true);
+
+      // First voice recording completes -> STILL recording because token2 is active
+      presence.stopRecording(token1);
+      expect(presence.getCurrentPresence()).toBe('recording');
+      expect(presence.isRecording()).toBe(true);
+
+      // Second voice recording completes -> restores composing (active turn present)
+      presence.stopRecording(token2);
+      expect(presence.getCurrentPresence()).toBe('composing');
+      expect(presence.isRecording()).toBe(false);
+
+      // Main turn finishes -> paused
+      presence.stopTurn('t-main');
+      expect(presence.getCurrentPresence()).toBe('idle');
+
+      expect(presenceUpdates.map((u) => u.type)).toEqual([
+        'composing',
+        'recording',
+        'composing',
+        'paused',
+      ]);
+
+      presence.stop();
+    });
+
     it('switches to recording mode and restores composing if turn is still active', () => {
       const presenceUpdates: Array<{ type: string; toJid?: string }> = [];
       const mockSocket = {
@@ -557,6 +632,30 @@ describe('WhatsApp Presence: Composing, Recording, Refresh & Lifecycle', () => {
       resolveWorkerTurn!({ text: 'Worker job finished' });
       await vi.waitFor(() => {
         expect(presenceUpdates.map((u) => u.type)).toEqual(['composing', 'paused', 'composing', 'paused']);
+      });
+      expect(presence.getActiveTurnCount()).toBe(0);
+    });
+
+    it('handles worker completion signal without idempotencyKey and settles properly', async () => {
+      let resolveWorkerTurn: (val: any) => void;
+      mockAgentHandle.read.mockImplementationOnce(() => new Promise((resolve) => {
+        resolveWorkerTurn = resolve;
+      }));
+      mockAgentHandle.dispatch.mockResolvedValueOnce({ submissionId: 'sub-worker-no-idemp' });
+
+      await runtime.dispatchSignal({
+        type: 'worker.completion',
+        tagName: 'worker',
+        attributes: { jobId: 'job-456' },
+        body: 'Scraping result data without idempotency key...',
+      });
+
+      expect(presenceUpdates.map((u) => u.type)).toEqual(['composing']);
+      expect(presence.getActiveTurnCount()).toBe(1);
+
+      resolveWorkerTurn!({ text: 'Done' });
+      await vi.waitFor(() => {
+        expect(presenceUpdates.map((u) => u.type)).toEqual(['composing', 'paused']);
       });
       expect(presence.getActiveTurnCount()).toBe(0);
     });

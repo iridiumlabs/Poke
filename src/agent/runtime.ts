@@ -374,9 +374,10 @@ export class PokeRuntime {
       });
       if (source && signal.idempotencyKey) {
         this.db.attachSubmissionDelivery(signal.idempotencyKey, receipt.submissionId);
-        if (turnKey && receipt.submissionId) {
-          this.presence?.attachTurnAlias(turnKey, receipt.submissionId);
-        }
+        this.watchSubmissionSettlement(receipt.submissionId);
+      }
+      if (turnKey && receipt.submissionId) {
+        this.presence?.attachTurnAlias(turnKey, receipt.submissionId);
         this.watchSubmissionSettlement(receipt.submissionId);
       }
       return receipt;

@@ -298,7 +298,7 @@ export class WhatsAppSender {
         quotePending = false;
       } else {
         logger.info('Synthesizing and sending voice note');
-        this.presence?.startRecording();
+        const recordingToken = this.presence?.startRecording();
         try {
           const { audioPath, mimeType } = await this.deepgram.synthesizeToAudioFile(params.text);
           const audioBuffer = fs.readFileSync(audioPath);
@@ -320,7 +320,7 @@ export class WhatsAppSender {
           );
           quotePending = false;
         } finally {
-          this.presence?.stopRecording();
+          this.presence?.stopRecording(recordingToken);
         }
       }
       partIndex++;

@@ -13,7 +13,7 @@ export interface WhatsAppPresenceOptions {
 export class WhatsAppPresence {
   private activeTurns = new Set<string>();
   private turnAliases = new Map<string, string>();
-  private isVoiceRecording = false;
+  private activeRecordingTokens = new Set<string>();
   private refreshTimer: NodeJS.Timeout | null = null;
   private currentPresence: 'idle' | 'composing' | 'recording' = 'idle';
   private readonly refreshIntervalMs: number;
@@ -31,7 +31,7 @@ export class WhatsAppPresence {
   }
 
   isRecording(): boolean {
-    return this.isVoiceRecording;
+    return this.activeRecordingTokens.size > 0;
   }
 
   getCurrentPresence(): 'idle' | 'composing' | 'recording' {
@@ -42,7 +42,7 @@ export class WhatsAppPresence {
     const turnKey = key || `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     this.activeTurns.add(turnKey);
 
-    if (this.isVoiceRecording) {
+    if (this.activeRecordingTokens.size > 0) {
       return turnKey;
     }
 
@@ -65,14 +65,18 @@ export class WhatsAppPresence {
       const resolvedKey = this.turnAliases.get(key) || key;
       this.activeTurns.delete(resolvedKey);
       this.activeTurns.delete(key);
-      this.turnAliases.delete(key);
+      for (const [alias, target] of this.turnAliases.entries()) {
+        if (target === resolvedKey || target === key || alias === key || alias === resolvedKey) {
+          this.turnAliases.delete(alias);
+        }
+      }
     } else {
       this.activeTurns.clear();
       this.turnAliases.clear();
     }
 
     if (this.activeTurns.size > 0) {
-      if (!this.isVoiceRecording && this.currentPresence !== 'composing') {
+      if (this.activeRecordingTokens.size === 0 && this.currentPresence !== 'composing') {
         this.currentPresence = 'composing';
         this.sendUpdate('composing');
         this.ensureRefreshTimer();
@@ -80,7 +84,7 @@ export class WhatsAppPresence {
       return;
     }
 
-    if (this.isVoiceRecording) {
+    if (this.activeRecordingTokens.size > 0) {
       return;
     }
 
@@ -91,17 +95,30 @@ export class WhatsAppPresence {
     }
   }
 
-  startRecording(): void {
-    this.isVoiceRecording = true;
+  startRecording(token?: string): string {
+    const recordingToken = token || `rec-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    this.activeRecordingTokens.add(recordingToken);
     if (this.currentPresence !== 'recording') {
       this.currentPresence = 'recording';
       this.sendUpdate('recording');
       this.ensureRefreshTimer();
     }
+    return recordingToken;
   }
 
-  stopRecording(): void {
-    this.isVoiceRecording = false;
+  stopRecording(token?: string): void {
+    if (token) {
+      this.activeRecordingTokens.delete(token);
+    } else if (this.activeRecordingTokens.size > 0) {
+      const first = this.activeRecordingTokens.values().next().value;
+      if (first) {
+        this.activeRecordingTokens.delete(first);
+      }
+    }
+
+    if (this.activeRecordingTokens.size > 0) {
+      return;
+    }
 
     if (this.activeTurns.size > 0) {
       if (this.currentPresence !== 'composing') {
@@ -121,7 +138,7 @@ export class WhatsAppPresence {
   clear(): void {
     this.activeTurns.clear();
     this.turnAliases.clear();
-    this.isVoiceRecording = false;
+    this.activeRecordingTokens.clear();
     this.clearRefreshTimer();
     if (this.currentPresence !== 'idle') {
       this.currentPresence = 'idle';
@@ -130,14 +147,7 @@ export class WhatsAppPresence {
   }
 
   stop(): void {
-    this.activeTurns.clear();
-    this.turnAliases.clear();
-    this.isVoiceRecording = false;
-    this.clearRefreshTimer();
-    if (this.currentPresence !== 'idle') {
-      this.currentPresence = 'idle';
-      this.sendUpdate('paused');
-    }
+    this.clear();
   }
 
   pauseTimer(): void {
@@ -145,11 +155,13 @@ export class WhatsAppPresence {
   }
 
   resumeTimerIfNeeded(): void {
-    if (this.activeTurns.size > 0 || this.isVoiceRecording) {
+    if (this.activeRecordingTokens.size > 0 || this.activeTurns.size > 0) {
       this.ensureRefreshTimer();
-      if (this.isVoiceRecording) {
+      if (this.activeRecordingTokens.size > 0) {
+        this.currentPresence = 'recording';
         this.sendUpdate('recording');
       } else {
+        this.currentPresence = 'composing';
         this.sendUpdate('composing');
       }
     }
