@@ -12,7 +12,7 @@ import {
 } from '../daemon/pid-file.js';
 
 export function getSystemdUserDirectory(): string {
-  if (process.env.XDG_CONFIG_HOME) {
+  if (process.env.XDG_CONFIG_HOME && path.isAbsolute(process.env.XDG_CONFIG_HOME)) {
     return path.join(process.env.XDG_CONFIG_HOME, 'systemd/user');
   }
   const home = process.env.HOME || os.homedir();
@@ -134,19 +134,18 @@ export function installSystemdService(
       }
     }
 
-    if (alreadyExists && existingContent === unitContent) {
-      return true;
+    const contentChanged = !alreadyExists || existingContent !== unitContent;
+    if (contentChanged) {
+      fs.writeFileSync(serviceFile, unitContent, { mode: 0o644 });
     }
-
-    fs.writeFileSync(serviceFile, unitContent, { mode: 0o644 });
 
     exec('systemctl --user daemon-reload');
     exec('systemctl --user enable poke.service');
 
-    if (alreadyExists) {
-      console.log(`✓ Updated systemd user service at ${serviceFile}`);
-    } else {
+    if (!alreadyExists) {
       console.log(`✓ Installed and enabled systemd user service at ${serviceFile}`);
+    } else if (contentChanged) {
+      console.log(`✓ Updated systemd user service at ${serviceFile}`);
     }
     return true;
   } catch (err: any) {
@@ -179,9 +178,11 @@ export async function runStart(
   dependencies: {
     exec?: (cmd: string) => any;
     installationPaths?: { pokeBinPath: string; workingDir: string };
+    spawn?: typeof spawn;
   } = {}
 ): Promise<void> {
   const exec = dependencies.exec || execSync;
+  const spawnFn = dependencies.spawn || spawn;
   const paths = resolvePokePaths(customHome);
   const pidFile = path.join(paths.root, 'daemon.pid');
 
@@ -195,23 +196,27 @@ export async function runStart(
 
   // Ensure systemd user service is installed and started if systemd is available
   if (isSystemdAvailable(exec)) {
-    installSystemdService(customHome, dependencies);
-    if (isSystemdServiceActive(exec)) {
-      console.log('Poke daemon is already running via systemd.');
-      return;
-    }
-    try {
-      exec('systemctl --user start poke.service');
-      console.log('✓ Started Poke daemon via systemd user service (poke.service).');
-      return;
-    } catch (err: any) {
-      console.log(`Failed to start via systemd (${err.message}), falling back to background process.`);
+    const installed = installSystemdService(customHome, dependencies);
+    if (installed) {
+      if (isSystemdServiceActive(exec)) {
+        console.log('Poke daemon is already running via systemd.');
+        return;
+      }
+      try {
+        exec('systemctl --user start poke.service');
+        console.log('✓ Started Poke daemon via systemd user service (poke.service).');
+        return;
+      } catch (err: any) {
+        console.log(`Failed to start via systemd (${err.message}), falling back to background process.`);
+      }
+    } else {
+      console.log('Failed to configure systemd service, falling back to background process.');
     }
   }
 
   if (fs.existsSync(pidFile)) {
     const record = readDaemonPidFile(pidFile);
-    const { pokeBinPath } = resolvePokeInstallationPaths();
+    const { pokeBinPath } = dependencies.installationPaths || resolvePokeInstallationPaths();
     if (record && isLivePokeDaemon(record, pokeBinPath)) {
       console.log(`Poke daemon is already running (PID: ${record.pid}).`);
       return;
@@ -221,8 +226,8 @@ export async function runStart(
   }
 
   console.log('Starting Poke daemon in background...');
-  const { pokeBinPath: scriptPath } = resolvePokeInstallationPaths();
-  const child = spawn(process.execPath, [scriptPath, 'start', '--foreground'], {
+  const { pokeBinPath: scriptPath } = dependencies.installationPaths || resolvePokeInstallationPaths();
+  const child = spawnFn(process.execPath, [scriptPath, 'start', '--foreground'], {
     detached: true,
     stdio: 'ignore',
     env: { ...process.env, ...(customHome ? { POKE_HOME: customHome } : {}) },

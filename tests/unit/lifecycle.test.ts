@@ -192,11 +192,89 @@ ExecStart="/old/node" "/old/bin/poke.js" start --foreground
       expect(executedCommands).toContain('systemctl --user daemon-reload');
       expect(executedCommands).toContain('systemctl --user enable poke.service');
 
-      // Running install again with matching content should be idempotent and not reload
+      // Running install again with matching content should still ensure daemon-reload and enable are run
       executedCommands.length = 0;
       const secondInstall = installSystemdService(undefined, { exec: fakeExec });
       expect(secondInstall).toBe(true);
-      expect(executedCommands.length).toBe(0);
+      expect(executedCommands).toEqual([
+        'systemctl --user daemon-reload',
+        'systemctl --user enable poke.service',
+      ]);
+    } finally {
+      if (oldXdg !== undefined) {
+        process.env.XDG_CONFIG_HOME = oldXdg;
+      } else {
+        delete process.env.XDG_CONFIG_HOME;
+      }
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('ignores relative XDG_CONFIG_HOME and falls back to home directory', async () => {
+    const { getSystemdUserDirectory } = await import('../../src/cli/lifecycle.js');
+    const oldXdg = process.env.XDG_CONFIG_HOME;
+    const oldHome = process.env.HOME;
+    process.env.XDG_CONFIG_HOME = 'relative/path/to/config';
+    process.env.HOME = '/fake/home/user';
+
+    try {
+      const dir = getSystemdUserDirectory();
+      expect(dir).toBe('/fake/home/user/.config/systemd/user');
+    } finally {
+      if (oldXdg !== undefined) {
+        process.env.XDG_CONFIG_HOME = oldXdg;
+      } else {
+        delete process.env.XDG_CONFIG_HOME;
+      }
+      if (oldHome !== undefined) {
+        process.env.HOME = oldHome;
+      } else {
+        delete process.env.HOME;
+      }
+    }
+  });
+
+  it('retries daemon-reload and enable when unit file is unchanged after earlier failure', async () => {
+    const os = await import('node:os');
+    const { installSystemdService, generateSystemdServiceUnit } = await import('../../src/cli/lifecycle.js');
+
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'poke-retry-test-'));
+    const userSystemdDir = path.join(tempDir, 'systemd/user');
+    fs.mkdirSync(userSystemdDir, { recursive: true });
+    const serviceFile = path.join(userSystemdDir, 'poke.service');
+
+    // Unit file already matches target content
+    const expectedUnit = generateSystemdServiceUnit();
+    fs.writeFileSync(serviceFile, expectedUnit);
+
+    const oldXdg = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = tempDir;
+
+    let shouldFail = true;
+    const executedCommands: string[] = [];
+    const fakeExec = (command: string) => {
+      executedCommands.push(command);
+      if (shouldFail && command.includes('daemon-reload')) {
+        throw new Error('daemon-reload failed');
+      }
+      return '';
+    };
+
+    try {
+      // First attempt fails during daemon-reload
+      const firstResult = installSystemdService(undefined, { exec: fakeExec });
+      expect(firstResult).toBe(false);
+      expect(executedCommands).toEqual(['systemctl --user daemon-reload']);
+
+      // Second attempt retries reload and enable even though file content matches
+      executedCommands.length = 0;
+      shouldFail = false;
+      const secondResult = installSystemdService(undefined, { exec: fakeExec });
+      expect(secondResult).toBe(true);
+      expect(executedCommands).toEqual([
+        'systemctl --user daemon-reload',
+        'systemctl --user enable poke.service',
+      ]);
     } finally {
       if (oldXdg !== undefined) {
         process.env.XDG_CONFIG_HOME = oldXdg;
@@ -282,6 +360,55 @@ ExecStart="/old/node" "/old/bin/poke.js" start --foreground
       // Daemon-reload was called to refresh unit, but start was skipped since already active
       expect(executedCommands).toContain('systemctl --user daemon-reload');
       expect(executedCommands).not.toContain('systemctl --user start poke.service');
+    } finally {
+      if (oldXdg !== undefined) {
+        process.env.XDG_CONFIG_HOME = oldXdg;
+      } else {
+        delete process.env.XDG_CONFIG_HOME;
+      }
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('runStart does not attempt systemd start when systemd installation fails', async () => {
+    const os = await import('node:os');
+    const { runStart } = await import('../../src/cli/lifecycle.js');
+
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'poke-runstart-fail-'));
+    const oldXdg = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = tempDir;
+
+    const executedCommands: string[] = [];
+    const fakeExec = (command: string) => {
+      executedCommands.push(command);
+      if (command.includes('daemon-reload')) {
+        throw new Error('daemon-reload error');
+      }
+      return '';
+    };
+
+    let spawnedWith: any[] | null = null;
+    const fakeSpawn = ((...args: any[]) => {
+      spawnedWith = args;
+      return {
+        pid: 99999,
+        unref: () => {},
+      };
+    }) as any;
+
+    try {
+      await runStart({}, tempDir, {
+        exec: fakeExec,
+        spawn: fakeSpawn,
+      });
+
+      // Systemd install was attempted and failed on daemon-reload
+      expect(executedCommands).toContain('systemctl --user daemon-reload');
+      // Should not have checked is-active or called start poke.service
+      expect(executedCommands).not.toContain('systemctl --user start poke.service');
+      expect(executedCommands).not.toContain('systemctl --user is-active poke.service');
+      // Fallback background spawn was triggered
+      expect(spawnedWith).not.toBeNull();
     } finally {
       if (oldXdg !== undefined) {
         process.env.XDG_CONFIG_HOME = oldXdg;
