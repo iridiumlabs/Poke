@@ -7,6 +7,7 @@ import { WhatsAppSender, splitLongTextMessage } from '../../src/gateway/sender.j
 import { ConfigManager } from '../../src/config/config.js';
 import { PokeDatabase } from '../../src/db/database.js';
 import { DeepgramHandler } from '../../src/gateway/deepgram.js';
+import { GroqTranscriptionError, GroqTranscriptionHandler } from '../../src/gateway/groq.js';
 
 describe('WhatsApp Gateway & Sender', () => {
   let tempDir: string;
@@ -228,7 +229,7 @@ describe('WhatsApp Gateway & Sender', () => {
     expect(formatVoiceTranscript('  Please summarize this.  ')).toBe('[voice] Please summarize this.');
   });
 
-  it('reports an audio download failure without dispatching an empty message', async () => {
+  it('keeps an audio download failure visible to the main agent', async () => {
     const dispatch = vi.fn();
     const gateway = new WhatsAppGateway(
       config,
@@ -245,14 +246,22 @@ describe('WhatsApp Gateway & Sender', () => {
       message: { audioMessage: { ptt: true, mimetype: 'audio/ogg' } },
     });
 
-    expect(dispatch).not.toHaveBeenCalled();
-    expect(report).toHaveBeenCalledWith('Poke could not download the audio message. Please send it again.');
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({
+      isVoice: true,
+      text: expect.stringContaining('[voice media download failed]'),
+    }));
+    expect(report).toHaveBeenCalledWith(expect.stringContaining('download failed'));
+    expect(db.getLastOperationalError()).toMatchObject({
+      source: 'whatsapp_media',
+      message: expect.stringContaining('audio-download-failed'),
+      details: expect.stringContaining('"stage":"download"'),
+    });
   });
 
   it('prefixes a successfully transcribed voice note before dispatching it', async () => {
     const dispatch = vi.fn();
-    const deepgramMock = {
-      transcribe: vi.fn().mockResolvedValue('Please summarize this.'),
+    const groqMock = {
+      transcribe: vi.fn().mockResolvedValue({ text: 'Please summarize this.' }),
     };
     const gateway = new WhatsAppGateway(
       config,
@@ -262,7 +271,7 @@ describe('WhatsApp Gateway & Sender', () => {
       tempDir,
       {
         downloadMedia: vi.fn().mockResolvedValue(Buffer.from('audio')),
-        deepgram: deepgramMock as any,
+        groq: groqMock as any,
       }
     );
 
@@ -279,8 +288,8 @@ describe('WhatsApp Gateway & Sender', () => {
 
   it('preserves quoted message ID and preview when transcribing a quoted voice note', async () => {
     const dispatch = vi.fn();
-    const deepgramMock = {
-      transcribe: vi.fn().mockResolvedValue('Please summarize this.'),
+    const groqMock = {
+      transcribe: vi.fn().mockResolvedValue({ text: 'Please summarize this.' }),
     };
     const gateway = new WhatsAppGateway(
       config,
@@ -290,7 +299,7 @@ describe('WhatsApp Gateway & Sender', () => {
       tempDir,
       {
         downloadMedia: vi.fn().mockResolvedValue(Buffer.from('audio')),
-        deepgram: deepgramMock as any,
+        groq: groqMock as any,
       }
     );
 
@@ -314,6 +323,260 @@ describe('WhatsApp Gateway & Sender', () => {
       isVoice: true,
       text: expect.stringContaining('[Replying to message ID: original-msg-123 "Here is the original text to summarize."]\n\n[voice] Please summarize this.'),
     }));
+  });
+
+  it('sends Urdu and mixed Urdu-English voice notes to Groq Whisper Large V3 without pinning a language', async () => {
+    const groq = new GroqTranscriptionHandler('test-api-key', tempDir);
+    const originalFetch = global.fetch;
+    let requestedUrl = '';
+    let requestHeaders: RequestInit['headers'];
+    let requestForm: FormData | undefined;
+    global.fetch = vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+      requestedUrl = url;
+      requestHeaders = init?.headers;
+      requestForm = init?.body as FormData;
+      return new Response(JSON.stringify({
+        text: 'یہ task complete کر دو پھر report send کر دینا',
+        language: 'ur',
+        x_groq: { id: 'groq-request-1' },
+      }), { status: 200 });
+    });
+
+    try {
+      await expect(
+        groq.transcribe(Buffer.from('whatsapp-ogg-opus'), 'audio/ogg; codecs=opus')
+      ).resolves.toEqual({
+        text: 'یہ task complete کر دو پھر report send کر دینا',
+        detectedLanguage: 'ur',
+        requestId: 'groq-request-1',
+      });
+
+      const url = new URL(requestedUrl);
+      expect(url.origin + url.pathname).toBe('https://api.groq.com/openai/v1/audio/transcriptions');
+      expect(requestForm?.get('model')).toBe('whisper-large-v3');
+      expect(requestForm?.get('response_format')).toBe('verbose_json');
+      expect(requestForm?.getAll('timestamp_granularities[]')).toEqual(['segment']);
+      expect(requestForm?.get('language')).toBeNull();
+      const file = requestForm?.get('file') as Blob & { name?: string };
+      expect(file.name).toBe('audio.ogg');
+      expect(file.type).toBe('audio/ogg; codecs=opus');
+      expect(Buffer.from(await file.arrayBuffer()).toString()).toBe('whatsapp-ogg-opus');
+      expect((requestHeaders as Record<string, string>)?.Authorization).toBe('Bearer test-api-key');
+      expect((requestHeaders as Record<string, string>)?.['Content-Type']).toBeUndefined();
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('retains Groq diagnostics after a permanent transcription failure', async () => {
+    const groq = new GroqTranscriptionHandler('test-api-key', tempDir);
+    const originalFetch = global.fetch;
+    global.fetch = vi.fn().mockImplementation(async () => new Response(
+      JSON.stringify({ error: { message: 'Unsupported audio container' } }),
+      { status: 415, headers: { 'x-request-id': 'groq-request-123' } }
+    ));
+
+    try {
+      await expect(groq.transcribe(Buffer.from('bad-audio'), 'audio/unknown')).rejects.toMatchObject({
+        name: 'GroqTranscriptionError',
+        provider: 'groq',
+        model: 'whisper-large-v3',
+        attempts: 1,
+        status: 415,
+        requestId: 'groq-request-123',
+        message: expect.stringContaining('Unsupported audio container'),
+      });
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('withholds a Whisper transcript when Groq reports a documented low-confidence segment', async () => {
+    const dispatch = vi.fn();
+    const groqMock = {
+      transcribe: vi.fn().mockResolvedValue({
+        text: 'This text must not become agent context.',
+        requestId: 'groq-low-confidence-1',
+        detectedLanguage: 'ur',
+        quality: {
+          requiresVerification: true,
+          segmentCount: 2,
+          affectedSegmentCount: 1,
+          reasons: ['low_log_probability'],
+        },
+      }),
+    };
+    const gateway = new WhatsAppGateway(
+      config,
+      db,
+      dispatch,
+      async () => {},
+      tempDir,
+      {
+        downloadMedia: vi.fn().mockResolvedValue(Buffer.from('unclear-audio')),
+        groq: groqMock as any,
+      }
+    );
+    const report = vi.spyOn(gateway.getSender(), 'sendDirectError').mockResolvedValue();
+
+    await gateway.handleIncomingMessage({
+      key: { remoteJid: '923001234567@s.whatsapp.net', id: 'voice-low-confidence' },
+      message: { audioMessage: { ptt: true, mimetype: 'audio/ogg; codecs=opus' } },
+    });
+
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({
+      isVoice: true,
+      text: expect.stringContaining('[voice transcription low confidence]'),
+    }));
+    expect(dispatch.mock.calls[0][0].text).not.toContain('This text must not become agent context.');
+    expect(report).toHaveBeenCalledWith(expect.stringContaining('low_log_probability'));
+    expect(db.getLastOperationalError()).toMatchObject({
+      source: 'whatsapp_media',
+      details: expect.stringContaining('"stage":"transcription_low_confidence"'),
+    });
+  });
+
+  it('derives a low-confidence signal from Groq verbose Whisper metadata', async () => {
+    const groq = new GroqTranscriptionHandler('test-api-key', tempDir);
+    const originalFetch = global.fetch;
+    global.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      text: 'uncertain transcript',
+      segments: [
+        { avg_logprob: -1.2, compression_ratio: 1.1, no_speech_prob: 0.2 },
+        { avg_logprob: -0.1, compression_ratio: 1.1, no_speech_prob: 0.01 },
+      ],
+    }), { status: 200 }));
+
+    try {
+      await expect(groq.transcribe(Buffer.from('unclear-audio'))).resolves.toMatchObject({
+        text: 'uncertain transcript',
+        quality: {
+          requiresVerification: true,
+          segmentCount: 2,
+          affectedSegmentCount: 1,
+          reasons: ['low_log_probability'],
+        },
+      });
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('keeps a failed transcript explicit without corrupting a neighboring successful voice note', async () => {
+    const dispatch = vi.fn();
+    const failure = new GroqTranscriptionError(
+      'Groq whisper-large-v3 transcription failed after 3 attempts: Groq STT returned 429: Too many requests',
+      {
+        model: 'whisper-large-v3',
+        attempts: 3,
+        status: 429,
+        requestId: 'groq-rate-limit-1',
+        cause: new Error('Too many requests'),
+      }
+    );
+    const groqMock = {
+      transcribe: vi.fn(async (audio: Buffer) => {
+        if (audio.toString() === 'failed-audio') throw failure;
+        return { text: 'یہ successful task ہے' };
+      }),
+    };
+    const gateway = new WhatsAppGateway(
+      config,
+      db,
+      dispatch,
+      async () => {},
+      tempDir,
+      {
+        downloadMedia: vi.fn((message: any) =>
+          Promise.resolve(Buffer.from(message.key.id === 'voice-failed' ? 'failed-audio' : 'successful-audio'))
+        ),
+        groq: groqMock as any,
+      }
+    );
+    const report = vi.spyOn(gateway.getSender(), 'sendDirectError').mockResolvedValue();
+
+    await Promise.all([
+      gateway.handleIncomingMessage({
+        key: { remoteJid: '923001234567@s.whatsapp.net', id: 'voice-failed' },
+        message: { audioMessage: { ptt: true, mimetype: 'audio/ogg; codecs=opus' } },
+      }),
+      gateway.handleIncomingMessage({
+        key: { remoteJid: '923001234567@s.whatsapp.net', id: 'voice-succeeded' },
+        message: { audioMessage: { ptt: false, mimetype: 'audio/ogg; codecs=opus' } },
+      }),
+    ]);
+
+    expect(dispatch).toHaveBeenCalledTimes(2);
+    expect(dispatch.mock.calls.map(([message]) => message.messageId)).toEqual(['voice-failed', 'voice-succeeded']);
+    expect(dispatch.mock.calls[0][0]).toMatchObject({
+      isVoice: true,
+      text: expect.stringContaining('[voice transcription failed]'),
+    });
+    expect(dispatch.mock.calls[0][0].text).toContain('Do not infer what it said.');
+    expect(dispatch.mock.calls[1][0]).toMatchObject({
+      isVoice: true,
+      text: expect.stringContaining('[voice] یہ successful task ہے'),
+    });
+    expect(dispatch.mock.calls[1][0].text).not.toContain('[voice transcription failed]');
+    expect(fs.readFileSync(path.join(tempDir, 'inbox', 'voice-failed', 'audio.ogg'), 'utf8')).toBe('failed-audio');
+    expect(fs.readFileSync(path.join(tempDir, 'inbox', 'voice-succeeded', 'audio.ogg'), 'utf8')).toBe('successful-audio');
+    expect(report).toHaveBeenCalledTimes(1);
+    expect(report).toHaveBeenCalledWith(expect.stringContaining('429'));
+    expect(report).toHaveBeenCalledWith(expect.stringContaining('after 3 attempts'));
+    expect(db.getLastOperationalError()).toMatchObject({
+      source: 'whatsapp_media',
+      message: expect.stringContaining('voice-failed'),
+      details: expect.stringContaining('"requestId":"groq-rate-limit-1"'),
+    });
+  });
+
+  it('admits nine rapid voice notes and a following instruction in receipt order even when STT finishes out of order', async () => {
+    const dispatch = vi.fn();
+    const resolvers = new Map<string, (transcription: { text: string }) => void>();
+    const groqMock = {
+      transcribe: vi.fn((audio: Buffer) => new Promise<{ text: string }>((resolve) => {
+        resolvers.set(audio.toString(), resolve);
+      })),
+    };
+    const gateway = new WhatsAppGateway(
+      config,
+      db,
+      dispatch,
+      async () => {},
+      tempDir,
+      {
+        downloadMedia: vi.fn((message: any) => Promise.resolve(Buffer.from(message.key.id))),
+        groq: groqMock as any,
+      }
+    );
+
+    const voiceIds = Array.from({ length: 9 }, (_, index) => `voice-${index + 1}`);
+    const voices = voiceIds.map((id) => gateway.handleIncomingMessage({
+      key: { remoteJid: '923001234567@s.whatsapp.net', id },
+      message: { audioMessage: { ptt: true, mimetype: 'audio/ogg; codecs=opus' } },
+    }));
+    const instruction = gateway.handleIncomingMessage({
+      key: { remoteJid: '923001234567@s.whatsapp.net', id: 'task-list' },
+      message: { conversation: 'Use everything above to create a task list.' },
+    });
+
+    await vi.waitFor(() => expect(groqMock.transcribe).toHaveBeenCalledTimes(9));
+    for (const id of [...voiceIds].reverse().slice(0, -1)) {
+      resolvers.get(id)!({ text: `transcript for ${id}` });
+    }
+    await Promise.resolve();
+    expect(dispatch).not.toHaveBeenCalled();
+
+    resolvers.get(voiceIds[0])!({ text: `transcript for ${voiceIds[0]}` });
+    await Promise.all([...voices, instruction]);
+
+    expect(dispatch.mock.calls.map(([message]) => message.messageId)).toEqual([...voiceIds, 'task-list']);
+    for (const [index, id] of voiceIds.entries()) {
+      expect(dispatch.mock.calls[index][0].text).toContain(`[voice] transcript for ${id}`);
+      expect(fs.readFileSync(path.join(tempDir, 'inbox', id, 'audio.ogg'), 'utf8')).toBe(id);
+    }
+    expect(dispatch.mock.calls.at(-1)?.[0].text).toContain('Use everything above to create a task list.');
   });
 
   it('targets Deepgram Flux /v2/speak API for WhatsApp-compatible TTS synthesis', async () => {

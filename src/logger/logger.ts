@@ -132,6 +132,7 @@ export const SENSITIVE_KEYS = [
   'supermemoryApiKey',
   'exaApiKey',
   'deepgramApiKey',
+  'groqApiKey',
   'fireworksApiKey',
   'commandCodeApiKey',
 ];
@@ -142,7 +143,7 @@ export function redactSecrets(obj: any): any {
     // Errors often carry a provider's response text. Remove common
     // authorization forms before the value reaches logs, status, or WhatsApp.
     let cleaned = obj.replace(/\b(Bearer|Token)\s+[A-Za-z0-9._~+/=-]+/gi, '$1 [REDACTED]');
-    cleaned = cleaned.replace(/(?:sk-|dg-|fw-|cm_)[A-Za-z0-9_\-]{16,}/gi, '[REDACTED_KEY]');
+    cleaned = cleaned.replace(/(?:sk-|dg-|fw-|cm_|gsk[_-])[A-Za-z0-9_\-]{16,}/gi, '[REDACTED_KEY]');
     cleaned = cleaned.replace(
       /([?&](?:api[_-]?key|access[_-]?token|refresh[_-]?token|token)=)[^&#\s]+/gi,
       '$1[REDACTED]'

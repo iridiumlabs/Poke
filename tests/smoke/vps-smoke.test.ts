@@ -21,6 +21,7 @@ describe('VPS Smoke Test Suite', () => {
         supermemoryApiKey: 'smoke-supermemory-key',
         exaApiKey: 'smoke-exa-key',
         deepgramApiKey: 'smoke-dg-key',
+        groqApiKey: 'smoke-groq-key',
       });
       config.setMainModel({ provider: 'commandcode', model: 'claude-sonnet-4-6' });
       config.setWorkerModel({ provider: 'commandcode', model: 'claude-sonnet-4-6' });

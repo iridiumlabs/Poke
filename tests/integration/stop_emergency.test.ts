@@ -17,6 +17,7 @@ describe('Integration: Out-of-band /stop Emergency Brake', () => {
       commandCodeApiKey: 'cmd-test-key',
       exaApiKey: 'exa-test-key',
       deepgramApiKey: 'dg-test-key',
+      groqApiKey: 'groq-test-key',
     });
     config.setMainModel({ provider: 'commandcode', model: 'claude-sonnet-4-6' });
   });

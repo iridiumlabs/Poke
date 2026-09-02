@@ -39,7 +39,7 @@ export class SupermemoryToolHandler {
 
   async save(params: MemorySaveParams): Promise<{ success: boolean; id?: string }> {
     if (!this.apiKey) {
-      throw new Error('Supermemory API key is not configured. Add it via `poke setup`.');
+      throw new Error('Supermemory API key is not configured. Add it with `poke configure`.');
     }
     if (!params.content.trim()) {
       throw new Error('Memory content is required.');
@@ -116,7 +116,7 @@ export class SupermemoryToolHandler {
 
   async recall(params: MemoryRecallParams): Promise<{ results: MemoryItem[] }> {
     if (!this.apiKey) {
-      throw new Error('Supermemory API key is not configured. Add it via `poke setup`.');
+      throw new Error('Supermemory API key is not configured. Add it with `poke configure`.');
     }
     if (!params.query.trim()) {
       throw new Error('Memory search query is required.');

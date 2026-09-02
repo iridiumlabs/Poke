@@ -10,6 +10,14 @@ describe('WhatsApp reply prompt and tool metadata', () => {
     expect(MAIN_AGENT_SYSTEM_PROMPT).toContain('Do not reply-to or quote every inbound message');
   });
 
+  it('tells the agent not to invent content for failed voice attachments', () => {
+    expect(MAIN_AGENT_SYSTEM_PROMPT).toContain('`[voice transcription failed]`');
+    expect(MAIN_AGENT_SYSTEM_PROMPT).toContain('`[voice transcription low confidence]`');
+    expect(MAIN_AGENT_SYSTEM_PROMPT).toContain('`[voice media download failed]`');
+    expect(MAIN_AGENT_SYSTEM_PROMPT).toContain('Do not infer its content from surrounding messages or attachments');
+    expect(MAIN_AGENT_SYSTEM_PROMPT).toContain('ask the user to resend it or provide the text before proceeding');
+  });
+
   it('clarifies reply_to omission and usage criteria in send tool description while preserving quoting capability', () => {
     const tools = createPokeTools({} as any);
     const sendTool = tools.sendTool;
@@ -45,4 +53,3 @@ describe('Composio tool metadata', () => {
     expect(executeTool.description).not.toContain('connected service');
   });
 });
-

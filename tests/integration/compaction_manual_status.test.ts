@@ -19,6 +19,7 @@ describe('Integration: Manual Compaction, WhatsApp /compact, and /status', () =>
       commandCodeApiKey: 'cmd-test-key',
       exaApiKey: 'exa-test-key',
       deepgramApiKey: 'dg-test-key',
+      groqApiKey: 'groq-test-key',
     });
     config.setMainModel({ provider: 'commandcode', model: 'z-ai/glm-5.3-flash' });
     config.setWorkerModel({ provider: 'commandcode', model: 'z-ai/glm-5.3-flash' });
