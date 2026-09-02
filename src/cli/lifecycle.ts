@@ -11,9 +11,21 @@ import {
   removeDaemonPidFileIfMatches,
 } from '../daemon/pid-file.js';
 
-export function isSystemdAvailable(): boolean {
+export function getSystemdUserDirectory(): string {
+  if (process.env.XDG_CONFIG_HOME) {
+    return path.join(process.env.XDG_CONFIG_HOME, 'systemd/user');
+  }
+  const home = process.env.HOME || os.homedir();
+  return path.join(home, '.config/systemd/user');
+}
+
+export function getSystemdUserServicePath(): string {
+  return path.join(getSystemdUserDirectory(), 'poke.service');
+}
+
+export function isSystemdAvailable(exec: (cmd: string) => any = execSync): boolean {
   try {
-    execSync('systemctl --user list-units --type=service', { stdio: 'ignore' });
+    exec('systemctl --user list-units --type=service');
     return true;
   } catch {
     return false;
@@ -21,15 +33,14 @@ export function isSystemdAvailable(): boolean {
 }
 
 export function isSystemdServiceInstalled(): boolean {
-  const serviceFile = path.join(os.homedir(), '.config/systemd/user/poke.service');
-  return fs.existsSync(serviceFile);
+  return fs.existsSync(getSystemdUserServicePath());
 }
 
-export function isSystemdServiceActive(): boolean {
-  if (!isSystemdAvailable() || !isSystemdServiceInstalled()) return false;
+export function isSystemdServiceActive(exec: (cmd: string) => any = execSync): boolean {
+  if (!isSystemdAvailable(exec) || !isSystemdServiceInstalled()) return false;
   try {
-    const output = execSync('systemctl --user is-active poke.service', { encoding: 'utf8' }).trim();
-    return output === 'active';
+    const output = String(exec('systemctl --user is-active poke.service')).trim();
+    return output === 'active' || output === 'activating';
   } catch {
     return false;
   }
@@ -42,18 +53,41 @@ export function isDaemonRunning(customHome?: string): boolean {
   return Boolean(record && isLivePokeDaemon(record, resolvePokeInstallationPaths().pokeBinPath));
 }
 
-export function generateSystemdServiceUnit(customHome?: string): string {
+export function generateSystemdServiceUnit(
+  customHome?: string,
+  installationPaths?: { pokeBinPath: string; workingDir: string }
+): string {
   const nodePath = process.execPath;
-  const { pokeBinPath, workingDir } = resolvePokeInstallationPaths();
-  const quoteSystemdArgument = (value: string) => `"${value.replace(/[\\"]/g, '\\$&')}"`;
+  const { pokeBinPath, workingDir } = installationPaths || resolvePokeInstallationPaths();
+
+  if (!workingDir || !path.isAbsolute(workingDir)) {
+    throw new Error(`Working directory must be an absolute path: ${workingDir}`);
+  }
+
+  const formatSystemdPath = (value: string): string => {
+    if (!value || !path.isAbsolute(value)) {
+      throw new Error(`Working directory must be an absolute path: ${value}`);
+    }
+    return value.replace(/%/g, '%%');
+  };
+
+  const quoteSystemdArgument = (value: string) => `"${value.replace(/%/g, '%%').replace(/[\\"]/g, '\\$&')}"`;
 
   const envLines = ['Environment="NODE_ENV=production"'];
   const pokeHome = customHome || process.env.POKE_HOME;
   if (pokeHome) {
-    envLines.push(`Environment=${quoteSystemdArgument(`POKE_HOME=${path.resolve(pokeHome)}`)}`);
+    const resolvedHome = path.resolve(pokeHome);
+    if (!path.isAbsolute(resolvedHome)) {
+      throw new Error(`POKE_HOME must be an absolute path: ${resolvedHome}`);
+    }
+    envLines.push(`Environment=${quoteSystemdArgument(`POKE_HOME=${resolvedHome}`)}`);
   }
   if (process.env.POKE_SKILLS_HOME) {
-    envLines.push(`Environment=${quoteSystemdArgument(`POKE_SKILLS_HOME=${path.resolve(process.env.POKE_SKILLS_HOME)}`)}`);
+    const resolvedSkillsHome = path.resolve(process.env.POKE_SKILLS_HOME);
+    if (!path.isAbsolute(resolvedSkillsHome)) {
+      throw new Error(`POKE_SKILLS_HOME must be an absolute path: ${resolvedSkillsHome}`);
+    }
+    envLines.push(`Environment=${quoteSystemdArgument(`POKE_SKILLS_HOME=${resolvedSkillsHome}`)}`);
   }
 
   return `[Unit]
@@ -62,7 +96,7 @@ After=network.target
 
 [Service]
 Type=exec
-WorkingDirectory=${quoteSystemdArgument(workingDir)}
+WorkingDirectory=${formatSystemdPath(workingDir)}
 ExecStart=${quoteSystemdArgument(nodePath)} ${quoteSystemdArgument(pokeBinPath)} start --foreground
 Restart=on-failure
 RestartSec=5
@@ -74,21 +108,46 @@ WantedBy=default.target
 `;
 }
 
-export function installSystemdService(customHome?: string): boolean {
+export function installSystemdService(
+  customHome?: string,
+  dependencies: {
+    exec?: (cmd: string) => any;
+    installationPaths?: { pokeBinPath: string; workingDir: string };
+  } = {}
+): boolean {
+  const exec = dependencies.exec || ((cmd: string) => execSync(cmd, { stdio: 'ignore' }));
   try {
-    const userSystemdDir = path.join(os.homedir(), '.config/systemd/user');
+    const userSystemdDir = getSystemdUserDirectory();
     if (!fs.existsSync(userSystemdDir)) {
       fs.mkdirSync(userSystemdDir, { recursive: true, mode: 0o755 });
     }
 
-    const unitContent = generateSystemdServiceUnit(customHome);
-    const serviceFile = path.join(userSystemdDir, 'poke.service');
+    const unitContent = generateSystemdServiceUnit(customHome, dependencies.installationPaths);
+    const serviceFile = getSystemdUserServicePath();
+    const alreadyExists = fs.existsSync(serviceFile);
+    let existingContent: string | null = null;
+    if (alreadyExists) {
+      try {
+        existingContent = fs.readFileSync(serviceFile, 'utf8');
+      } catch {
+        existingContent = null;
+      }
+    }
+
+    if (alreadyExists && existingContent === unitContent) {
+      return true;
+    }
+
     fs.writeFileSync(serviceFile, unitContent, { mode: 0o644 });
 
-    execSync('systemctl --user daemon-reload', { stdio: 'ignore' });
-    execSync('systemctl --user enable poke.service', { stdio: 'ignore' });
+    exec('systemctl --user daemon-reload');
+    exec('systemctl --user enable poke.service');
 
-    console.log(`✓ Installed and enabled systemd user service at ${serviceFile}`);
+    if (alreadyExists) {
+      console.log(`✓ Updated systemd user service at ${serviceFile}`);
+    } else {
+      console.log(`✓ Installed and enabled systemd user service at ${serviceFile}`);
+    }
     return true;
   } catch (err: any) {
     console.log(`Could not configure systemd service: ${err.message}`);
@@ -96,15 +155,16 @@ export function installSystemdService(customHome?: string): boolean {
   }
 }
 
-export function uninstallSystemdService(): boolean {
+export function uninstallSystemdService(dependencies: { exec?: (cmd: string) => any } = {}): boolean {
+  const exec = dependencies.exec || ((cmd: string) => execSync(cmd, { stdio: 'ignore' }));
   try {
-    execSync('systemctl --user stop poke.service', { stdio: 'ignore' });
-    execSync('systemctl --user disable poke.service', { stdio: 'ignore' });
-    const serviceFile = path.join(os.homedir(), '.config/systemd/user/poke.service');
+    exec('systemctl --user stop poke.service');
+    exec('systemctl --user disable poke.service');
+    const serviceFile = getSystemdUserServicePath();
     if (fs.existsSync(serviceFile)) {
       fs.unlinkSync(serviceFile);
     }
-    execSync('systemctl --user daemon-reload', { stdio: 'ignore' });
+    exec('systemctl --user daemon-reload');
     console.log('✓ Stopped and removed systemd user service');
     return true;
   } catch (err: any) {
@@ -113,7 +173,15 @@ export function uninstallSystemdService(): boolean {
   }
 }
 
-export async function runStart(options: { foreground?: boolean }, customHome?: string): Promise<void> {
+export async function runStart(
+  options: { foreground?: boolean },
+  customHome?: string,
+  dependencies: {
+    exec?: (cmd: string) => any;
+    installationPaths?: { pokeBinPath: string; workingDir: string };
+  } = {}
+): Promise<void> {
+  const exec = dependencies.exec || execSync;
   const paths = resolvePokePaths(customHome);
   const pidFile = path.join(paths.root, 'daemon.pid');
 
@@ -126,12 +194,14 @@ export async function runStart(options: { foreground?: boolean }, customHome?: s
   }
 
   // Ensure systemd user service is installed and started if systemd is available
-  if (isSystemdAvailable()) {
-    if (!isSystemdServiceInstalled()) {
-      installSystemdService(customHome);
+  if (isSystemdAvailable(exec)) {
+    installSystemdService(customHome, dependencies);
+    if (isSystemdServiceActive(exec)) {
+      console.log('Poke daemon is already running via systemd.');
+      return;
     }
     try {
-      execSync('systemctl --user start poke.service');
+      exec('systemctl --user start poke.service');
       console.log('✓ Started Poke daemon via systemd user service (poke.service).');
       return;
     } catch (err: any) {
