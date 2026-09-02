@@ -13,7 +13,7 @@ import { MAIN_AGENT_SYSTEM_PROMPT } from './prompts.js';
 import { createPokeTools, ToolContexts } from './tools.js';
 import { createPokeSandboxEnvironment } from './sandbox-env.js';
 import { resolveFlueModelSpecifier, normalizeCatalogModelId } from '../providers/provider-registry.js';
-import { BUNDLED_KNOWN_MODELS, CommandCodeCatalog } from '../providers/commandcode.js';
+import { COMMAND_CODE_MANUAL_CATALOG } from '../providers/commandcode.js';
 import {
   CompactionManager,
   RECENT_TOKENS_RETENTION,
@@ -24,16 +24,16 @@ let sharedContexts: ToolContexts | null = null;
 let sharedCompactionManager: CompactionManager | null = null;
 
 function getModelContextWindow(modelId?: string, provider?: string): number {
-  // Runtime validation supplies the exact live metadata to Flue. This local
+  // Runtime validation supplies the exact metadata to Flue. This local
   // reserve calculation only needs a safe fallback when that catalog is
   // unavailable; assuming a 1M window can otherwise over-reserve a 128K
   // model before Poke's own 272K policy gets a chance to run.
   if (!modelId) return 128000;
   const normalized = normalizeCatalogModelId(modelId, provider as any);
-  const bundled = BUNDLED_KNOWN_MODELS[normalized];
-  if (bundled?.contextWindow) return bundled.contextWindow;
-  const meta = CommandCodeCatalog.extractPackageMetadata().get(normalized);
-  if (meta?.contextWindow) return meta.contextWindow;
+  if (provider === 'commandcode') {
+    const manual = COMMAND_CODE_MANUAL_CATALOG.find((m) => m.id === normalized);
+    if (manual?.capabilities.contextWindow) return manual.capabilities.contextWindow;
+  }
   return 128000;
 }
 

@@ -1,9 +1,8 @@
 import { setProvider } from '@flue/runtime';
 import type { CredentialStore, Models } from '@earendil-works/pi-ai';
-import { fireworksProvider } from '@earendil-works/pi-ai/providers/fireworks';
 import { openaiCodexProvider } from '@earendil-works/pi-ai/providers/openai-codex';
 import type { ModelInfo, ModelSelection, ProviderType } from '../config/types.js';
-import { CommandCodeCatalog } from './commandcode.js';
+import { COMMAND_CODE_MANUAL_CATALOG, CommandCodeCatalog } from './commandcode.js';
 import { FireworksCatalog } from './fireworks.js';
 import { redactSecrets } from '../logger/logger.js';
 import {
@@ -11,6 +10,7 @@ import {
   COMMAND_CODE_PROVIDER_ID,
   FIREWORKS_PROVIDER_ID,
   createCommandCodeCredentialProvider,
+  createFireworksCredentialProvider,
   createPokeModels,
   getAuthenticatedModels,
   withPokeCredentialResolver,
@@ -45,11 +45,17 @@ export function normalizeCatalogModelId(model: string, provider?: ProviderType):
 }
 
 /** Registers Flue adapters whose request-time auth resolves from Poke's store. */
-export function registerAllProviders(models: Models, commandCodeModels: readonly ModelInfo[] = []): void {
+export function registerAllProviders(
+  models: Models,
+  commandCodeModels: readonly ModelInfo[] = COMMAND_CODE_MANUAL_CATALOG,
+  fireworksModels: readonly ModelInfo[] = []
+): void {
   setProvider(
     withPokeCredentialResolver(createCommandCodeCredentialProvider(commandCodeModels), models)
   );
-  setProvider(withPokeCredentialResolver(fireworksProvider(), models));
+  setProvider(
+    withPokeCredentialResolver(createFireworksCredentialProvider(fireworksModels), models)
+  );
   setProvider(withPokeCredentialResolver(openaiCodexProvider(), models));
 }
 
@@ -82,7 +88,7 @@ export class ProviderRegistry implements ProviderCatalog {
         if (!apiKey) {
           throw new Error('Command Code is not authenticated. Run `poke login`.');
         }
-        return await CommandCodeCatalog.fetchLiveModels(apiKey);
+        return await CommandCodeCatalog.validateApiKey(apiKey);
       }
       case 'fireworks': {
         const auth = await this.models.getAuth(FIREWORKS_PROVIDER_ID);
@@ -90,12 +96,7 @@ export class ProviderRegistry implements ProviderCatalog {
         if (!apiKey) {
           throw new Error('Fireworks is not authenticated. Run `poke login`.');
         }
-        const liveModels = await FireworksCatalog.fetchLiveModels(apiKey);
-        // Flue only has pi-ai's bundled Fireworks definitions. Do not present
-        // a newer account-visible ID that the runtime cannot actually resolve.
-        return liveModels.filter((model) =>
-          Boolean(this.models.getModel(FIREWORKS_PROVIDER_ID, model.id))
-        );
+        return await FireworksCatalog.fetchLiveModels(apiKey);
       }
       case 'codex':
         return await getAuthenticatedModels(this.models, CODEX_PROVIDER_ID);

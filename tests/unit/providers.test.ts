@@ -102,68 +102,274 @@ describe('Provider Retry & Error Classification', () => {
 });
 
 describe('CommandCodeCatalog', () => {
-  it('extracts package metadata from official command-code cli.mjs', () => {
-    const meta = CommandCodeCatalog.extractPackageMetadata();
-    expect(meta.size).toBeGreaterThan(0);
-
-    const sonnetMeta = meta.get('claude-sonnet-4-6');
-    expect(sonnetMeta).toBeDefined();
-    expect(sonnetMeta?.reasoningEfforts).toContain('low');
-    expect(sonnetMeta?.reasoningEfforts).toContain('high');
+  it('exposes only the explicit Poke-owned manual catalog containing GLM 5.3 Flash', () => {
+    const models = CommandCodeCatalog.getModels();
+    expect(models).toHaveLength(1);
+    expect(models[0]).toEqual({
+      id: 'z-ai/glm-5.3-flash',
+      name: 'GLM-5.3 Flash',
+      description: 'Fast, affordable GLM coding with 1M context',
+      capabilities: {
+        reasoningEfforts: ['low', 'high', 'max'],
+        acceptsImages: true,
+        contextWindow: 1050000,
+      },
+    });
   });
 
-  it('normalizes live reasoning effort metadata without accepting malformed values', async () => {
+  it('validates Command Code API key against provider endpoint and returns manual catalog', async () => {
+    let capturedUrl = '';
+    let capturedAuth = '';
     const originalFetch = global.fetch;
-    global.fetch = (async () =>
-      new Response(
-        JSON.stringify({
-          data: [{ id: 'model-a', reasoningEfforts: ['HIGH', 'not-an-effort', 5, null] }],
-        }),
-        { status: 200 }
-      )) as typeof fetch;
+    global.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      capturedUrl = String(url);
+      capturedAuth = String((init?.headers as Record<string, string>)?.Authorization || '');
+      return new Response(JSON.stringify({ data: [{ id: 'arbitrary-remote-model' }] }), { status: 200 });
+    }) as typeof fetch;
 
     try {
-      const models = await CommandCodeCatalog.fetchLiveModels('test-key');
+      const models = await CommandCodeCatalog.validateApiKey('test-command-code-key');
+      expect(capturedUrl).toBe('https://api.commandcode.ai/provider/v1/models');
+      expect(capturedAuth).toBe('Bearer test-command-code-key');
+      // Returns manual catalog models, NOT arbitrary live models from API response
       expect(models).toHaveLength(1);
-      expect(models[0].capabilities.reasoningEfforts).toEqual(['high']);
+      expect(models[0].id).toBe('z-ai/glm-5.3-flash');
     } finally {
       global.fetch = originalFetch;
     }
   });
 
-  it('returns empty list when live catalog data or models property is not an array', async () => {
+  it('throws when Command Code API key validation receives non-ok HTTP status', async () => {
     const originalFetch = global.fetch;
-    global.fetch = (async () =>
-      new Response(
-        JSON.stringify({
-          data: { invalid: 'object' },
-          models: 'not-an-array',
-        }),
-        { status: 200 }
-      )) as typeof fetch;
+    global.fetch = (async () => new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 })) as typeof fetch;
 
     try {
-      const models = await CommandCodeCatalog.fetchLiveModels('test-key');
-      expect(models).toEqual([]);
+      await expect(CommandCodeCatalog.validateApiKey('invalid-key')).rejects.toThrow('Command Code returned 401.');
     } finally {
       global.fetch = originalFetch;
     }
   });
 });
 
-describe('resolveFlueModelSpecifier', () => {
+describe('FireworksCatalog', () => {
+  it('extracts authoritative capabilities for live compatible Fireworks models', async () => {
+    const originalFetch = global.fetch;
+    global.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          data: [
+            {
+              id: 'accounts/fireworks/models/deepseek-r1',
+              displayName: 'DeepSeek R1',
+              description: 'Frontier reasoning model',
+              context_length: 160000,
+              supports_image_input: false,
+              supports_tools: true,
+              reasoning_efforts: ['low', 'medium', 'high', 'max'],
+            },
+            {
+              id: 'accounts/fireworks/models/qwen2p5-vl-72b-instruct',
+              name: 'accounts/fireworks/models/qwen2p5-vl-72b-instruct',
+              display_name: 'Qwen 2.5 VL 72B Instruct',
+              contextLength: 131072,
+              supportsImageInput: true,
+              supportsTools: true,
+            },
+          ],
+        }),
+        { status: 200 }
+      )) as typeof fetch;
+
+    try {
+      const models = await FireworksCatalog.fetchLiveModels('fireworks-key');
+      expect(models).toHaveLength(2);
+
+      const r1 = models.find((m) => m.id === 'accounts/fireworks/models/deepseek-r1')!;
+      expect(r1).toBeDefined();
+      expect(r1.name).toBe('DeepSeek R1');
+      expect(r1.description).toBe('Frontier reasoning model');
+      expect(r1.capabilities.contextWindow).toBe(160000);
+      expect(r1.capabilities.acceptsImages).toBe(false);
+      expect(r1.capabilities.reasoningEfforts).toEqual(['low', 'medium', 'high', 'max']);
+
+      const qwenVl = models.find((m) => m.id === 'accounts/fireworks/models/qwen2p5-vl-72b-instruct')!;
+      expect(qwenVl).toBeDefined();
+      expect(qwenVl.name).toBe('Qwen 2.5 VL 72B Instruct');
+      expect(qwenVl.capabilities.contextWindow).toBe(131072);
+      expect(qwenVl.capabilities.acceptsImages).toBe(true);
+      expect(qwenVl.capabilities.reasoningEfforts).toEqual([]);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('retains known reasoning metadata for Fireworks models when live API omits reasoning capability fields', async () => {
+    const originalFetch = global.fetch;
+    global.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          data: [
+            {
+              id: 'accounts/fireworks/models/deepseek-r1',
+              displayName: 'DeepSeek R1',
+            },
+            {
+              id: 'accounts/fireworks/models/qwq-32b',
+              displayName: 'QwQ 32B',
+            },
+          ],
+        }),
+        { status: 200 }
+      )) as typeof fetch;
+
+    try {
+      const models = await FireworksCatalog.fetchLiveModels('fireworks-key');
+      expect(models).toHaveLength(2);
+
+      const r1 = models.find((m) => m.id === 'accounts/fireworks/models/deepseek-r1')!;
+      expect(r1.capabilities.reasoningEfforts).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+
+      const qwq = models.find((m) => m.id === 'accounts/fireworks/models/qwq-32b')!;
+      expect(qwq.capabilities.reasoningEfforts).toEqual(['low', 'medium', 'high']);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('preserves explicit empty effort lists and supports_reasoning: false without populating known defaults', async () => {
+    const originalFetch = global.fetch;
+    global.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          data: [
+            {
+              id: 'accounts/fireworks/models/deepseek-r1',
+              displayName: 'DeepSeek R1 Disabled Reasoning',
+              reasoning_efforts: [],
+            },
+            {
+              id: 'accounts/fireworks/models/qwq-32b',
+              displayName: 'QwQ 32B No Reasoning Flag',
+              supports_reasoning: false,
+            },
+          ],
+        }),
+        { status: 200 }
+      )) as typeof fetch;
+
+    try {
+      const models = await FireworksCatalog.fetchLiveModels('fireworks-key');
+      expect(models).toHaveLength(2);
+
+      const r1 = models.find((m) => m.id === 'accounts/fireworks/models/deepseek-r1')!;
+      expect(r1.capabilities.reasoningEfforts).toEqual([]);
+
+      const qwq = models.find((m) => m.id === 'accounts/fireworks/models/qwq-32b')!;
+      expect(qwq.capabilities.reasoningEfforts).toEqual([]);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('applies conservative defaults when capability metadata is absent', async () => {
+    const originalFetch = global.fetch;
+    global.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          data: [
+            {
+              id: 'accounts/fireworks/models/unannotated-chat-model',
+            },
+          ],
+        }),
+        { status: 200 }
+      )) as typeof fetch;
+
+    try {
+      const models = await FireworksCatalog.fetchLiveModels('fireworks-key');
+      expect(models).toHaveLength(1);
+      expect(models[0].capabilities.contextWindow).toBe(128000);
+      expect(models[0].capabilities.acceptsImages).toBe(false);
+      expect(models[0].capabilities.reasoningEfforts).toEqual([]);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  it('excludes incompatible model types (embeddings, rerankers, image/audio generation, guardrails, non-serverless)', async () => {
+    const originalFetch = global.fetch;
+    global.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          data: [
+            // Compatible
+            { id: 'accounts/fireworks/models/llama-v3p3-70b-instruct', displayName: 'Llama 3.3 70B' },
+            { id: 'accounts/fireworks/models/new-compatible-text-model', context_length: 64000 },
+
+            // Incompatible - Embeddings
+            { id: 'accounts/fireworks/models/qwen3-embedding-8b', kind: 'EMBEDDING' },
+            { id: 'accounts/fireworks/models/bge-large-en-v1.5' },
+            { id: 'accounts/fireworks/models/text-embedding-004', type: 'embedding' },
+
+            // Incompatible - Rerankers
+            { id: 'accounts/fireworks/models/qwen3-reranker-8b', type: 'reranking' },
+            { id: 'accounts/fireworks/models/bge-reranker-v2-m3' },
+
+            // Incompatible - Image / Video Generation
+            { id: 'accounts/fireworks/models/flux-1-dev', kind: 'IMAGE_GENERATION' },
+            { id: 'accounts/fireworks/models/stable-diffusion-xl-1024-v1-0' },
+            { id: 'accounts/fireworks/models/kandinsky-2-2', type: 'image_generation' },
+            { id: 'accounts/fireworks/models/cogvideox-5b', type: 'video_generation' },
+
+            // Incompatible - Audio / Speech / Whisper
+            { id: 'accounts/fireworks/models/whisper-large-v3', type: 'audio' },
+            { id: 'accounts/fireworks/models/bark', type: 'tts' },
+
+            // Incompatible - Guardrails / Moderation
+            { id: 'accounts/fireworks/models/llama-guard-3-8b' },
+            { id: 'accounts/fireworks/models/moderation-model', type: 'moderation' },
+
+            // Incompatible - Explicit non-serverless or inactive
+            { id: 'accounts/fireworks/models/custom-dedicated-model', serverless: false },
+            { id: 'accounts/fireworks/models/disabled-model', state: 'DISABLED' },
+            { id: 'accounts/fireworks/models/no-tools-model', supports_tools: false },
+          ],
+        }),
+        { status: 200 }
+      )) as typeof fetch;
+
+    try {
+      const models = await FireworksCatalog.fetchLiveModels('fireworks-key');
+      const ids = models.map((m) => m.id);
+      expect(ids).toEqual([
+        'accounts/fireworks/models/llama-v3p3-70b-instruct',
+        'accounts/fireworks/models/new-compatible-text-model',
+      ]);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+});
+
+describe('resolveFlueModelSpecifier & Runtime Resolution', () => {
   it('correctly maps provider and model selections to provider/model format', async () => {
     const { resolveFlueModelSpecifier } = await import('../../src/providers/provider-registry.js');
 
     expect(resolveFlueModelSpecifier({ provider: 'codex', model: 'gpt-4o' })).toBe('openai-codex/gpt-4o');
-    expect(resolveFlueModelSpecifier({ provider: 'commandcode', model: 'claude-sonnet-4-6' })).toBe('commandcode/claude-sonnet-4-6');
-    expect(resolveFlueModelSpecifier({ provider: 'fireworks', model: 'accounts/fireworks/models/deepseek-r1' })).toBe('fireworks/accounts/fireworks/models/deepseek-r1');
-    expect(resolveFlueModelSpecifier({ provider: 'codex', model: 'openai-codex/o3-mini' })).toBe('openai-codex/o3-mini');
+    expect(resolveFlueModelSpecifier({ provider: 'commandcode', model: 'z-ai/glm-5.3-flash' })).toBe(
+      'commandcode/z-ai/glm-5.3-flash'
+    );
+    expect(
+      resolveFlueModelSpecifier({ provider: 'fireworks', model: 'accounts/fireworks/models/deepseek-r1' })
+    ).toBe('fireworks/accounts/fireworks/models/deepseek-r1');
+    expect(resolveFlueModelSpecifier({ provider: 'codex', model: 'openai-codex/o3-mini' })).toBe(
+      'openai-codex/o3-mini'
+    );
   });
 
-  it('matches provider-qualified configuration IDs with bare live catalog IDs', async () => {
+  it('matches provider-qualified configuration IDs with bare catalog IDs', async () => {
     expect(normalizeCatalogModelId('openai-codex/gpt-4o', 'codex')).toBe('gpt-4o');
-    expect(normalizeCatalogModelId('commandcode/claude-sonnet-4-6', 'commandcode')).toBe('claude-sonnet-4-6');
+    expect(normalizeCatalogModelId('commandcode/z-ai/glm-5.3-flash', 'commandcode')).toBe('z-ai/glm-5.3-flash');
     expect(normalizeCatalogModelId('fireworks/accounts/fireworks/models/deepseek-r1', 'fireworks')).toBe(
       'accounts/fireworks/models/deepseek-r1'
     );
@@ -187,45 +393,96 @@ describe('resolveFlueModelSpecifier', () => {
     }
   });
 
-  it('uses only the private credential store for provider catalogs', async () => {
+  it('uses only manual catalog for Command Code and validates stored credentials', async () => {
     const directory = await import('node:fs/promises').then(({ mkdtemp }) => mkdtemp('/tmp/poke-provider-test-'));
     const credentials = new FileCredentialStore(`${directory}/credentials.json`);
     await credentials.modify('commandcode', async () => ({ type: 'api_key', key: 'stored-command-code-key' }));
     const registry = new ProviderRegistry(credentials);
-    const fetchLiveModels = vi.spyOn(CommandCodeCatalog, 'fetchLiveModels').mockResolvedValue([]);
+    const validateApiKey = vi.spyOn(CommandCodeCatalog, 'validateApiKey').mockResolvedValue(CommandCodeCatalog.getModels());
 
     try {
-      await registry.fetchModels('commandcode');
-      expect(fetchLiveModels).toHaveBeenCalledWith('stored-command-code-key');
+      const models = await registry.fetchModels('commandcode');
+      expect(validateApiKey).toHaveBeenCalledWith('stored-command-code-key');
+      expect(models).toEqual(CommandCodeCatalog.getModels());
+      expect(models).toHaveLength(1);
+      expect(models[0].id).toBe('z-ai/glm-5.3-flash');
     } finally {
-      fetchLiveModels.mockRestore();
+      validateApiKey.mockRestore();
       await import('node:fs/promises').then(({ rm }) => rm(directory, { recursive: true, force: true }));
     }
   });
 
-  it('does not advertise a live Fireworks model that Flue cannot resolve', async () => {
+  it('fails selection validation when stored Command Code key is revoked (401)', async () => {
+    const directory = await import('node:fs/promises').then(({ mkdtemp }) => mkdtemp('/tmp/poke-provider-test-'));
+    const credentials = new FileCredentialStore(`${directory}/credentials.json`);
+    await credentials.modify('commandcode', async () => ({ type: 'api_key', key: 'revoked-command-code-key' }));
+    const registry = new ProviderRegistry(credentials);
+
+    const originalFetch = global.fetch;
+    global.fetch = (async () =>
+      new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 })) as typeof fetch;
+
+    try {
+      const validation = await registry.validateSelection({
+        provider: 'commandcode',
+        model: 'z-ai/glm-5.3-flash',
+      });
+      expect(validation.valid).toBe(false);
+      expect(validation.transient).toBe(false);
+      expect(validation.error).toContain('401');
+    } finally {
+      global.fetch = originalFetch;
+      await import('node:fs/promises').then(({ rm }) => rm(directory, { recursive: true, force: true }));
+    }
+  });
+
+  it('exposes newly available live Fireworks models and makes them resolvable by Flue at runtime', async () => {
     const directory = await import('node:fs/promises').then(({ mkdtemp }) => mkdtemp('/tmp/poke-provider-test-'));
     const credentials = new FileCredentialStore(`${directory}/credentials.json`);
     await credentials.modify('fireworks', async () => ({ type: 'api_key', key: 'stored-fireworks-key' }));
     const registry = new ProviderRegistry(credentials);
-    const registered = registry.models.getModels('fireworks')[0]!;
-    const fetchLiveModels = vi.spyOn(FireworksCatalog, 'fetchLiveModels').mockResolvedValue([
-      {
-        id: registered.id,
-        name: registered.name,
-        capabilities: { reasoningEfforts: [] },
-      },
-      {
-        id: 'new-account-visible-model',
-        name: 'New account-visible model',
-        capabilities: { reasoningEfforts: [] },
-      },
-    ]);
+
+    const newLiveModel = {
+      id: 'accounts/fireworks/models/brand-new-future-model-70b',
+      name: 'Brand New Future Model 70B',
+      capabilities: { reasoningEfforts: ['low', 'high'] as any, acceptsImages: true, contextWindow: 200000 },
+    };
+
+    const fetchLiveModels = vi.spyOn(FireworksCatalog, 'fetchLiveModels').mockResolvedValue([newLiveModel]);
 
     try {
-      await expect(registry.fetchModels('fireworks')).resolves.toEqual([
-        expect.objectContaining({ id: registered.id }),
-      ]);
+      // 1. poke model / fetchModels returns newly available model without static filtering
+      const fetched = await registry.fetchModels('fireworks');
+      expect(fetched).toEqual([newLiveModel]);
+
+      // 2. Selection validation succeeds
+      const validation = await registry.validateSelection({
+        provider: 'fireworks',
+        model: newLiveModel.id,
+        reasoningEffort: 'high',
+      });
+      expect(validation.valid).toBe(true);
+      expect(validation.modelInfo).toEqual(newLiveModel);
+
+      // 3. Register with Flue runtime and verify resolution
+      const { registerAllProviders } = await import('../../src/providers/provider-registry.js');
+      const { createFireworksCredentialProvider } = await import('../../src/providers/models.js');
+
+      registerAllProviders(registry.models, [], [validation.modelInfo!]);
+
+      const fireworksProvider = createFireworksCredentialProvider([validation.modelInfo!]);
+      const registeredFlueModel = fireworksProvider.getModels().find((m) => m.id === newLiveModel.id);
+      expect(registeredFlueModel).toBeDefined();
+      expect(registeredFlueModel).toMatchObject({
+        id: newLiveModel.id,
+        api: 'openai-completions',
+        provider: 'fireworks',
+        baseUrl: 'https://api.fireworks.ai/inference/v1',
+        reasoning: true,
+        input: ['text', 'image'],
+        contextWindow: 200000,
+        maxTokens: 16384,
+      });
     } finally {
       fetchLiveModels.mockRestore();
       await import('node:fs/promises').then(({ rm }) => rm(directory, { recursive: true, force: true }));
@@ -237,46 +494,67 @@ describe('resolveFlueModelSpecifier', () => {
     expect(() => resolveFlueModelSpecifier()).toThrow(/No model is configured/);
   });
 
-  it('attaches Flue dynamicModelTemplate to Command Code credential provider', async () => {
-    const { createCommandCodeCredentialProvider, withPokeCredentialResolver, createPokeModels } = await import('../../src/providers/models.js');
+  it('attaches Flue dynamicModelTemplate to Fireworks and Command Code providers', async () => {
+    const {
+      createCommandCodeCredentialProvider,
+      createFireworksCredentialProvider,
+      withPokeCredentialResolver,
+      createPokeModels,
+    } = await import('../../src/providers/models.js');
     const dynamicKey = Symbol.for('flue.dynamicModelTemplate');
-    const provider = createCommandCodeCredentialProvider();
-    expect((provider as any)[dynamicKey]).toEqual({
+
+    const cmdProvider = createCommandCodeCredentialProvider();
+    expect((cmdProvider as any)[dynamicKey]).toEqual({
       api: 'openai-completions',
       baseUrl: 'https://api.commandcode.ai/provider/v1',
+    });
+
+    const fwProvider = createFireworksCredentialProvider();
+    expect((fwProvider as any)[dynamicKey]).toEqual({
+      api: 'openai-completions',
+      baseUrl: 'https://api.fireworks.ai/inference/v1',
     });
 
     const credentials = new FileCredentialStore('/tmp/test-creds.json');
     const models = createPokeModels(credentials);
-    const resolved = withPokeCredentialResolver(provider, models);
-    expect((resolved as any)[dynamicKey]).toEqual({
+    const resolvedFw = withPokeCredentialResolver(fwProvider, models);
+    expect((resolvedFw as any)[dynamicKey]).toEqual({
       api: 'openai-completions',
-      baseUrl: 'https://api.commandcode.ai/provider/v1',
+      baseUrl: 'https://api.fireworks.ai/inference/v1',
     });
   });
 
   it('registers selected live Command Code metadata as a concrete Flue model', async () => {
-    const { createCommandCodeCredentialProvider } = await import('../../src/providers/models.js');
-    const provider = createCommandCodeCredentialProvider([
-      {
-        id: 'live-model',
-        name: 'Live model',
-        capabilities: {
-          reasoningEfforts: ['high'],
-          acceptsImages: true,
-          contextWindow: 400000,
-        },
+    const { createCommandCodeRuntimeModel, createCommandCodeCredentialProvider } = await import(
+      '../../src/providers/models.js'
+    );
+    const modelInfo = {
+      id: 'z-ai/glm-5.3-flash',
+      name: 'GLM-5.3 Flash',
+      capabilities: {
+        reasoningEfforts: ['low', 'high', 'max'] as any,
+        acceptsImages: true,
+        contextWindow: 1050000,
       },
-    ]);
-
-    expect(provider.getModels()[0]).toMatchObject({
-      id: 'live-model',
+    };
+    const runtimeModel = createCommandCodeRuntimeModel(modelInfo);
+    expect(runtimeModel).toMatchObject({
+      id: 'z-ai/glm-5.3-flash',
+      api: 'openai-completions',
+      provider: 'commandcode',
       reasoning: true,
       input: ['text', 'image'],
-      contextWindow: 400000,
+      contextWindow: 1050000,
       maxTokens: 16384,
     });
-    expect((provider.getModels()[0] as any).thinkingLevelMap.high).toBe('high');
+    expect((runtimeModel as any).thinkingLevelMap.low).toBe('low');
+    expect((runtimeModel as any).thinkingLevelMap.high).toBe('high');
+    expect((runtimeModel as any).thinkingLevelMap.max).toBe('max');
+
+    const provider = createCommandCodeCredentialProvider([modelInfo]);
+    expect(provider.getModels()[0]).toMatchObject({
+      id: 'z-ai/glm-5.3-flash',
+    });
   });
 });
 

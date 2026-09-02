@@ -311,6 +311,22 @@ describe('CLI & Diagnostics', () => {
     expect(ui.errors.join('\n')).toContain('invalid key');
   });
 
+  it('runs login using default validator callbacks without context loss', async () => {
+    const credentials = new FileCredentialStore(config.getPaths().credentialsFile);
+    const ui = new ScriptedUi(['commandcode'], [], ['valid-key']);
+    const originalFetch = global.fetch;
+    global.fetch = (async () =>
+      new Response(JSON.stringify({ data: [{ id: 'model-1' }] }), { status: 200 })) as typeof fetch;
+
+    try {
+      await runLogin(tempDir, ui, { credentials });
+      expect(await credentials.read('commandcode')).toEqual({ type: 'api_key', key: 'valid-key' });
+      expect(ui.notes.join('\n')).toContain('Found 1 available models');
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
   it('uses pi-ai’s Codex device-code flow instead of accepting a pasted access token', async () => {
     const ui = new ScriptedUi(['codex']);
     const login = vi.fn().mockImplementation(async (_provider, _type, interaction) => {
