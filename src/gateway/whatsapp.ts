@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { randomUUID } from 'node:crypto';
 import makeWASocket, {
   DisconnectReason,
   useMultiFileAuthState,
@@ -12,12 +13,17 @@ import makeWASocket, {
 import { ConfigManager, normalizePhoneNumber } from '../config/config.js';
 import { PokeDatabase } from '../db/database.js';
 import { DeepgramHandler } from './deepgram.js';
+import {
+  GROQ_STT_MODEL,
+  GroqTranscriptionError,
+  GroqTranscriptionHandler,
+} from './groq.js';
 import { WhatsAppSender } from './sender.js';
 import { WhatsAppPresence, WhatsAppPresenceOptions } from './presence.js';
 import { getLogger } from '../logger/logger.js';
 import { resolvePokePaths, ensurePokeDirectories } from '../config/paths.js';
 import { writeGatewayRuntimeStatus } from './runtime-status.js';
-
+import { compactErrorMessage } from './error-detail.js';
 export interface InboundMediaAttachment {
   path: string;
   filename: string;
@@ -70,6 +76,39 @@ export function formatVoiceTranscript(transcript: string): string {
   return `[voice] ${transcript.trim()}`;
 }
 
+export function formatVoiceTranscriptionFailure(): string {
+  return '[voice transcription failed]\nPoke has no reliable transcript for this message. Do not infer what it said. Ask the user to resend it or provide text before relying on it.';
+}
+
+export function formatVoiceLowConfidenceTranscript(): string {
+  return '[voice transcription low confidence]\nPoke deliberately omitted this unreliable transcript. Do not infer what it said. Ask the user to resend it or provide text before relying on it.';
+}
+
+export function formatVoiceDownloadFailure(): string {
+  return '[voice media download failed]\nPoke has no usable audio or transcript for this message. Do not infer what it said. Ask the user to resend it or provide text before relying on it.';
+}
+
+function audioExtension(mimeType: string, isPtt: boolean): string {
+  const mediaType = mimeType.split(';', 1)[0].trim().toLowerCase();
+  if (mediaType === 'audio/ogg') return 'ogg';
+  if (mediaType === 'audio/mpeg' || mediaType === 'audio/mp3') return 'mp3';
+  if (mediaType === 'audio/mp4' || mediaType === 'audio/m4a') return 'm4a';
+  if (mediaType === 'audio/aac') return 'aac';
+  if (mediaType === 'audio/wav' || mediaType === 'audio/x-wav') return 'wav';
+  if (mediaType === 'audio/webm') return 'webm';
+  return isPtt ? 'ogg' : 'bin';
+}
+
+
+function transcriptionFailureNotice(messageId: string, error: unknown): string {
+  return `Poke could not transcribe voice message ${messageId}. ${compactErrorMessage(error)} Please send it again.`;
+}
+
+function appendVoiceFailure(text: string, replyPrefix: string, failure: string): string {
+  const caption = text.startsWith(replyPrefix) ? text.slice(replyPrefix.length).trim() : text.trim();
+  return `${replyPrefix}${caption ? `${caption}\n\n` : ''}${failure}`;
+}
+
 function normalizeQuotedPreview(value: string): string {
   const normalized = value
     .replace(/[\u0000-\u001f\u007f]/g, ' ')
@@ -98,6 +137,7 @@ export type StatusHandlerFn = () => Promise<string>;
 export interface WhatsAppGatewayDependencies {
   downloadMedia?: (message: WAMessage) => Promise<Buffer>;
   deepgram?: DeepgramHandler;
+  groq?: GroqTranscriptionHandler;
   presence?: WhatsAppPresence;
   presenceOptions?: WhatsAppPresenceOptions;
   onCompact?: CompactHandlerFn;
@@ -110,9 +150,13 @@ export class WhatsAppGateway {
   private qrCode: string | null = null;
   private connectionState: 'disconnected' | 'connecting' | 'connected' = 'disconnected';
   private inFlightInbound = new Set<string>();
+  // Media downloads and transcription may complete in any order. Admission to
+  // the one owner conversation must retain WhatsApp receipt order instead.
+  private inboundAdmissionTail: Promise<void> = Promise.resolve();
   private sender: WhatsAppSender;
   private presence: WhatsAppPresence;
   private deepgram: DeepgramHandler;
+  private groq: GroqTranscriptionHandler;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private isStopped = false;
   private lastConnectedAt: number | undefined;
@@ -144,6 +188,7 @@ export class WhatsAppGateway {
     );
     const creds = this.configManager.getCredentials();
     this.deepgram = dependencies.deepgram || new DeepgramHandler(creds.deepgramApiKey, customHome);
+    this.groq = dependencies.groq || new GroqTranscriptionHandler(creds.groqApiKey, customHome);
     const ownerPhone = this.configManager.getOwnerPhoneNumber() || '';
     const ownerJid = ownerPhone ? `${ownerPhone}@s.whatsapp.net` : '';
     this.presence = dependencies.presence || new WhatsAppPresence(
@@ -258,16 +303,15 @@ export class WhatsAppGateway {
       this.sock.ev.on('messages.upsert', (m: any) => {
         if (m.type !== 'notify') return;
 
-        void (async () => {
-          for (const msg of m.messages) {
-            if (!msg.message || msg.key?.fromMe) continue;
-            try {
-              await this.handleIncomingMessage(msg);
-            } catch (err: any) {
-              logger.error({ err: err?.message || String(err) }, 'Failed to process incoming WhatsApp message');
-            }
-          }
-        })();
+        for (const msg of m.messages) {
+          if (!msg.message || msg.key?.fromMe) continue;
+          void this.handleIncomingMessage(msg).catch((err: any) => {
+            logger.error(
+              { messageId: msg.key?.id, err: err?.message || String(err) },
+              'Failed to process incoming WhatsApp message'
+            );
+          });
+        }
       });
     } catch (err: any) {
       this.isConnecting = false;
@@ -279,9 +323,9 @@ export class WhatsAppGateway {
   }
 
   async handleIncomingMessage(msg: proto.IWebMessageInfo): Promise<void> {
-    const logger = getLogger();
+    const logger = getLogger(this.customHome);
     const remoteJid = msg.key?.remoteJid || '';
-    const messageId = msg.key?.id || `msg-${Date.now()}`;
+    const messageId = msg.key?.id || `msg-${randomUUID()}`;
 
     // Ignore status broadcasts and groups
     if (remoteJid === 'status@broadcast' || remoteJid.endsWith('@g.us')) {
@@ -493,188 +537,294 @@ export class WhatsAppGateway {
       text = replyPrefix + text;
     }
 
+    // Start the potentially slow media work now, then serialize only admission
+    // to the single main-agent conversation. This keeps downloads and STT
+    // concurrent without letting a faster later message overtake an earlier one.
+    const normalizedPromise = this.prepareIncomingMessage({
+      msg,
+      msgContent,
+      messageId,
+      from: senderNumber,
+      text,
+      replyPrefix,
+    });
+    // The admission queue can be waiting on an earlier voice note. Mark an
+    // early preparation failure as handled now, then rethrow it at its own
+    // admission slot so it retains normal idempotency and gateway reporting.
+    void normalizedPromise.catch(() => undefined);
+
     try {
-      // Handle Media & Attachments
-      const attachments: InboundMediaAttachment[] = [];
-      let isVoice = false;
-
-      const paths = resolvePokePaths(this.customHome);
-      const msgInboxDir = path.join(paths.inboxDir, messageId);
-
-      // Audio / Voice note
-      if (msgContent.audioMessage) {
-        try {
-          if (!fs.existsSync(msgInboxDir)) {
-            fs.mkdirSync(msgInboxDir, { recursive: true, mode: 0o700 });
-          }
-          const isPtt = Boolean(msgContent.audioMessage.ptt);
-          const ext = isPtt ? 'ogg' : 'mp3';
-          const filePath = path.join(msgInboxDir, `audio.${ext}`);
-          const buffer = await this.downloadMedia(msg as WAMessage);
-          fs.writeFileSync(filePath, buffer as Buffer);
-
-          const mime = msgContent.audioMessage.mimetype || 'audio/ogg';
-          const size = (buffer as Buffer).length;
-
-          attachments.push({
-            path: filePath,
-            filename: `audio.${ext}`,
-            mimeType: mime,
-            size,
-            messageId,
-            caption: text || undefined,
-          });
-
-          // Transcribe voice note via Deepgram
-          if (this.deepgram) {
-            logger.info('Transcribing incoming voice note with Deepgram Nova-3');
-            try {
-              const transcript = await this.deepgram.transcribe(buffer as Buffer, mime);
-              if (transcript) {
-                text = replyPrefix + formatVoiceTranscript(transcript);
-                isVoice = true;
-                logger.info({ messageId, transcriptLength: transcript.length }, 'Voice note transcribed');
-              } else {
-                logger.warn({ messageId }, 'Voice note transcription was empty');
-                await this.reportInboundMediaFailure(
-                  messageId,
-                  'Poke could not transcribe the voice message. Please send it again.'
-                );
-                if (!text.trim() || text === replyPrefix) return;
-              }
-            } catch (sttErr: any) {
-              logger.error({ err: sttErr.message }, 'Voice note transcription failed');
-              await this.reportInboundMediaFailure(
-                messageId,
-                'Poke could not transcribe the voice message. Please send it again.'
-              );
-              if (!text.trim() || text === replyPrefix) return;
-            }
-          }
-        } catch (err: any) {
-          logger.error({ err: err.message }, 'Failed to download or process audio message');
-          await this.reportInboundMediaFailure(
-            messageId,
-            'Poke could not download the audio message. Please send it again.'
-          );
-          if (!text.trim() || text === replyPrefix) return;
+      await this.enqueueInboundAdmission(async () => {
+        const normalized = await normalizedPromise;
+        if (normalized) {
+          await this.onDispatch(normalized);
         }
-      }
 
-      // Image message
-      if (msgContent.imageMessage) {
-        try {
-          if (!fs.existsSync(msgInboxDir)) {
-            fs.mkdirSync(msgInboxDir, { recursive: true, mode: 0o700 });
-          }
-          const filePath = path.join(msgInboxDir, 'image.jpg');
-          const buffer = await this.downloadMedia(msg as WAMessage);
-          fs.writeFileSync(filePath, buffer as Buffer);
-
-          attachments.push({
-            path: filePath,
-            filename: 'image.jpg',
-            mimeType: msgContent.imageMessage.mimetype || 'image/jpeg',
-            size: (buffer as Buffer).length,
-            messageId,
-            caption: text || undefined,
-            isImage: true,
-          });
-        } catch (err: any) {
-          logger.error({ err: err.message }, 'Failed to download image message');
-          await this.reportInboundMediaFailure(
-            messageId,
-            'Poke could not download the image. Please send it again.'
-          );
-          if (!text.trim()) return;
+        // Only acknowledge the inbound message after dispatch admission succeeds,
+        // so a transient runtime failure can be retried by a redelivery.
+        if (this.db.isOpen()) {
+          this.db.recordIdempotency(idempotencyKey, 'whatsapp_inbound', messageId);
         }
-      }
-
-      // Document message with path traversal protection
-      if (msgContent.documentMessage) {
-        try {
-          if (!fs.existsSync(msgInboxDir)) {
-            fs.mkdirSync(msgInboxDir, { recursive: true, mode: 0o700 });
-          }
-          const rawFilename = msgContent.documentMessage.fileName || 'document.bin';
-          const filename = path.basename(rawFilename) || 'document.bin';
-          const filePath = path.resolve(msgInboxDir, filename);
-
-          if (!filePath.startsWith(path.resolve(msgInboxDir))) {
-            throw new Error(`Invalid document path: ${filePath}`);
-          }
-
-          const buffer = await this.downloadMedia(msg as WAMessage);
-          fs.writeFileSync(filePath, buffer as Buffer);
-
-          attachments.push({
-            path: filePath,
-            filename,
-            mimeType: msgContent.documentMessage.mimetype || 'application/octet-stream',
-            size: (buffer as Buffer).length,
-            messageId,
-            caption: text || undefined,
-          });
-        } catch (err: any) {
-          logger.error({ err: err.message }, 'Failed to download document message');
-          await this.reportInboundMediaFailure(
-            messageId,
-            'Poke could not download the document. Please send it again.'
-          );
-          if (!text.trim()) return;
-        }
-      }
-
-      // Video message
-      if (msgContent.videoMessage) {
-        try {
-          if (!fs.existsSync(msgInboxDir)) {
-            fs.mkdirSync(msgInboxDir, { recursive: true, mode: 0o700 });
-          }
-          const filePath = path.join(msgInboxDir, 'video.mp4');
-          const buffer = await this.downloadMedia(msg as WAMessage);
-          fs.writeFileSync(filePath, buffer as Buffer);
-
-          attachments.push({
-            path: filePath,
-            filename: 'video.mp4',
-            mimeType: msgContent.videoMessage.mimetype || 'video/mp4',
-            size: (buffer as Buffer).length,
-            messageId,
-            caption: text || undefined,
-          });
-        } catch (err: any) {
-          logger.error({ err: err.message }, 'Failed to download video message');
-          await this.reportInboundMediaFailure(
-            messageId,
-            'Poke could not download the video. Please send it again.'
-          );
-          if (!text.trim()) return;
-        }
-      }
-
-      // Build normalized message
-      const formattedText = formatInboundMessageText(text, attachments);
-      const normalized: NormalizedInboundMessage = {
-        messageId,
-        from: senderNumber,
-        text: formattedText,
-        isVoice,
-        attachments,
-        rawMessage: msg,
-      };
-
-      // Dispatch immediately into the main agent
-      await this.onDispatch(normalized);
-
-      // Only acknowledge the inbound message after dispatch admission succeeds, so a
-      // transient runtime failure can be retried by a redelivery.
-      if (this.db.isOpen()) {
-        this.db.recordIdempotency(idempotencyKey, 'whatsapp_inbound', messageId);
-      }
+      });
     } finally {
       this.inFlightInbound.delete(idempotencyKey);
     }
+  }
+
+  private enqueueInboundAdmission(operation: () => Promise<void>): Promise<void> {
+    const admission = this.inboundAdmissionTail.then(operation, operation);
+    this.inboundAdmissionTail = admission.catch(() => undefined);
+    return admission;
+  }
+
+  private async prepareIncomingMessage(input: {
+    msg: proto.IWebMessageInfo;
+    msgContent: proto.IMessage;
+    messageId: string;
+    from: string;
+    text: string;
+    replyPrefix: string;
+  }): Promise<NormalizedInboundMessage | null> {
+    const logger = getLogger(this.customHome);
+    const { msg, msgContent, messageId, from, replyPrefix } = input;
+    let { text } = input;
+    const attachments: InboundMediaAttachment[] = [];
+    let isVoice = false;
+
+    const paths = resolvePokePaths(this.customHome);
+    const msgInboxDir = path.join(paths.inboxDir, messageId);
+    const ensureInbox = () => {
+      if (!fs.existsSync(msgInboxDir)) {
+        fs.mkdirSync(msgInboxDir, { recursive: true, mode: 0o700 });
+      }
+    };
+
+    // Audio / Voice note
+    if (msgContent.audioMessage) {
+      isVoice = true;
+      const mime = msgContent.audioMessage.mimetype || 'audio/ogg';
+      let size: number | undefined;
+      try {
+        ensureInbox();
+        const ext = audioExtension(mime, Boolean(msgContent.audioMessage.ptt));
+        const filePath = path.join(msgInboxDir, `audio.${ext}`);
+        const buffer = await this.downloadMedia(msg as WAMessage);
+        fs.writeFileSync(filePath, buffer as Buffer);
+        size = (buffer as Buffer).length;
+
+        attachments.push({
+          path: filePath,
+          filename: `audio.${ext}`,
+          mimeType: mime,
+          size,
+          messageId,
+          caption: text || undefined,
+        });
+
+        logger.info(
+          { messageId, mimeType: mime, audioBytes: size, provider: 'groq', model: GROQ_STT_MODEL },
+          'Transcribing incoming voice note with Groq Whisper Large V3'
+        );
+        try {
+          const transcription = await this.groq.transcribe(buffer as Buffer, mime);
+          if (transcription.quality) {
+            const notice = `Poke could not reliably transcribe voice message ${messageId}. Groq returned low-confidence segments (${transcription.quality.reasons.join(', ')}). Please send it again.`;
+            logger.warn(
+              {
+                messageId,
+                mimeType: mime,
+                audioBytes: size,
+                provider: 'groq',
+                model: GROQ_STT_MODEL,
+                requestId: transcription.requestId,
+                detectedLanguage: transcription.detectedLanguage,
+                quality: transcription.quality,
+              },
+              'Voice note transcription has low-confidence segments'
+            );
+            await this.reportInboundMediaFailure(messageId, notice, {
+              stage: 'transcription_low_confidence',
+              mimeType: mime,
+              audioBytes: size,
+              provider: 'groq',
+              model: GROQ_STT_MODEL,
+              requestId: transcription.requestId,
+              detectedLanguage: transcription.detectedLanguage,
+              quality: transcription.quality,
+            });
+            text = appendVoiceFailure(text, replyPrefix, formatVoiceLowConfidenceTranscript());
+          } else if (transcription.text) {
+            text = replyPrefix + formatVoiceTranscript(transcription.text);
+            logger.info(
+              {
+                messageId,
+                provider: 'groq',
+                model: GROQ_STT_MODEL,
+                requestId: transcription.requestId,
+                detectedLanguage: transcription.detectedLanguage,
+                transcriptLength: transcription.text.length,
+              },
+              'Voice note transcribed'
+            );
+          } else {
+            const notice = `Poke could not transcribe voice message ${messageId}. Groq returned an empty transcript. Please send it again.`;
+            logger.warn(
+              { messageId, mimeType: mime, audioBytes: size, provider: 'groq', model: GROQ_STT_MODEL },
+              'Voice note transcription was empty'
+            );
+            await this.reportInboundMediaFailure(messageId, notice, {
+              stage: 'transcription',
+              mimeType: mime,
+              audioBytes: size,
+              provider: 'groq',
+              model: GROQ_STT_MODEL,
+              error: 'Groq returned an empty transcript.',
+            });
+            text = appendVoiceFailure(text, replyPrefix, formatVoiceTranscriptionFailure());
+          }
+        } catch (error: unknown) {
+          const diagnostic = error instanceof GroqTranscriptionError
+            ? {
+                provider: error.provider,
+                model: error.model,
+                attempts: error.attempts,
+                status: error.status,
+                requestId: error.requestId,
+              }
+            : { provider: 'groq', model: GROQ_STT_MODEL };
+          const notice = transcriptionFailureNotice(messageId, error);
+          logger.error(
+            {
+              messageId,
+              mimeType: mime,
+              audioBytes: size,
+              ...diagnostic,
+              err: error,
+            },
+            'Voice note transcription failed'
+          );
+          await this.reportInboundMediaFailure(messageId, notice, {
+            stage: 'transcription',
+            mimeType: mime,
+            audioBytes: size,
+            ...diagnostic,
+            error: compactErrorMessage(error),
+          });
+          text = appendVoiceFailure(text, replyPrefix, formatVoiceTranscriptionFailure());
+        }
+      } catch (error: unknown) {
+        const notice = `Poke could not download voice message ${messageId}. ${compactErrorMessage(error)} Please send it again.`;
+        logger.error(
+          { messageId, mimeType: mime, audioBytes: size, err: error },
+          'Failed to download or process audio message'
+        );
+        await this.reportInboundMediaFailure(messageId, notice, {
+          stage: 'download',
+          mimeType: mime,
+          audioBytes: size,
+          error: compactErrorMessage(error),
+        });
+        text = appendVoiceFailure(text, replyPrefix, formatVoiceDownloadFailure());
+      }
+    }
+
+    // Image message
+    if (msgContent.imageMessage) {
+      try {
+        ensureInbox();
+        const filePath = path.join(msgInboxDir, 'image.jpg');
+        const buffer = await this.downloadMedia(msg as WAMessage);
+        fs.writeFileSync(filePath, buffer as Buffer);
+
+        attachments.push({
+          path: filePath,
+          filename: 'image.jpg',
+          mimeType: msgContent.imageMessage.mimetype || 'image/jpeg',
+          size: (buffer as Buffer).length,
+          messageId,
+          caption: text || undefined,
+          isImage: true,
+        });
+      } catch (error: unknown) {
+        const notice = 'Poke could not download the image. Please send it again.';
+        logger.error({ messageId, err: error }, 'Failed to download image message');
+        await this.reportInboundMediaFailure(messageId, notice, {
+          stage: 'download_image',
+          error: compactErrorMessage(error),
+        });
+        if (!text.trim()) return null;
+      }
+    }
+
+    // Document message with path traversal protection
+    if (msgContent.documentMessage) {
+      try {
+        ensureInbox();
+        const rawFilename = msgContent.documentMessage.fileName || 'document.bin';
+        const filename = path.basename(rawFilename) || 'document.bin';
+        const filePath = path.resolve(msgInboxDir, filename);
+
+        if (!filePath.startsWith(path.resolve(msgInboxDir))) {
+          throw new Error(`Invalid document path: ${filePath}`);
+        }
+
+        const buffer = await this.downloadMedia(msg as WAMessage);
+        fs.writeFileSync(filePath, buffer as Buffer);
+
+        attachments.push({
+          path: filePath,
+          filename,
+          mimeType: msgContent.documentMessage.mimetype || 'application/octet-stream',
+          size: (buffer as Buffer).length,
+          messageId,
+          caption: text || undefined,
+        });
+      } catch (error: unknown) {
+        const notice = 'Poke could not download the document. Please send it again.';
+        logger.error({ messageId, err: error }, 'Failed to download document message');
+        await this.reportInboundMediaFailure(messageId, notice, {
+          stage: 'download_document',
+          error: compactErrorMessage(error),
+        });
+        if (!text.trim()) return null;
+      }
+    }
+
+    // Video message
+    if (msgContent.videoMessage) {
+      try {
+        ensureInbox();
+        const filePath = path.join(msgInboxDir, 'video.mp4');
+        const buffer = await this.downloadMedia(msg as WAMessage);
+        fs.writeFileSync(filePath, buffer as Buffer);
+
+        attachments.push({
+          path: filePath,
+          filename: 'video.mp4',
+          mimeType: msgContent.videoMessage.mimetype || 'video/mp4',
+          size: (buffer as Buffer).length,
+          messageId,
+          caption: text || undefined,
+        });
+      } catch (error: unknown) {
+        const notice = 'Poke could not download the video. Please send it again.';
+        logger.error({ messageId, err: error }, 'Failed to download video message');
+        await this.reportInboundMediaFailure(messageId, notice, {
+          stage: 'download_video',
+          error: compactErrorMessage(error),
+        });
+        if (!text.trim()) return null;
+      }
+    }
+
+    return {
+      messageId,
+      from,
+      text: formatInboundMessageText(text, attachments),
+      isVoice,
+      attachments,
+      rawMessage: msg,
+    };
   }
 
   private scheduleReconnect(): void {
@@ -688,7 +838,7 @@ export class WhatsAppGateway {
       try {
         await this.start();
       } catch (err: any) {
-        getLogger().error(
+        getLogger(this.customHome).error(
           { err: err?.message || String(err) },
           'WhatsApp reconnect attempt failed; rescheduling'
         );
@@ -699,12 +849,29 @@ export class WhatsAppGateway {
     }, 3000);
   }
 
-  private async reportInboundMediaFailure(messageId: string, notice: string): Promise<void> {
+  private async reportInboundMediaFailure(
+    messageId: string,
+    notice: string,
+    diagnostic?: Record<string, unknown>
+  ): Promise<void> {
+    try {
+      this.db.recordOperationalError(
+        'whatsapp_media',
+        notice,
+        JSON.stringify({ messageId, ...diagnostic })
+      );
+    } catch (error: unknown) {
+      getLogger(this.customHome).error(
+        { messageId, err: error },
+        'Failed to persist inbound media failure diagnostics'
+      );
+    }
+
     try {
       await this.sender.sendDirectError(notice);
     } catch (error: unknown) {
-      getLogger().error(
-        { messageId, err: error instanceof Error ? error.message : String(error) },
+      getLogger(this.customHome).error(
+        { messageId, err: error },
         'Failed to report inbound media failure'
       );
     }

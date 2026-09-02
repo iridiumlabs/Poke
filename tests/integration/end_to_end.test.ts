@@ -23,6 +23,7 @@ describe('Integration: End-to-End Poke Agent Flows', () => {
       commandCodeApiKey: 'cmd-test-key',
       exaApiKey: 'exa-test-key',
       deepgramApiKey: 'dg-test-key',
+      groqApiKey: 'groq-test-key',
       supermemoryApiKey: 'sm-test-key',
     });
     config.setMainModel({ provider: 'commandcode', model: 'claude-sonnet-4-6' });

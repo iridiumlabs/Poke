@@ -130,7 +130,7 @@ export class ComposioToolHandler {
     connected_accounts: ComposioConnectedAccount[];
   }> {
     if (!this.apiKey || !this.client) {
-      throw new Error('Composio API key is not configured. Add it via `poke setup`.');
+      throw new Error('Composio API key is not configured. Add it with `poke configure`.');
     }
 
     const query = params.query.trim();
@@ -166,7 +166,7 @@ export class ComposioToolHandler {
     signal?: AbortSignal
   ): Promise<{ result: unknown }> {
     if (!this.apiKey || !this.client) {
-      throw new Error('Composio API key is not configured. Add it via `poke setup`.');
+      throw new Error('Composio API key is not configured. Add it with `poke configure`.');
     }
 
     const action = params.action.trim();
@@ -278,7 +278,7 @@ export class ComposioToolHandler {
 
     const client = this.client;
     if (!client) {
-      throw new Error('Composio API key is not configured. Add it via `poke setup`.');
+      throw new Error('Composio API key is not configured. Add it with `poke configure`.');
     }
 
     const generation = this.catalogGeneration;

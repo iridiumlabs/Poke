@@ -1,9 +1,10 @@
 import fs from 'fs';
 import path from 'path';
-import { getLogger, redactSecrets } from '../logger/logger.js';
+import { getLogger } from '../logger/logger.js';
 import { withProviderRetry } from '../providers/retry.js';
 import { providerRequestSignal } from '../providers/fetch.js';
 import { resolvePokePaths } from '../config/paths.js';
+import { boundedErrorDetail } from './error-detail.js';
 
 export class DeepgramHandler {
   constructor(private apiKey?: string, private customHome?: string) {}
@@ -12,63 +13,12 @@ export class DeepgramHandler {
     this.apiKey = apiKey;
   }
 
-  async transcribe(audioBuffer: Buffer | string, mimeType?: string): Promise<string> {
-    if (!this.apiKey) {
-      throw new Error('Deepgram API key is not configured. Add it via `poke setup`.');
-    }
-
-    const logger = getLogger();
-    logger.info('Transcribing audio via Deepgram Nova-3');
-
-    let buffer: Buffer;
-    if (typeof audioBuffer === 'string') {
-      buffer = fs.readFileSync(audioBuffer);
-    } else {
-      buffer = audioBuffer;
-    }
-
-    return await withProviderRetry(async () => {
-      // Use direct REST call to Deepgram Nova-3
-      const url = new URL('https://api.deepgram.com/v1/listen');
-      url.searchParams.set('model', 'nova-3');
-      url.searchParams.set('smart_format', 'true');
-      url.searchParams.set('punctuate', 'true');
-
-      const res = await fetch(url.toString(), {
-        method: 'POST',
-        headers: {
-          Authorization: `Token ${this.apiKey}`,
-          'Content-Type': mimeType || 'audio/ogg',
-        },
-        body: buffer as any,
-        signal: providerRequestSignal(),
-      });
-
-      if (!res.ok) {
-        const detail = await res.text().catch(() => '');
-        const message = detail
-          ? `Deepgram STT returned ${res.status}: ${redactSecrets(detail)}`
-          : `Deepgram STT returned ${res.status}.`;
-        const err = new Error(message);
-        (err as any).status = res.status;
-        (err as any).headers = res.headers;
-        throw err;
-      }
-
-      const data = (await res.json()) as any;
-      const transcript =
-        data.results?.channels?.[0]?.alternatives?.[0]?.transcript || '';
-
-      return transcript.trim();
-    });
-  }
-
   async synthesizeToAudioFile(text: string): Promise<{ audioPath: string; mimeType: string }> {
     if (!this.apiKey) {
-      throw new Error('Deepgram API key is not configured. Add it via `poke setup`.');
+      throw new Error('Deepgram API key is not configured. Add it with `poke configure`.');
     }
 
-    const logger = getLogger();
+    const logger = getLogger(this.customHome);
     logger.info('Synthesizing speech via Deepgram Flux TTS');
 
     const paths = resolvePokePaths(this.customHome);
@@ -94,7 +44,7 @@ export class DeepgramHandler {
       if (!res.ok) {
         const detail = await res.text().catch(() => '');
         const message = detail
-          ? `Deepgram TTS returned ${res.status}: ${redactSecrets(detail)}`
+          ? `Deepgram TTS returned ${res.status}: ${boundedErrorDetail(detail)}`
           : `Deepgram TTS returned ${res.status}.`;
         const err = new Error(message);
         (err as any).status = res.status;

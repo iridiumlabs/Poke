@@ -12,7 +12,7 @@ Normative words have their usual meaning:
 
 Poke is a private, WhatsApp-first personal agent that runs continuously on a dedicated Ubuntu VPS owned by one user. It is meant to feel like a capable person living on that machine, not like a coding-agent UI transplanted into WhatsApp.
 
-Poke has one long-lived main conversation. It remembers personal context through Supermemory, can operate the VPS without permission prompts, can use connected services through Composio, can search and fetch the web through Exa, can understand and send voice notes through Deepgram, can install and use skills, can create durable automations, and can start asynchronous workers for long tasks.
+Poke has one long-lived main conversation. It remembers personal context through Supermemory, can operate the VPS without permission prompts, can use connected services through Composio, can search and fetch the web through Exa, transcribes incoming voice through Groq and sends voice notes through Deepgram, can install and use skills, can create durable automations, and can start asynchronous workers for long tasks.
 
 The finalized product name and CLI executable are both `Poke` and `poke` respectively.
 
@@ -59,7 +59,7 @@ Poke has four runtime parts:
    - Connects to WhatsApp through Baileys.
    - Enforces owner-only input.
    - Downloads attachments.
-   - Transcribes incoming voice through Deepgram.
+   - Transcribes incoming voice through Groq Whisper Large V3.
    - Dispatches normalized messages into the main Flue agent.
    - Implements the out-of-band `/stop` command.
    - Owns the `send` tool and direct operational error messages.
@@ -101,7 +101,7 @@ There must be one stable main-agent instance ID for the owner, such as `owner`. 
 - Web search and page retrieval: Exa, through tools mounted directly on the agents.
 - Connected services: Composio.
 - Long-term personal memory: Supermemory.
-- Incoming speech-to-text: Deepgram Nova-3.
+- Incoming speech-to-text: Groq Whisper Large V3.
 - Outgoing text-to-speech: Deepgram Flux through the current `/v2/speak` API.
 - Host: a private Ubuntu VPS.
 - Timezone: `Asia/Karachi` everywhere.
@@ -189,7 +189,7 @@ If the selected model supports image input and the image fits Flue/provider limi
 For a WhatsApp voice note:
 
 1. Download the original audio.
-2. Transcribe it with Deepgram.
+2. Transcribe it with Groq Whisper Large V3. Do not set a language parameter. Send the original WhatsApp audio container as multipart data; Poke does not convert it first.
 3. Dispatch the transcript in this form:
 
 ```text
@@ -201,11 +201,11 @@ Hey, can you check what happened with that thing we discussed yesterday?
 
 `[voice]` is metadata, not an instruction to answer in voice.
 
-If transcription fails after transient retries, the gateway sends a short operational error directly to WhatsApp. Do not ask the model to report a failure when the model never received a usable message.
+If transcription fails after transient retries, or Whisper's returned segment metadata meets its documented fallback thresholds, the gateway sends a short operational error directly to WhatsApp and dispatches an explicit failure marker to the main agent. The marker must say that there is no reliable transcript and that the agent must not infer the missing content. Preserve the sanitized provider diagnostic with the WhatsApp message ID, MIME type, byte count, status, request ID, retry count, and (when present) quality metadata in logs and local operational errors.
 
 ### 5.4 No batching or debounce
 
-Do not combine double or triple texts into one synthetic input. Dispatch every ordinary incoming message immediately.
+Do not combine double or triple texts into one synthetic input. Start each ordinary incoming message immediately. Media download and transcription may run concurrently, but admission to the one main-agent conversation must preserve WhatsApp receipt order so a fast later instruction cannot overtake earlier media.
 
 If the main agent is running, Flue joins the new delivery at the next turn boundary. In a tool loop, this is after the current tool batch commits and before the next model call. If the current response is already producing its final output and there is no further join point, the new message becomes the next durable submission.
 
@@ -803,7 +803,7 @@ Worker failures normally arrive as a worker-completion error signal so the main 
 
 ### 17.3 Other retries
 
-Use bounded transient retries for Exa, Composio, Supermemory, Deepgram, and WhatsApp network operations. Do not automatically repeat a non-idempotent external action unless it has a durable idempotency key or the provider confirms it was not applied.
+Use bounded transient retries for Exa, Composio, Supermemory, Groq, Deepgram, and WhatsApp network operations. Do not automatically repeat a non-idempotent external action unless it has a durable idempotency key or the provider confirms it was not applied.
 
 ## 18. Persistence and local layout
 
@@ -848,6 +848,7 @@ Ship this command set and keep it small:
 
 ```text
 poke setup
+poke configure
 
 poke login
 poke model
@@ -881,6 +882,7 @@ Services
   Supermemory API key
   Exa API key
   Deepgram API key
+  Groq API key
 
 Done
 ```
@@ -891,7 +893,11 @@ Do not ask for AI provider credentials during setup. Those belong to `poke login
 
 Validate keys with cheap read-only calls where supported. A failed validation should identify the service and let the user retry without losing completed setup steps.
 
-### 19.2 `poke login`
+### 19.2 `poke configure`
+
+Provide an interactive menu for Supermemory, Composio, Exa, Deepgram, and Groq service keys. Do not display existing secrets. Keep an existing key unless the user explicitly confirms replacement. Validate a replacement before saving it to the existing Poke credential store, then restart a running daemon after one or more keys change.
+
+### 19.3 `poke login`
 
 Present the supported providers and run the correct flow:
 
@@ -901,11 +907,11 @@ Present the supported providers and run the correct flow:
 
 Allow re-authentication and credential replacement. Do not print existing secrets.
 
-### 19.3 `poke model` and `poke model worker`
+### 19.4 `poke model` and `poke model worker`
 
 Use the dynamic model and exact reasoning-capability flow in section 16. Show the currently selected configuration. Validate before saving. Main and worker selections are independent.
 
-### 19.4 `poke whatsapp`
+### 19.5 `poke whatsapp`
 
 Provide an interactive menu:
 
@@ -922,13 +928,13 @@ Status: connected
 
 Clearing the session is destructive and must ask for confirmation. It does not delete conversations, memory, jobs, automations, or provider credentials.
 
-### 19.5 Lifecycle commands
+### 19.6 Lifecycle commands
 
 `start`, `stop`, and `restart` manage one background daemon. Use systemd on Ubuntu so Poke survives SSH disconnection and restarts according to a bounded service policy. Run it as the account that installed/configured Poke. Do not create another Unix account.
 
 `poke stop` is an administrative graceful daemon stop. It is not the same as WhatsApp `/stop`. A normal daemon shutdown should stop accepting new gateway events, persist state, and close cleanly. It should not mark durable queued jobs as user-aborted unless explicitly requested.
 
-### 19.6 `poke status`
+### 19.7 `poke status`
 
 Show, without secrets:
 
@@ -942,7 +948,7 @@ Show, without secrets:
 - Enabled automation count and next due time.
 - Last operational error.
 
-### 19.7 `poke doctor`
+### 19.8 `poke doctor`
 
 Run read-only diagnostics:
 
@@ -955,13 +961,13 @@ Run read-only diagnostics:
 - Selected models still present in live catalogs.
 - Selected reasoning values still valid.
 - Skills directory readability and registry health.
-- Deepgram, Exa, Supermemory, and Composio connectivity through cheap checks.
+- Groq, Deepgram, Exa, Supermemory, and Composio connectivity through cheap checks.
 - Writable state, inbox, outbox, cache, and log directories.
 - Scheduler running and next-run calculations valid.
 
 Return a nonzero exit code when a required check fails.
 
-### 19.8 Logs
+### 19.9 Logs
 
 `poke logs` shows recent structured daemon logs. `poke logs -f` follows them. Redact secrets and avoid storing full private message bodies by default. Include correlation IDs for WhatsApp messages, Flue submissions, workers, automations, provider calls, and sends.
 
@@ -1016,7 +1022,7 @@ Build in vertical slices. Each slice should be usable and tested before the next
 
 - Project structure, configuration, migrations, SQLite, and structured logging.
 - Flue Node runtime with a stable main instance.
-- `poke setup`, provider login, model selection, lifecycle, status, doctor, and logs.
+- `poke setup`, `poke configure`, provider login, model selection, lifecycle, status, doctor, and logs.
 - Full local host sandbox with complete environment forwarding.
 
 ### Slice 2: WhatsApp text loop
@@ -1040,7 +1046,7 @@ Build in vertical slices. Each slice should be usable and tested before the next
 
 - Image, file, document, video, audio, and voice-note download.
 - Native image attachment when supported.
-- Deepgram transcription.
+- Groq Whisper Large V3 transcription.
 - `send` voice mode through Deepgram Flux.
 - Direct gateway reporting for media-service failures.
 
@@ -1169,7 +1175,7 @@ Use current official documentation while implementing. Important starting points
 - [Command Code BYOK model metadata](https://commandcode.ai/docs/byok)
 - [Command Code model reference](https://commandcode.ai/docs/reference/cli/models)
 - [Exa Search API](https://exa.ai/docs/reference/search-api-guide)
-- [Deepgram speech-to-text](https://developers.deepgram.com/docs/pre-recorded-audio)
+- [Groq speech-to-text](https://console.groq.com/docs/speech-to-text)
 - [Deepgram text-to-speech](https://developers.deepgram.com/docs/text-to-speech)
 
 Provider and framework APIs may change. Keep provider-specific parsing behind adapters, preserve the normalized Poke contracts in this document, and update implementation details without changing settled product behavior.

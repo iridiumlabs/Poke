@@ -5,7 +5,8 @@ export type ServiceCredentialKey =
   | 'composioApiKey'
   | 'supermemoryApiKey'
   | 'exaApiKey'
-  | 'deepgramApiKey';
+  | 'deepgramApiKey'
+  | 'groqApiKey';
 
 export interface RequiredService {
   readonly name: string;
@@ -17,6 +18,7 @@ export const REQUIRED_SERVICES = [
   { name: 'Supermemory', key: 'supermemoryApiKey' },
   { name: 'Exa', key: 'exaApiKey' },
   { name: 'Deepgram', key: 'deepgramApiKey' },
+  { name: 'Groq', key: 'groqApiKey' },
 ] as const satisfies readonly RequiredService[];
 
 const VALIDATION_TIMEOUT_MS = 10_000;
@@ -82,6 +84,14 @@ export async function validateServiceCredential(
         signal: AbortSignal.timeout(VALIDATION_TIMEOUT_MS),
       });
       if (!response.ok) throw new Error(`Deepgram returned ${response.status}.`);
+      return;
+    }
+    case 'groqApiKey': {
+      const response = await fetch('https://api.groq.com/openai/v1/models', {
+        headers: { Authorization: `Bearer ${apiKey}` },
+        signal: AbortSignal.timeout(VALIDATION_TIMEOUT_MS),
+      });
+      if (!response.ok) throw new Error(`Groq returned ${response.status}.`);
       return;
     }
   }

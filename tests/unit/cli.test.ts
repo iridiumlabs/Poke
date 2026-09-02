@@ -9,15 +9,17 @@ import { ConfigManager } from '../../src/config/config.js';
 import { PokeDatabase } from '../../src/db/database.js';
 import { readLogTail } from '../../src/cli/logs.js';
 import { createCli } from '../../src/cli/index.js';
-import { colorizeCliText, isPromptCancellation } from '../../src/cli/ui.js';
+import { CliCancelledError, colorizeCliText, isPromptCancellation } from '../../src/cli/ui.js';
 import type { CliUi, SelectChoice, TextPromptOptions } from '../../src/cli/ui.js';
 import { runSetup } from '../../src/cli/setup.js';
+import { runConfigure } from '../../src/cli/configure.js';
 import { runLogin } from '../../src/cli/login.js';
 import { runModelSelection } from '../../src/cli/model.js';
 import { runWhatsAppMenu } from '../../src/cli/whatsapp.js';
 import { runInteractiveWhatsAppPairing } from '../../src/cli/pairing.js';
 import { FileCredentialStore } from '../../src/providers/credential-store.js';
 import { readGatewayRuntimeStatus, writeGatewayRuntimeStatus } from '../../src/gateway/runtime-status.js';
+import { validateServiceCredential } from '../../src/services/health.js';
 
 class ScriptedUi implements CliUi {
   readonly notes: string[] = [];
@@ -91,6 +93,7 @@ describe('CLI & Diagnostics', () => {
       user: 'arham',
       credentials: {
         deepgramApiKey: 'dg-abcdef1234567890abcdef12',
+        groqApiKey: 'gsk_abcdef1234567890abcdef12',
         commandCodeApiKey: 'cm_abcdef1234567890',
       },
       message: 'Authorization: Bearer mySecretToken123456789',
@@ -99,8 +102,28 @@ describe('CLI & Diagnostics', () => {
     const redacted = redactSecrets(rawObject);
     expect(redacted.apiKey).toBe('[REDACTED]');
     expect(redacted.credentials.deepgramApiKey).toBe('[REDACTED]');
+    expect(redacted.credentials.groqApiKey).toBe('[REDACTED]');
     expect(redacted.credentials.commandCodeApiKey).toBe('[REDACTED]');
     expect(redacted.message).toContain('Bearer [REDACTED]');
+  });
+
+  it('validates a Groq key with Groq’s read-only model endpoint', async () => {
+    const originalFetch = global.fetch;
+    let requestedUrl = '';
+    let requestHeaders: RequestInit['headers'];
+    global.fetch = vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+      requestedUrl = url;
+      requestHeaders = init?.headers;
+      return new Response(JSON.stringify({ data: [] }), { status: 200 });
+    });
+
+    try {
+      await expect(validateServiceCredential('groqApiKey', 'gsk_test-key')).resolves.toBeUndefined();
+      expect(requestedUrl).toBe('https://api.groq.com/openai/v1/models');
+      expect((requestHeaders as Record<string, string>)?.Authorization).toBe('Bearer gsk_test-key');
+    } finally {
+      global.fetch = originalFetch;
+    }
   });
 
   it('poke doctor returns failure when mandatory fields are missing', async () => {
@@ -141,6 +164,7 @@ describe('CLI & Diagnostics', () => {
       supermemoryApiKey: 'supermemory-key-123',
       exaApiKey: 'exa-key-123',
       deepgramApiKey: 'dg-key-123',
+      groqApiKey: 'gsk-key-123',
     });
     config.setMainModel({ provider: 'commandcode', model: 'claude-sonnet-4-6' });
     config.setWorkerModel({ provider: 'commandcode', model: 'claude-sonnet-4-6' });
@@ -162,7 +186,8 @@ describe('CLI & Diagnostics', () => {
 
     const exaCheck = checks.find((c) => c.name === 'Exa API Key');
     expect(exaCheck?.passed).toBe(true);
-    expect(validateService).toHaveBeenCalledTimes(4);
+    expect(checks.find((c) => c.name === 'Groq API Key')?.passed).toBe(true);
+    expect(validateService).toHaveBeenCalledTimes(5);
     expect(success).toBe(true);
   });
 
@@ -267,7 +292,7 @@ describe('CLI & Diagnostics', () => {
     const ui = new ScriptedUi(
       ['qr'],
       ['+923001111111', '+923001222222'],
-      ['composio-key', 'supermemory-key', 'exa-key', 'deepgram-key']
+      ['composio-key', 'supermemory-key', 'exa-key', 'deepgram-key', 'groq-key']
     );
     const pairingService = {
       pair: vi.fn().mockResolvedValue({ pairedAccount: '923001111111' }),
@@ -292,7 +317,86 @@ describe('CLI & Diagnostics', () => {
       supermemoryApiKey: 'supermemory-key',
       exaApiKey: 'exa-key',
       deepgramApiKey: 'deepgram-key',
+      groqApiKey: 'groq-key',
     });
+  });
+
+  it('poke configure adds each supported service key through the existing credential store', async () => {
+    const validateService = vi.fn().mockResolvedValue(undefined);
+    const restartDaemon = vi.fn().mockResolvedValue(undefined);
+    const ui = new ScriptedUi(
+      ['supermemoryApiKey', 'composioApiKey', 'exaApiKey', 'deepgramApiKey', 'groqApiKey', 'done'],
+      [],
+      ['supermemory-key', 'composio-key', 'exa-key', 'deepgram-key', 'gsk_groq-key']
+    );
+
+    await runConfigure(tempDir, ui, {
+      validateService,
+      isDaemonRunning: () => true,
+      restartDaemon,
+    });
+
+    expect(config.getCredentials()).toMatchObject({
+      supermemoryApiKey: 'supermemory-key',
+      composioApiKey: 'composio-key',
+      exaApiKey: 'exa-key',
+      deepgramApiKey: 'deepgram-key',
+      groqApiKey: 'gsk_groq-key',
+    });
+    expect(validateService.mock.calls).toEqual([
+      ['supermemoryApiKey', 'supermemory-key'],
+      ['composioApiKey', 'composio-key'],
+      ['exaApiKey', 'exa-key'],
+      ['deepgramApiKey', 'deepgram-key'],
+      ['groqApiKey', 'gsk_groq-key'],
+    ]);
+    expect(restartDaemon).toHaveBeenCalledWith(tempDir);
+  });
+
+  it('poke configure preserves existing keys unless the user explicitly chooses replacement', async () => {
+    config.updateCredentials({
+      supermemoryApiKey: 'old-supermemory-key',
+      composioApiKey: 'old-composio-key',
+      deepgramApiKey: 'old-deepgram-key',
+      groqApiKey: 'old-groq-key',
+    });
+    const validateService = vi.fn().mockResolvedValue(undefined);
+    const ui = new ScriptedUi(
+      ['supermemoryApiKey', 'groqApiKey', 'done'],
+      [],
+      ['new-groq-key'],
+      [false, true]
+    );
+
+    await runConfigure(tempDir, ui, { validateService, isDaemonRunning: () => false });
+
+    expect(config.getCredentials()).toMatchObject({
+      supermemoryApiKey: 'old-supermemory-key',
+      composioApiKey: 'old-composio-key',
+      deepgramApiKey: 'old-deepgram-key',
+      groqApiKey: 'new-groq-key',
+    });
+    expect(validateService).toHaveBeenCalledTimes(1);
+    expect(validateService).toHaveBeenCalledWith('groqApiKey', 'new-groq-key');
+  });
+
+  it('applies completed poke configure changes to a running daemon after cancellation', async () => {
+    const validateService = vi.fn().mockResolvedValue(undefined);
+    const restartDaemon = vi.fn().mockResolvedValue(undefined);
+    const ui = new ScriptedUi(['groqApiKey'], [], ['gsk_groq-key']);
+    vi.spyOn(ui, 'select')
+      .mockResolvedValueOnce('groqApiKey' as any)
+      .mockRejectedValueOnce(new CliCancelledError());
+
+    await runConfigure(tempDir, ui, {
+      validateService,
+      isDaemonRunning: () => true,
+      restartDaemon,
+    });
+
+    expect(config.getCredentials().groqApiKey).toBe('gsk_groq-key');
+    expect(restartDaemon).toHaveBeenCalledWith(tempDir);
+    expect(ui.notes).toContain('Configuration cancelled. Completed changes were kept.');
   });
 
   it('keeps an existing provider credential when replacement validation fails', async () => {
@@ -484,6 +588,14 @@ describe('CLI & Diagnostics', () => {
 
     expect(updateCmd).toBeDefined();
     expect(updateCmd?.description()).toContain('Update Poke from origin/main');
+  });
+
+  it('registers the configure command', () => {
+    const program = createCli();
+    const configureCmd = program.commands.find((cmd) => cmd.name() === 'configure');
+
+    expect(configureCmd?.description()).toContain('Groq API keys');
+    expect(configureCmd?.description()).toContain('Exa');
   });
 
   it('registers the compact command with clear description', () => {

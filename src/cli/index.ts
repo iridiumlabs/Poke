@@ -1,5 +1,6 @@
 import { Command } from 'commander';
 import { runSetup } from './setup.js';
+import { runConfigure } from './configure.js';
 import { runLogin } from './login.js';
 import { runModelSelection } from './model.js';
 import { runWhatsAppMenu } from './whatsapp.js';
@@ -27,6 +28,13 @@ export function createCli(): Command {
     .description('Interactive setup for WhatsApp pairing, owner number, and service API keys')
     .action(async () => {
       await runSetup();
+    });
+
+  program
+    .command('configure')
+    .description('Add or replace Supermemory, Composio, Exa, Deepgram, and Groq API keys')
+    .action(async () => {
+      await runConfigure();
     });
 
   program

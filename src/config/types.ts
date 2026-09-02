@@ -19,6 +19,7 @@ export interface ServiceCredentials {
   supermemoryApiKey?: string;
   exaApiKey?: string;
   deepgramApiKey?: string;
+  groqApiKey?: string;
   /** @deprecated Read only to migrate existing installations into credentials.json. */
   fireworksApiKey?: string;
   /** @deprecated Read only to migrate existing installations into credentials.json. */
