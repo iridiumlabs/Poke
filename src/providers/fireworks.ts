@@ -4,6 +4,13 @@ import { providerRequestSignal } from './fetch.js';
 
 const VALID_REASONING_EFFORTS = new Set<ReasoningEffort>(['low', 'medium', 'high', 'xhigh', 'max']);
 
+export const FIREWORKS_KNOWN_REASONING: Record<string, readonly ReasoningEffort[]> = {
+  'accounts/fireworks/models/deepseek-r1': ['low', 'medium', 'high', 'xhigh', 'max'],
+  'accounts/fireworks/models/qwq-32b': ['low', 'medium', 'high'],
+  'deepseek-r1': ['low', 'medium', 'high', 'xhigh', 'max'],
+  'qwq-32b': ['low', 'medium', 'high'],
+};
+
 /**
  * Checks whether a Fireworks model entry represents a serverless text/chat/vision
  * model capable of functioning as a Poke agent model.
@@ -235,6 +242,14 @@ export function extractFireworksModelInfo(item: unknown): ModelInfo | null {
   } else if (obj.supports_reasoning === true || obj.supportsReasoning === true || obj.reasoning === true) {
     // If flagged as reasoning-capable without specific efforts list, provide standard efforts
     reasoningEfforts.push('low', 'medium', 'high');
+  }
+
+  // Retain authoritative known metadata when live response omits capability fields
+  if (reasoningEfforts.length === 0) {
+    const known = FIREWORKS_KNOWN_REASONING[id] || FIREWORKS_KNOWN_REASONING[lowerId];
+    if (known) {
+      reasoningEfforts.push(...known);
+    }
   }
 
   return {

@@ -88,7 +88,7 @@ export class ProviderRegistry implements ProviderCatalog {
         if (!apiKey) {
           throw new Error('Command Code is not authenticated. Run `poke login`.');
         }
-        return CommandCodeCatalog.getModels();
+        return await CommandCodeCatalog.validateApiKey(apiKey);
       }
       case 'fireworks': {
         const auth = await this.models.getAuth(FIREWORKS_PROVIDER_ID);

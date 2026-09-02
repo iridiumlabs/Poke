@@ -16,7 +16,9 @@ import { WhatsAppSender } from '../gateway/sender.js';
 import { CompactionManager, estimateTokenCount } from '../context/compaction-manager.js';
 import { getLogger } from '../logger/logger.js';
 import { resolvePokePaths, ensurePokeDirectories } from '../config/paths.js';
-import { registerAllProviders, ProviderRegistry } from '../providers/provider-registry.js';
+import { registerAllProviders, ProviderRegistry, normalizeCatalogModelId } from '../providers/provider-registry.js';
+import { COMMAND_CODE_MANUAL_CATALOG } from '../providers/commandcode.js';
+import { extractFireworksModelInfo } from '../providers/fireworks.js';
 import { FileCredentialStore } from '../providers/credential-store.js';
 import { migrateLegacyProviderCredentials } from '../providers/credentials-migration.js';
 import { SignalPayload } from './signals.js';
@@ -96,21 +98,36 @@ export class PokeRuntime {
 
       // Register the exact selected Command Code and Fireworks definitions with Flue.
       // Their metadata is authoritative for reasoning, image, and context capabilities.
+      const commandCodeFallback = (model?: { provider: string; model: string }) => {
+        if (model?.provider !== 'commandcode') return undefined;
+        const normalized = normalizeCatalogModelId(model.model, 'commandcode');
+        return COMMAND_CODE_MANUAL_CATALOG.find((entry) => entry.id === normalized);
+      };
+
+      const fireworksFallback = (model?: { provider: string; model: string }) => {
+        if (model?.provider !== 'fireworks') return undefined;
+        const normalized = normalizeCatalogModelId(model.model, 'fireworks');
+        return extractFireworksModelInfo({ id: normalized });
+      };
+
       const commandCodeModels = [
-        mainModel?.provider === 'commandcode' ? mainValidation.modelInfo : undefined,
-        workerModel?.provider === 'commandcode' ? workerValidation.modelInfo : undefined,
+        mainModel?.provider === 'commandcode' ? (mainValidation.modelInfo || commandCodeFallback(mainModel)) : undefined,
+        workerModel?.provider === 'commandcode' ? (workerValidation.modelInfo || commandCodeFallback(workerModel)) : undefined,
       ]
         .filter((model): model is NonNullable<typeof model> => Boolean(model))
         .filter((model, index, all) => all.findIndex((candidate) => candidate.id === model.id) === index);
+
+      const resolvedCommandCodeModels =
+        commandCodeModels.length > 0 ? commandCodeModels : COMMAND_CODE_MANUAL_CATALOG;
 
       const fireworksModels = [
-        mainModel?.provider === 'fireworks' ? mainValidation.modelInfo : undefined,
-        workerModel?.provider === 'fireworks' ? workerValidation.modelInfo : undefined,
+        mainModel?.provider === 'fireworks' ? (mainValidation.modelInfo || fireworksFallback(mainModel)) : undefined,
+        workerModel?.provider === 'fireworks' ? (workerValidation.modelInfo || fireworksFallback(workerModel)) : undefined,
       ]
         .filter((model): model is NonNullable<typeof model> => Boolean(model))
         .filter((model, index, all) => all.findIndex((candidate) => candidate.id === model.id) === index);
 
-      registerAllProviders(providerRegistry.models, commandCodeModels, fireworksModels);
+      registerAllProviders(providerRegistry.models, resolvedCommandCodeModels, fireworksModels);
 
       const toolContexts = {
         sender: this.sender,

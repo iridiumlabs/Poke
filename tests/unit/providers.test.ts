@@ -203,6 +203,39 @@ describe('FireworksCatalog', () => {
     }
   });
 
+  it('retains known reasoning metadata for Fireworks models when live API omits reasoning capability fields', async () => {
+    const originalFetch = global.fetch;
+    global.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          data: [
+            {
+              id: 'accounts/fireworks/models/deepseek-r1',
+              displayName: 'DeepSeek R1',
+            },
+            {
+              id: 'accounts/fireworks/models/qwq-32b',
+              displayName: 'QwQ 32B',
+            },
+          ],
+        }),
+        { status: 200 }
+      )) as typeof fetch;
+
+    try {
+      const models = await FireworksCatalog.fetchLiveModels('fireworks-key');
+      expect(models).toHaveLength(2);
+
+      const r1 = models.find((m) => m.id === 'accounts/fireworks/models/deepseek-r1')!;
+      expect(r1.capabilities.reasoningEfforts).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+
+      const qwq = models.find((m) => m.id === 'accounts/fireworks/models/qwq-32b')!;
+      expect(qwq.capabilities.reasoningEfforts).toEqual(['low', 'medium', 'high']);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
   it('applies conservative defaults when capability metadata is absent', async () => {
     const originalFetch = global.fetch;
     global.fetch = (async () =>
@@ -325,18 +358,45 @@ describe('resolveFlueModelSpecifier & Runtime Resolution', () => {
     }
   });
 
-  it('uses only manual catalog for Command Code without dynamic scraping', async () => {
+  it('uses only manual catalog for Command Code and validates stored credentials', async () => {
     const directory = await import('node:fs/promises').then(({ mkdtemp }) => mkdtemp('/tmp/poke-provider-test-'));
     const credentials = new FileCredentialStore(`${directory}/credentials.json`);
     await credentials.modify('commandcode', async () => ({ type: 'api_key', key: 'stored-command-code-key' }));
     const registry = new ProviderRegistry(credentials);
+    const validateApiKey = vi.spyOn(CommandCodeCatalog, 'validateApiKey').mockResolvedValue(CommandCodeCatalog.getModels());
 
     try {
       const models = await registry.fetchModels('commandcode');
+      expect(validateApiKey).toHaveBeenCalledWith('stored-command-code-key');
       expect(models).toEqual(CommandCodeCatalog.getModels());
       expect(models).toHaveLength(1);
       expect(models[0].id).toBe('z-ai/glm-5.3-flash');
     } finally {
+      validateApiKey.mockRestore();
+      await import('node:fs/promises').then(({ rm }) => rm(directory, { recursive: true, force: true }));
+    }
+  });
+
+  it('fails selection validation when stored Command Code key is revoked (401)', async () => {
+    const directory = await import('node:fs/promises').then(({ mkdtemp }) => mkdtemp('/tmp/poke-provider-test-'));
+    const credentials = new FileCredentialStore(`${directory}/credentials.json`);
+    await credentials.modify('commandcode', async () => ({ type: 'api_key', key: 'revoked-command-code-key' }));
+    const registry = new ProviderRegistry(credentials);
+
+    const originalFetch = global.fetch;
+    global.fetch = (async () =>
+      new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 })) as typeof fetch;
+
+    try {
+      const validation = await registry.validateSelection({
+        provider: 'commandcode',
+        model: 'z-ai/glm-5.3-flash',
+      });
+      expect(validation.valid).toBe(false);
+      expect(validation.transient).toBe(false);
+      expect(validation.error).toContain('401');
+    } finally {
+      global.fetch = originalFetch;
       await import('node:fs/promises').then(({ rm }) => rm(directory, { recursive: true, force: true }));
     }
   });

@@ -21,7 +21,7 @@ export class CommandCodeCatalog {
   }
 
   static async fetchLiveModels(apiKey: string): Promise<ModelInfo[]> {
-    return this.validateApiKey(apiKey);
+    return CommandCodeCatalog.validateApiKey(apiKey);
   }
 
   static async validateApiKey(apiKey: string): Promise<ModelInfo[]> {
@@ -46,6 +46,6 @@ export class CommandCodeCatalog {
       return await res.json();
     });
 
-    return this.getModels();
+    return CommandCodeCatalog.getModels();
   }
 }
