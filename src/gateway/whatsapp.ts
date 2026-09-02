@@ -13,6 +13,7 @@ import { ConfigManager, normalizePhoneNumber } from '../config/config.js';
 import { PokeDatabase } from '../db/database.js';
 import { DeepgramHandler } from './deepgram.js';
 import { WhatsAppSender } from './sender.js';
+import { WhatsAppPresence, WhatsAppPresenceOptions } from './presence.js';
 import { getLogger } from '../logger/logger.js';
 import { resolvePokePaths, ensurePokeDirectories } from '../config/paths.js';
 import { writeGatewayRuntimeStatus } from './runtime-status.js';
@@ -89,6 +90,8 @@ export type StopHandlerFn = () => Promise<void>;
 export interface WhatsAppGatewayDependencies {
   downloadMedia?: (message: WAMessage) => Promise<Buffer>;
   deepgram?: DeepgramHandler;
+  presence?: WhatsAppPresence;
+  presenceOptions?: WhatsAppPresenceOptions;
 }
 
 export class WhatsAppGateway {
@@ -98,6 +101,7 @@ export class WhatsAppGateway {
   private connectionState: 'disconnected' | 'connecting' | 'connected' = 'disconnected';
   private inFlightInbound = new Set<string>();
   private sender: WhatsAppSender;
+  private presence: WhatsAppPresence;
   private deepgram: DeepgramHandler;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private isStopped = false;
@@ -128,12 +132,22 @@ export class WhatsAppGateway {
     this.deepgram = dependencies.deepgram || new DeepgramHandler(creds.deepgramApiKey, customHome);
     const ownerPhone = this.configManager.getOwnerPhoneNumber() || '';
     const ownerJid = ownerPhone ? `${ownerPhone}@s.whatsapp.net` : '';
+    this.presence = dependencies.presence || new WhatsAppPresence(
+      () => this.sock,
+      () => this.sender ? this.sender.getOwnerJid() : ownerJid,
+      dependencies.presenceOptions
+    );
     this.sender = new WhatsAppSender(
       () => this.sock,
       ownerJid,
       this.db,
-      this.deepgram
+      this.deepgram,
+      this.presence
     );
+  }
+
+  getPresence(): WhatsAppPresence {
+    return this.presence;
   }
 
   getSender(): WhatsAppSender {
@@ -196,6 +210,7 @@ export class WhatsAppGateway {
         }
 
         if (connection === 'close') {
+          this.presence.pauseTimer();
           this.connectionState = 'disconnected';
           this.sock = null;
           this.isConnecting = false;
@@ -222,6 +237,7 @@ export class WhatsAppGateway {
           if (ownerPhone) {
             this.sender.setOwnerJid(`${ownerPhone}@s.whatsapp.net`);
           }
+          this.presence.resumeTimerIfNeeded();
         }
       });
 
@@ -316,6 +332,7 @@ export class WhatsAppGateway {
 
     if (isPureTextMessage && trimmedText === '/stop') {
       logger.info({ messageId }, 'Received exact /stop command. Triggering emergency brake.');
+      this.presence.clear();
       let stopSucceeded = false;
       try {
         await this.onStop();
@@ -595,6 +612,7 @@ export class WhatsAppGateway {
 
   async stop(): Promise<void> {
     this.isStopped = true;
+    this.presence.stop();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;

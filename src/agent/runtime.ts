@@ -13,6 +13,7 @@ import { SkillRegistry } from '../skills/registry.js';
 import { WorkerManager } from '../workers/worker-manager.js';
 import { AutomationScheduler } from '../scheduler/scheduler.js';
 import { WhatsAppSender } from '../gateway/sender.js';
+import { WhatsAppPresence } from '../gateway/presence.js';
 import { CompactionManager, estimateTokenCount } from '../context/compaction-manager.js';
 import { getLogger } from '../logger/logger.js';
 import { resolvePokePaths, ensurePokeDirectories } from '../config/paths.js';
@@ -49,7 +50,8 @@ export class PokeRuntime {
     private scheduler: AutomationScheduler,
     private sender: WhatsAppSender,
     private compactionManager: CompactionManager,
-    private customHome?: string
+    private customHome?: string,
+    private presence?: WhatsAppPresence
   ) {}
 
   async start(): Promise<void> {
@@ -247,6 +249,8 @@ export class PokeRuntime {
     );
 
     const sourceKey = whatsappMessageId ? `whatsapp:${whatsappMessageId}` : undefined;
+    const turnKey = sourceKey || `user-msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    this.presence?.startTurn(turnKey);
     let messagePayload: any;
     let dispatchAttempted = false;
     try {
@@ -292,7 +296,10 @@ export class PokeRuntime {
       });
       if (sourceKey) {
         this.db.attachSubmissionDelivery(sourceKey, receipt.submissionId);
+        this.presence?.attachTurnAlias(sourceKey, receipt.submissionId);
         this.watchSubmissionSettlement(receipt.submissionId);
+      } else if (receipt?.submissionId) {
+        this.presence?.attachTurnAlias(turnKey, receipt.submissionId);
       }
 
       return receipt;
@@ -304,8 +311,14 @@ export class PokeRuntime {
         dispatchAttempted,
         label: 'submission',
       });
-      if (recovered) return recovered;
+      if (recovered) {
+        if (sourceKey && recovered.submissionId) {
+          this.presence?.attachTurnAlias(sourceKey, recovered.submissionId);
+        }
+        return recovered;
+      }
 
+      this.presence?.stopTurn(turnKey);
       await this.sender.sendDirectError(`Inference failed: ${err.message}`);
       throw err;
     }
@@ -322,17 +335,20 @@ export class PokeRuntime {
       'Dispatching signal to main agent'
     );
 
-    await this.ensurePreflightCompaction();
-    this.compactionManager.recordActivity();
+    const isWorkerCompletion = signal.type === 'worker.completion';
+    const turnKey = isWorkerCompletion
+      ? (signal.idempotencyKey || `worker-signal-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)
+      : undefined;
+
+    if (turnKey) {
+      this.presence?.startTurn(turnKey);
+    }
 
     const source = signal.type === 'automation.trigger'
       ? 'automation'
       : signal.type === 'worker.completion'
         ? 'worker'
         : undefined;
-    if (source && signal.idempotencyKey) {
-      this.db.reserveSubmissionDelivery({ sourceKey: signal.idempotencyKey, source });
-    }
 
     const signalMessage = {
       kind: 'signal' as const,
@@ -344,6 +360,13 @@ export class PokeRuntime {
 
     let dispatchAttempted = false;
     try {
+      await this.ensurePreflightCompaction();
+      this.compactionManager.recordActivity();
+
+      if (source && signal.idempotencyKey) {
+        this.db.reserveSubmissionDelivery({ sourceKey: signal.idempotencyKey, source });
+      }
+
       dispatchAttempted = true;
       const receipt = await this.agentHandle.dispatch({
         message: signalMessage as any,
@@ -351,6 +374,9 @@ export class PokeRuntime {
       });
       if (source && signal.idempotencyKey) {
         this.db.attachSubmissionDelivery(signal.idempotencyKey, receipt.submissionId);
+        if (turnKey && receipt.submissionId) {
+          this.presence?.attachTurnAlias(turnKey, receipt.submissionId);
+        }
         this.watchSubmissionSettlement(receipt.submissionId);
       }
       return receipt;
@@ -362,8 +388,16 @@ export class PokeRuntime {
         dispatchAttempted,
         label: 'signal submission',
       });
-      if (recovered) return recovered;
+      if (recovered) {
+        if (turnKey && recovered.submissionId) {
+          this.presence?.attachTurnAlias(turnKey, recovered.submissionId);
+        }
+        return recovered;
+      }
 
+      if (turnKey) {
+        this.presence?.stopTurn(turnKey);
+      }
       throw err;
     }
   }
@@ -371,6 +405,8 @@ export class PokeRuntime {
   async abortAll(): Promise<void> {
     const logger = getLogger();
     logger.info('Executing global abort across main agent and all workers');
+
+    this.presence?.clear();
 
     // 1. Abort main agent
     if (this.agentHandle) {
@@ -387,6 +423,7 @@ export class PokeRuntime {
 
   async stop(): Promise<void> {
     this.isRunning = false;
+    this.presence?.stop();
     if (this.idleCheckInterval) {
       clearInterval(this.idleCheckInterval);
       this.idleCheckInterval = null;
@@ -422,9 +459,14 @@ export class PokeRuntime {
         this.runningOwnerSubmissions.add(event.submissionId);
         this.compactionManager.setMainAgentBusy(true);
         return;
-      case 'submission_settled':
+      case 'submission_settled': {
         this.runningOwnerSubmissions.delete(event.submissionId);
         this.compactionManager.setMainAgentBusy(this.runningOwnerSubmissions.size > 0);
+        const delivery = this.db.getSubmissionDelivery(event.submissionId);
+        if (delivery?.source_key) {
+          this.presence?.stopTurn(delivery.source_key);
+        }
+        this.presence?.stopTurn(event.submissionId);
         void this.handleSubmissionSettlement(event).catch((err: any) => {
           getLogger().error(
             { submissionId: event.submissionId, err: err?.message || String(err) },
@@ -432,6 +474,7 @@ export class PokeRuntime {
           );
         });
         return;
+      }
       case 'turn_request':
         if (event.purpose === 'agent') {
           const tokens = estimateTokenCount(event.request?.input);
@@ -658,6 +701,11 @@ export class PokeRuntime {
     error?: { message?: string };
   }): Promise<void> {
     const delivery = this.db.getSubmissionDelivery(event.submissionId);
+    if (delivery?.source_key) {
+      this.presence?.stopTurn(delivery.source_key);
+    }
+    this.presence?.stopTurn(event.submissionId);
+
     if (!delivery || delivery.status !== 'pending') return;
 
     const errorMessage = event.error?.message || 'Inference failed';
