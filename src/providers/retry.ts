@@ -18,19 +18,50 @@ export class NonRetryableError extends Error {
   }
 }
 
+export function extractHttpStatus(error: any, rawMsg?: string): number | undefined {
+  const status = error?.status || error?.statusCode || error?.response?.status;
+  if (typeof status === 'number' && Number.isFinite(status)) {
+    return status;
+  }
+  const text = rawMsg !== undefined ? rawMsg : (typeof error === 'string' ? error : (error?.message || ''));
+  if (!text) return undefined;
+
+  // Strip Flue submission IDs (sub_...) and long hex strings to avoid false matches
+  // on IDs that happen to contain status codes like 401 or 500
+  const sanitized = text
+    .replace(/\bsub_[a-zA-Z0-9_]+\b/g, '')
+    .replace(/\b[0-9a-fA-F]{16,}\b/g, '');
+
+  // Look for explicit HTTP status code patterns:
+  // 1. Prefix: "500: {...}" or "failed: 500: {...}"
+  // 2. Explicit keyword: "http 500", "status 500", "status code: 500", "returned 500", "error 500"
+  const match = sanitized.match(
+    /(?:(?:^|failed:\s*)(\d{3}):|(?:\bhttp|\bstatus(?:\s*code)?|\breturned|\berror(?:\s*code)?)\s*[:=]?\s*(\d{3})\b)/i
+  );
+  if (match) {
+    const code = Number(match[1] || match[2]);
+    if (code >= 100 && code < 600) {
+      return code;
+    }
+  }
+  return undefined;
+}
+
 export function isTransientError(error: any): boolean {
   if (error instanceof NonRetryableError) {
     return false;
   }
 
-  const status = error?.status || error?.statusCode || error?.response?.status;
-  if (status) {
+  const rawMsg = typeof error === 'string' ? error : (error?.message || '');
+  const parsedStatus = extractHttpStatus(error, rawMsg);
+
+  if (parsedStatus) {
     // 429 Too Many Requests, 5xx Server Errors are transient
-    if (status === 429 || (status >= 500 && status < 600)) {
+    if (parsedStatus === 429 || (parsedStatus >= 500 && parsedStatus < 600)) {
       return true;
     }
     // 400 Bad Request, 401 Unauthorized, 403 Forbidden, 404 Not Found, etc. are NOT transient
-    if (status >= 400 && status < 500) {
+    if (parsedStatus >= 400 && parsedStatus < 500) {
       return false;
     }
   }
@@ -52,14 +83,16 @@ export function isTransientError(error: any): boolean {
     }
   }
 
-  const rawMsg = typeof error === 'string' ? error : (error?.message || '');
-  const msg = rawMsg.toLowerCase();
+  const msg = rawMsg
+    .replace(/\bsub_[a-zA-Z0-9_]+\b/g, '')
+    .replace(/\b[0-9a-fA-F]{16,}\b/g, '')
+    .toLowerCase();
 
   // Authentication and client errors are not transient
   if (
-    msg.includes('401') ||
+    parsedStatus === 401 ||
+    parsedStatus === 403 ||
     msg.includes('unauthorized') ||
-    msg.includes('403') ||
     msg.includes('forbidden') ||
     msg.includes('invalid api key')
   ) {
@@ -76,8 +109,7 @@ export function isTransientError(error: any): boolean {
     msg.includes('temporarily unavailable') ||
     msg.includes('internal_server_error') ||
     msg.includes('internal server error') ||
-    msg.includes('server_error') ||
-    /(?:status\s*|:\s*|^|\b)(5\d{2}|429)\b/.test(msg)
+    msg.includes('server_error')
   ) {
     return true;
   }
@@ -89,15 +121,17 @@ export function isUserActionableError(error: any): boolean {
   if (isTransientError(error)) {
     return false;
   }
-  const status = error?.status || error?.statusCode || error?.response?.status;
-  if (status === 401 || status === 403) {
+  const rawMsg = typeof error === 'string' ? error : (error?.message || '');
+  const parsedStatus = extractHttpStatus(error, rawMsg);
+  if (parsedStatus === 401 || parsedStatus === 403) {
     return true;
   }
-  const rawMsg = typeof error === 'string' ? error : (error?.message || '');
-  const msg = rawMsg.toLowerCase();
+  const msg = rawMsg
+    .replace(/\bsub_[a-zA-Z0-9_]+\b/g, '')
+    .replace(/\b[0-9a-fA-F]{16,}\b/g, '')
+    .toLowerCase();
+
   if (
-    msg.includes('401') ||
-    msg.includes('403') ||
     msg.includes('unauthorized') ||
     msg.includes('forbidden') ||
     msg.includes('invalid api key') ||

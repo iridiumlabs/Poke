@@ -25,6 +25,14 @@ describe('Provider Retry & Error Classification', () => {
     expect(isTransientError(flue500)).toBe(true);
     expect(isTransientError(new Error(flue500))).toBe(true);
     expect(isTransientError('Command Code returned 401. Run `poke login`.')).toBe(false);
+
+    // Opaque submission ID containing 401 must NOT prevent classification as 500 transient error
+    const flue500With401 = 'dispatch(sub_ik_401abcdef1234567890abcdef123) failed: 500: {"message":"Internal Server Error"}';
+    expect(isTransientError(flue500With401)).toBe(true);
+
+    // 400 validation error containing a standalone number like 512 must NOT be treated as transient
+    const validation400 = '400: max_tokens must be at most 512';
+    expect(isTransientError(validation400)).toBe(false);
   });
 
   it('identifies user-actionable errors correctly', () => {
@@ -37,6 +45,13 @@ describe('Provider Retry & Error Classification', () => {
     expect(isUserActionableError(flue500)).toBe(false);
     expect(isUserActionableError({ status: 500 })).toBe(false);
     expect(isUserActionableError({ status: 429 })).toBe(false);
+
+    // Flue 500 error whose submission ID happens to contain '401' must NOT be classified as user-actionable
+    const flue500With401 = 'dispatch(sub_ik_401abcdef1234567890abcdef123) failed: 500: {"message":"Internal Server Error"}';
+    expect(isUserActionableError(flue500With401)).toBe(false);
+
+    // Validation 400 error is NOT user-actionable
+    expect(isUserActionableError('400: max_tokens must be at most 512')).toBe(false);
   });
 
   it('retries transient errors with configured attempts', async () => {

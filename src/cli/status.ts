@@ -56,7 +56,7 @@ async function readStatusDatabase(sqliteFile: string): Promise<StatusDatabaseSna
     let lastError: { source?: string; message?: string; created_at?: number } | undefined;
     try {
       lastError = database
-        .prepare('SELECT source, message, created_at FROM operational_errors ORDER BY created_at DESC LIMIT 1')
+        .prepare('SELECT source, message, created_at FROM operational_errors ORDER BY created_at DESC, rowid DESC LIMIT 1')
         .get() as { source?: string; message?: string; created_at?: number } | undefined;
     } catch {
       // Table missing or corrupt

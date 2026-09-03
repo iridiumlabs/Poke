@@ -661,6 +661,19 @@ describe('PokeRuntime: Submission Delivery Settlement & Error Handling', () => {
       'Inference failed: An unexpected error occurred. Please try again later. (500)'
     );
 
+    // Strips "submission sub_... failed:" wrapper as well
+    const rawFlueSubmission =
+      'submission sub_ik_test123 failed: 500: {"message":"An unexpected error occurred. Please try again later."}';
+    expect(formatUserFacingError(rawFlueSubmission)).toBe(
+      'Inference failed: An unexpected error occurred. Please try again later. (500)'
+    );
+
+    // Strips standalone sub_ tokens
+    const withStandaloneSub = 'Internal failure in sub_deadbeef while processing request';
+    expect(formatUserFacingError(withStandaloneSub)).toBe(
+      'Inference failed: Internal failure in while processing request'
+    );
+
     expect(formatUserFacingError('Pre-admission validation failure')).toBe(
       'Inference failed: Pre-admission validation failure'
     );
@@ -670,6 +683,36 @@ describe('PokeRuntime: Submission Delivery Settlement & Error Handling', () => {
     );
 
     expect(formatUserFacingError('Key sk-12345678901234567890 failed')).toContain('[REDACTED_KEY]');
+  });
+
+  it('records operational error when signal dispatch fails persistently pre-admission without sending unsolicited WhatsApp message', async () => {
+    const directErrorSpy = vi.spyOn(sender, 'sendDirectError').mockResolvedValue();
+    const sourceKey = 'automation:pre-fail:1750000000000';
+
+    mockAgentHandle.dispatch
+      .mockRejectedValueOnce(new Error('Flue rejected signal admission'))
+      .mockRejectedValueOnce(new Error('Flue rejected signal admission'));
+
+    await expect(
+      runtime.dispatchSignal({
+        type: 'automation.trigger',
+        tagName: 'automation',
+        attributes: {},
+        body: 'run',
+        idempotencyKey: sourceKey,
+      })
+    ).rejects.toThrow('Flue rejected signal admission');
+
+    // Must NOT notify WhatsApp
+    expect(directErrorSpy).not.toHaveBeenCalled();
+
+    // Must record operational error in DB
+    const lastOpError = db.getLastOperationalError();
+    expect(lastOpError).toMatchObject({
+      source: 'automation',
+      message: 'Flue rejected signal admission',
+    });
+    expect(lastOpError?.details).toContain(sourceKey);
   });
 });
 

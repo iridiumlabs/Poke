@@ -411,6 +411,18 @@ export class PokeRuntime {
       if (turnKey) {
         this.presence?.stopTurn(turnKey);
       }
+      try {
+        this.db.recordOperationalError(
+          source || 'signal',
+          err?.message || String(err),
+          JSON.stringify({
+            sourceKey: signal.idempotencyKey,
+            signalType: signal.type,
+          })
+        );
+      } catch (recErr: any) {
+        logger.warn({ err: recErr?.message }, 'Failed to record signal pre-admission operational error');
+      }
       throw err;
     }
   }
@@ -836,8 +848,14 @@ export function formatUserFacingError(rawMessage: unknown): string {
     : (rawMessage as any)?.message || String(rawMessage);
   message = message.trim();
 
-  // Strip Flue internal operation label: e.g. "dispatch(sub_...) failed: "
-  message = message.replace(/^(?:dispatch|[a-z_]+)\((?:sub_[a-zA-Z0-9_]+|[^)]+)\)\s*failed:\s*/i, '');
+  // Strip Flue internal operation label: e.g. "dispatch(sub_...) failed: " or "submission sub_... failed: "
+  message = message.replace(
+    /^(?:submission\s+|dispatch|[a-z_]+)(?:\((?:sub_[a-zA-Z0-9_]+|[^)]+)\)|sub_[a-zA-Z0-9_]+)\s*failed:\s*/i,
+    ''
+  );
+
+  // Strip standalone internal submission IDs so they never leak in user-facing notices
+  message = message.replace(/\bsub_[a-zA-Z0-9_]+\b/g, '').replace(/\s{2,}/g, ' ');
 
   // Check if remaining string contains a JSON payload like "500: {...}" or "{...}"
   const jsonMatch = message.match(/^(?:(\d{3}):\s*)?(\{.*\})$/s);

@@ -966,13 +966,24 @@ export class PokeDatabase {
       )
       .run(record);
 
+    // Keep diagnostic storage bounded by retaining only the recent 100 errors
+    this.db
+      .prepare(
+        `DELETE FROM operational_errors
+         WHERE id NOT IN (
+           SELECT id FROM operational_errors
+           ORDER BY created_at DESC, rowid DESC LIMIT 100
+         )`
+      )
+      .run();
+
     return record;
   }
 
   getLastOperationalError(): OperationalErrorRecord | null {
     if (!this.isOpen()) return null;
     const row = this.db
-      .prepare('SELECT * FROM operational_errors ORDER BY created_at DESC LIMIT 1')
+      .prepare('SELECT * FROM operational_errors ORDER BY created_at DESC, rowid DESC LIMIT 1')
       .get() as OperationalErrorRecord | undefined;
     return row || null;
   }
