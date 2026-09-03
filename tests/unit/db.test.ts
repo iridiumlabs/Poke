@@ -107,6 +107,20 @@ describe('PokeDatabase', () => {
     expect(last?.details).not.toContain(secret);
   });
 
+  it('bounds operational errors retention to the latest 100 entries', () => {
+    for (let i = 0; i < 110; i++) {
+      db.recordOperationalError('test', `Error message ${i}`);
+    }
+
+    const count = (db as any).db
+      .prepare('SELECT COUNT(*) as cnt FROM operational_errors')
+      .get().cnt;
+    expect(count).toBe(100);
+
+    const latest = db.getLastOperationalError();
+    expect(latest?.message).toBe('Error message 109');
+  });
+
   it('persists a delivery intent before a transport result and preserves an unknown outcome', () => {
     const first = db.reserveOutgoingDelivery('send-1:part:0', 'whatsapp_send_part', 'payload-hash');
     expect(first.created).toBe(true);

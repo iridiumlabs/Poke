@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { PokeRuntime, MAIN_AGENT_INSTANCE_ID } from '../../src/agent/runtime.js';
+import { PokeRuntime, MAIN_AGENT_INSTANCE_ID, formatUserFacingError } from '../../src/agent/runtime.js';
 import { PokeMainAgent } from '../../src/agent/main-agent.js';
 import { PokeDatabase } from '../../src/db/database.js';
 import { ConfigManager } from '../../src/config/config.js';
@@ -492,5 +492,229 @@ describe('PokeRuntime: Compaction Mechanics & Manual Compaction', () => {
     );
   });
 });
+
+describe('PokeRuntime: Submission Delivery Settlement & Error Handling', () => {
+  let tempDir: string;
+  let db: PokeDatabase;
+  let config: ConfigManager;
+  let sender: WhatsAppSender;
+  let compactionManager: CompactionManager;
+  let runtime: PokeRuntime;
+
+  let mockAgentHandle: {
+    dispatch: ReturnType<typeof vi.fn>;
+    read: ReturnType<typeof vi.fn>;
+    abort: ReturnType<typeof vi.fn>;
+  };
+
+  beforeEach(() => {
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'poke-runtime-settlement-test-'));
+    db = new PokeDatabase(tempDir);
+    config = new ConfigManager(tempDir);
+    config.setOwnerPhoneNumber('923001234567');
+
+    sender = new WhatsAppSender(
+      {} as any,
+      '923001234567@s.whatsapp.net',
+      db,
+      {} as any
+    );
+    compactionManager = new CompactionManager(db, config);
+
+    runtime = new PokeRuntime(
+      config,
+      db,
+      new ExaToolHandler(),
+      new SupermemoryToolHandler(),
+      new ComposioToolHandler(),
+      new SkillRegistry(path.join(tempDir, 'skills')),
+      new WorkerManager(db, config, {} as any, {} as any, {} as any, {} as any),
+      new AutomationScheduler(db),
+      sender,
+      compactionManager,
+      tempDir
+    );
+
+    mockAgentHandle = {
+      dispatch: vi.fn().mockResolvedValue({ submissionId: 'sub_test_1' }),
+      read: vi.fn().mockResolvedValue({ text: 'done' }),
+      abort: vi.fn().mockResolvedValue(undefined),
+    };
+    (runtime as any).agentHandle = mockAgentHandle;
+  });
+
+  afterEach(() => {
+    db.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('does not send unsolicited WhatsApp error on background automation transient 500 failure, and records operational error in DB', async () => {
+    const directErrorSpy = vi.spyOn(sender, 'sendDirectError').mockResolvedValue();
+    const sourceKey = 'automation:remind-1:1750000000000';
+    const submissionId = 'sub_ik_9de1d1f9385a8bb9cae1bd0a2cbbe16f';
+    const flue500Error =
+      'dispatch(sub_ik_9de1d1f9385a8bb9cae1bd0a2cbbe16f) failed: 500: {"message":"An unexpected error occurred. Please try again later.","type":"server_error","code":"INTERNAL_SERVER_ERROR"}';
+
+    // 1. Reserve and attach submission delivery with source 'automation'
+    db.reserveSubmissionDelivery({
+      sourceKey,
+      source: 'automation',
+    });
+    db.attachSubmissionDelivery(sourceKey, submissionId);
+
+    // 2. Simulate settlement failure from Flue runner
+    await (runtime as any).handleSubmissionSettlement({
+      submissionId,
+      outcome: 'failed',
+      error: { message: flue500Error },
+    });
+
+    // 3. Must NOT send unsolicited error to WhatsApp
+    expect(directErrorSpy).not.toHaveBeenCalled();
+
+    // 4. Delivery record must be marked 'failed'
+    const delivery = db.getSubmissionDelivery(submissionId);
+    expect(delivery).toMatchObject({
+      source: 'automation',
+      status: 'failed',
+      error_message: flue500Error,
+    });
+
+    // 5. Operational error must be durably recorded in SQLite for /status inspection
+    const lastOpError = db.getLastOperationalError();
+    expect(lastOpError).toMatchObject({
+      source: 'automation',
+      message: flue500Error,
+    });
+    expect(lastOpError?.details).toContain(submissionId);
+  });
+
+  it('sends sanitized user-friendly error on interactive WhatsApp message failure without leaking Flue internal wrapper or JSON', async () => {
+    const directErrorSpy = vi.spyOn(sender, 'sendDirectError').mockResolvedValue();
+    const sourceKey = 'whatsapp:user-msg-999';
+    const submissionId = 'sub_ik_user_msg_999';
+    const flue500Error =
+      'dispatch(sub_ik_user_msg_999) failed: 500: {"message":"An unexpected error occurred. Please try again later.","type":"server_error","code":"INTERNAL_SERVER_ERROR"}';
+
+    // 1. Reserve and attach submission delivery with source 'whatsapp'
+    db.reserveSubmissionDelivery({
+      sourceKey,
+      source: 'whatsapp',
+      whatsappMessageId: 'user-msg-999',
+    });
+    db.attachSubmissionDelivery(sourceKey, submissionId);
+
+    // 2. Simulate settlement failure from Flue runner
+    await (runtime as any).handleSubmissionSettlement({
+      submissionId,
+      outcome: 'failed',
+      error: { message: flue500Error },
+    });
+
+    // 3. Must send sanitized error to WhatsApp
+    expect(directErrorSpy).toHaveBeenCalledTimes(1);
+    const sentError = directErrorSpy.mock.calls[0][0];
+    expect(sentError).toBe('Inference failed: An unexpected error occurred. Please try again later. (500)');
+    // Must NOT leak Flue internal wrapper or ID
+    expect(sentError).not.toContain('dispatch(');
+    expect(sentError).not.toContain('sub_ik_');
+    expect(sentError).not.toContain('INTERNAL_SERVER_ERROR');
+
+    // 4. Operational error must be recorded
+    const lastOpError = db.getLastOperationalError();
+    expect(lastOpError).toMatchObject({
+      source: 'whatsapp',
+      message: flue500Error,
+    });
+  });
+
+  it('notifies WhatsApp when background failure is genuinely user-actionable (e.g. 401 auth required)', async () => {
+    const directErrorSpy = vi.spyOn(sender, 'sendDirectError').mockResolvedValue();
+    const sourceKey = 'automation:auth-check:1750000000000';
+    const submissionId = 'sub_ik_auth_check';
+    const authError = 'dispatch(sub_ik_auth_check) failed: 401: {"message":"Invalid API Key"}';
+
+    db.reserveSubmissionDelivery({
+      sourceKey,
+      source: 'automation',
+    });
+    db.attachSubmissionDelivery(sourceKey, submissionId);
+
+    await (runtime as any).handleSubmissionSettlement({
+      submissionId,
+      outcome: 'failed',
+      error: { message: authError },
+    });
+
+    // User-actionable background failure MUST notify user with clean message
+    expect(directErrorSpy).toHaveBeenCalledWith('Inference failed: Invalid API Key (401)');
+    expect(db.getLastOperationalError()).toMatchObject({
+      source: 'automation',
+      message: authError,
+    });
+  });
+
+  it('formatUserFacingError cleans internal IDs, JSON envelopes, and redacts secrets', () => {
+    const rawFlue =
+      'dispatch(sub_ik_9de1d1f9385a8bb9cae1bd0a2cbbe16f) failed: 500: {"message":"An unexpected error occurred. Please try again later.","type":"server_error","code":"INTERNAL_SERVER_ERROR"}';
+    expect(formatUserFacingError(rawFlue)).toBe(
+      'Inference failed: An unexpected error occurred. Please try again later. (500)'
+    );
+
+    // Strips "submission sub_... failed:" wrapper as well
+    const rawFlueSubmission =
+      'submission sub_ik_test123 failed: 500: {"message":"An unexpected error occurred. Please try again later."}';
+    expect(formatUserFacingError(rawFlueSubmission)).toBe(
+      'Inference failed: An unexpected error occurred. Please try again later. (500)'
+    );
+
+    // Strips standalone sub_ tokens
+    const withStandaloneSub = 'Internal failure in sub_deadbeef while processing request';
+    expect(formatUserFacingError(withStandaloneSub)).toBe(
+      'Inference failed: Internal failure in while processing request'
+    );
+
+    expect(formatUserFacingError('Pre-admission validation failure')).toBe(
+      'Inference failed: Pre-admission validation failure'
+    );
+
+    expect(formatUserFacingError('Inference failed: Already formatted error')).toBe(
+      'Inference failed: Already formatted error'
+    );
+
+    expect(formatUserFacingError('Key sk-12345678901234567890 failed')).toContain('[REDACTED_KEY]');
+  });
+
+  it('records operational error when signal dispatch fails persistently pre-admission without sending unsolicited WhatsApp message', async () => {
+    const directErrorSpy = vi.spyOn(sender, 'sendDirectError').mockResolvedValue();
+    const sourceKey = 'automation:pre-fail:1750000000000';
+
+    mockAgentHandle.dispatch
+      .mockRejectedValueOnce(new Error('Flue rejected signal admission'))
+      .mockRejectedValueOnce(new Error('Flue rejected signal admission'));
+
+    await expect(
+      runtime.dispatchSignal({
+        type: 'automation.trigger',
+        tagName: 'automation',
+        attributes: {},
+        body: 'run',
+        idempotencyKey: sourceKey,
+      })
+    ).rejects.toThrow('Flue rejected signal admission');
+
+    // Must NOT notify WhatsApp
+    expect(directErrorSpy).not.toHaveBeenCalled();
+
+    // Must record operational error in DB
+    const lastOpError = db.getLastOperationalError();
+    expect(lastOpError).toMatchObject({
+      source: 'automation',
+      message: 'Flue rejected signal admission',
+    });
+    expect(lastOpError?.details).toContain(sourceKey);
+  });
+});
+
 
 
