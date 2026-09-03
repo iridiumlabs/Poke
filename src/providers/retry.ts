@@ -23,7 +23,7 @@ export function isTransientError(error: any): boolean {
     return false;
   }
 
-  const status = error.status || error.statusCode || error.response?.status;
+  const status = error?.status || error?.statusCode || error?.response?.status;
   if (status) {
     // 429 Too Many Requests, 5xx Server Errors are transient
     if (status === 429 || (status >= 500 && status < 600)) {
@@ -36,7 +36,7 @@ export function isTransientError(error: any): boolean {
   }
 
   // Network / connection errors
-  const code = error.code || error.cause?.code;
+  const code = error?.code || error?.cause?.code;
   if (code) {
     const transientCodes = [
       'ECONNRESET',
@@ -52,7 +52,20 @@ export function isTransientError(error: any): boolean {
     }
   }
 
-  const msg = (error.message || '').toLowerCase();
+  const rawMsg = typeof error === 'string' ? error : (error?.message || '');
+  const msg = rawMsg.toLowerCase();
+
+  // Authentication and client errors are not transient
+  if (
+    msg.includes('401') ||
+    msg.includes('unauthorized') ||
+    msg.includes('403') ||
+    msg.includes('forbidden') ||
+    msg.includes('invalid api key')
+  ) {
+    return false;
+  }
+
   if (
     msg.includes('rate limit') ||
     msg.includes('too many requests') ||
@@ -60,11 +73,40 @@ export function isTransientError(error: any): boolean {
     msg.includes('service unavailable') ||
     msg.includes('gateway timeout') ||
     msg.includes('bad gateway') ||
-    msg.includes('temporarily unavailable')
+    msg.includes('temporarily unavailable') ||
+    msg.includes('internal_server_error') ||
+    msg.includes('internal server error') ||
+    msg.includes('server_error') ||
+    /(?:status\s*|:\s*|^|\b)(5\d{2}|429)\b/.test(msg)
   ) {
     return true;
   }
 
+  return false;
+}
+
+export function isUserActionableError(error: any): boolean {
+  if (isTransientError(error)) {
+    return false;
+  }
+  const status = error?.status || error?.statusCode || error?.response?.status;
+  if (status === 401 || status === 403) {
+    return true;
+  }
+  const rawMsg = typeof error === 'string' ? error : (error?.message || '');
+  const msg = rawMsg.toLowerCase();
+  if (
+    msg.includes('401') ||
+    msg.includes('403') ||
+    msg.includes('unauthorized') ||
+    msg.includes('forbidden') ||
+    msg.includes('invalid api key') ||
+    msg.includes('authentication failed') ||
+    msg.includes('poke login') ||
+    msg.includes('not authenticated')
+  ) {
+    return true;
+  }
   return false;
 }
 

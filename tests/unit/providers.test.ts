@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { withProviderRetry, isTransientError, NonRetryableError } from '../../src/providers/retry.js';
+import { withProviderRetry, isTransientError, isUserActionableError, NonRetryableError } from '../../src/providers/retry.js';
 import { CommandCodeCatalog } from '../../src/providers/commandcode.js';
 import { FireworksCatalog } from '../../src/providers/fireworks.js';
 import { ProviderRegistry, normalizeCatalogModelId } from '../../src/providers/provider-registry.js';
@@ -19,6 +19,24 @@ describe('Provider Retry & Error Classification', () => {
     expect(isTransientError({ status: 401 })).toBe(false);
     expect(isTransientError({ status: 404 })).toBe(false);
     expect(isTransientError(new NonRetryableError('Bad request'))).toBe(false);
+
+    // String inputs and Flue operation failed wrappers
+    const flue500 = 'dispatch(sub_ik_9de1d1f9385a8bb9cae1bd0a2cbbe16f) failed: 500: {"message":"An unexpected error occurred. Please try again later.","type":"server_error","code":"INTERNAL_SERVER_ERROR"}';
+    expect(isTransientError(flue500)).toBe(true);
+    expect(isTransientError(new Error(flue500))).toBe(true);
+    expect(isTransientError('Command Code returned 401. Run `poke login`.')).toBe(false);
+  });
+
+  it('identifies user-actionable errors correctly', () => {
+    expect(isUserActionableError({ status: 401 })).toBe(true);
+    expect(isUserActionableError('Command Code returned 401. Run `poke login`.')).toBe(true);
+    expect(isUserActionableError(new Error('Invalid API Key'))).toBe(true);
+
+    // Transient server errors are NOT user-actionable
+    const flue500 = 'dispatch(sub_ik_9de1d1f9385a8bb9cae1bd0a2cbbe16f) failed: 500: {"message":"An unexpected error occurred. Please try again later.","type":"server_error","code":"INTERNAL_SERVER_ERROR"}';
+    expect(isUserActionableError(flue500)).toBe(false);
+    expect(isUserActionableError({ status: 500 })).toBe(false);
+    expect(isUserActionableError({ status: 429 })).toBe(false);
   });
 
   it('retries transient errors with configured attempts', async () => {

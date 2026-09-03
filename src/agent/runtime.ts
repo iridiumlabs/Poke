@@ -22,6 +22,8 @@ import { COMMAND_CODE_MANUAL_CATALOG } from '../providers/commandcode.js';
 import { extractFireworksModelInfo } from '../providers/fireworks.js';
 import { FileCredentialStore } from '../providers/credential-store.js';
 import { migrateLegacyProviderCredentials } from '../providers/credentials-migration.js';
+import { isTransientError, isUserActionableError } from '../providers/retry.js';
+import { redactSecrets } from '../logger/logger.js';
 import { SignalPayload } from './signals.js';
 
 export const MAIN_AGENT_INSTANCE_ID = 'owner';
@@ -320,7 +322,16 @@ export class PokeRuntime {
       }
 
       this.presence?.stopTurn(turnKey);
-      await this.sender.sendDirectError(`Inference failed: ${err.message}`);
+      try {
+        this.db.recordOperationalError(
+          'whatsapp',
+          err.message,
+          JSON.stringify({ sourceKey, whatsappMessageId })
+        );
+      } catch (recErr: any) {
+        logger.warn({ err: recErr?.message }, 'Failed to record pre-admission operational error');
+      }
+      await this.sender.sendDirectError(formatUserFacingError(err.message));
       throw err;
     }
   }
@@ -773,8 +784,41 @@ export class PokeRuntime {
       { submissionId: event.submissionId, source: delivery.source, err: errorMessage },
       'Agent submission failed'
     );
+
+    // Durably record operational diagnostic in SQLite so /status and CLI can inspect it
     try {
-      await this.sender.sendDirectError(errorMessage);
+      this.db.recordOperationalError(
+        delivery.source,
+        errorMessage,
+        JSON.stringify({
+          submissionId: event.submissionId,
+          sourceKey: delivery.source_key,
+        })
+      );
+    } catch (recordErr: any) {
+      getLogger().error(
+        { submissionId: event.submissionId, err: recordErr?.message || String(recordErr) },
+        'Failed to record operational error for failed submission delivery'
+      );
+    }
+
+    const isInteractive = delivery.source === 'whatsapp';
+    const isTransient = isTransientError(errorMessage);
+    const isActionable = isUserActionableError(errorMessage);
+
+    // Background failures (automation, worker) should not send unsolicited notifications
+    // to WhatsApp long after a completed turn unless the failure is genuinely user-actionable
+    // (e.g. invalid credentials requiring `poke login`).
+    if (!isInteractive && (isTransient || !isActionable)) {
+      return;
+    }
+
+    // Format user-facing error so raw implementation details (dispatch(...) wrapper,
+    // internal sub_ik_ IDs, raw provider JSON blobs) are never exposed on WhatsApp.
+    const userNotice = formatUserFacingError(errorMessage);
+
+    try {
+      await this.sender.sendDirectError(userNotice);
     } catch (error: any) {
       getLogger().error(
         { submissionId: event.submissionId, err: error?.message || String(error) },
@@ -782,4 +826,49 @@ export class PokeRuntime {
       );
     }
   }
+}
+
+export function formatUserFacingError(rawMessage: unknown): string {
+  if (!rawMessage) return 'Inference failed. Please try again.';
+
+  let message = typeof rawMessage === 'string'
+    ? rawMessage
+    : (rawMessage as any)?.message || String(rawMessage);
+  message = message.trim();
+
+  // Strip Flue internal operation label: e.g. "dispatch(sub_...) failed: "
+  message = message.replace(/^(?:dispatch|[a-z_]+)\((?:sub_[a-zA-Z0-9_]+|[^)]+)\)\s*failed:\s*/i, '');
+
+  // Check if remaining string contains a JSON payload like "500: {...}" or "{...}"
+  const jsonMatch = message.match(/^(?:(\d{3}):\s*)?(\{.*\})$/s);
+  if (jsonMatch) {
+    const statusCode = jsonMatch[1];
+    const jsonStr = jsonMatch[2];
+    try {
+      const parsed = JSON.parse(jsonStr);
+      const innerMessage =
+        parsed.message ||
+        parsed.error?.message ||
+        (typeof parsed.error === 'string' ? parsed.error : undefined) ||
+        parsed.details;
+      if (innerMessage && typeof innerMessage === 'string') {
+        message = statusCode ? `${innerMessage} (${statusCode})` : innerMessage;
+      }
+    } catch {
+      // Ignore JSON parse error and keep cleaned message
+    }
+  }
+
+  // If message has raw status code like "500: Server Error"
+  const statusMatch = message.match(/^(\d{3}):\s*(.+)$/s);
+  if (statusMatch && !jsonMatch) {
+    message = `${statusMatch[2]} (${statusMatch[1]})`;
+  }
+
+  message = message.trim();
+  if (!message.toLowerCase().startsWith('inference failed')) {
+    message = `Inference failed: ${message}`;
+  }
+
+  return redactSecrets(message);
 }
